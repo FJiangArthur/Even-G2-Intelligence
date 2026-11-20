@@ -6,6 +6,7 @@
 // Query: ?speed=3 (rehearsal speed) &autoplay=0 (wait for hudQa.play()).
 //        ?scenario=v08: v0.8 flow (continuous caption, THEY ASKED, claims + verify, menu, mirror,
 //        lifecycle re-push) driven by scripts/qa_hud.mjs with HUD_QA_SCENARIO=v08.
+//        ?display=ambient&scenario=ambient: ambient display flow, driven by scripts/qa_ambient.mjs.
 import { waitForEvenAppBridge, type EvenHubEvent } from "@evenrealities/even_hub_sdk";
 import { DirectConversationTransport, type DirectConversationOptions, type GatewayEvent, type Speaker } from "@helix/conversation-sdk";
 import { DEFAULT_CONFIG } from "../src/config";
@@ -113,7 +114,8 @@ const port: G2BridgePort = {
 };
 
 const presentation = new ConversationPresentation();
-hud = new GlassesHud(port, { onError: error => { log("hud-error", { message: error.message }); presentation.setStatus("failed", error.message); },
+// ?display=ambient: the default product setting (blank until something pops up); the older scripts pin always-on.
+hud = new GlassesHud(port, { display: params.get("display") === "ambient" ? "ambient" : "always-on", onError: error => { log("hud-error", { message: error.message }); presentation.setStatus("failed", error.message); },
   onRenderError: error => console.error("HUD render error", error) });
 const partial = (text: string, speaker: Speaker): GatewayEvent => ({
   protocolVersion: "2.1", type: "transcript.partial", eventId: `qa-partial-${Date.now()}`, sessionId: "qa", occurredAt: new Date().toISOString(),
@@ -181,7 +183,30 @@ async function runV08(): Promise<void> {
   ]);
   log("v08-seeded");
 }
-Object.assign(window, { hudQa: { controller, presentation, hud, play, fake, runV08 } });
+/** Ambient scenario: presentation events only (no provider, no transport), so every step is deterministic. */
+async function runAmbient(): Promise<void> {
+  const event = (value: object): GatewayEvent => ({ protocolVersion: "2.1", eventId: `qa-${Math.random()}`, sessionId: "qa", occurredAt: at(), ...value }) as unknown as GatewayEvent;
+  const context = (speaker: Speaker, trigger?: string) => ({ speaker, prompt: { id: "p", version: "1" }, endpoint: { id: "openai-direct", url: "", provider: "openai", model: "fake" }, latencyMs: { totalMs: 0 }, ...(trigger ? { trigger } : {}) });
+  await sleep(5000); // the "● listening" status cue is gone
+  presentation.apply(partial("We should order the x86 box this week", them));
+  presentation.apply(event({ type: "transcript.final", transcriptId: "qa-t1", text: "We should order the x86 box this week, the Orin modules are back ordered.", context: context(them) }));
+  await sleep(1500);
+  log("ambient-talked");
+  await sleep(2500);
+  presentation.apply(event({ type: "question.detected", questionId: "qa-q1", text: "How long is the Jetson Orin lead time right now?", confidence: 0.9, context: context(them, "question") }));
+  presentation.apply(event({ type: "answer.completed", answerId: "qa-a1", questionId: "qa-q1", text: "Twelve to sixteen weeks at major distributors; developer kits ship sooner but are allocation limited.", context: context({ label: "Helix", role: "unknown" }, "question") }));
+  await sleep(1200);
+  log("ambient-answer-shown", { header: hud.frame.header });
+  await sleep(9500); // the answer hides 8 s after it completed
+  log("ambient-answer-expired", { header: hud.frame.header, body: hud.frame.body });
+  await sleep(2500);
+  presentation.applyVerification({ id: "qa-v1", target: "Jetson Orin lead times are about 8 weeks.", status: "contradicted", summary: "Distributors list 12 to 16 weeks for Orin modules.", sources: [], checkedAt: at(), requestedBy: "auto" });
+  await sleep(1200);
+  log("ambient-verdict-shown", { header: hud.frame.header });
+  await sleep(6500);
+  log("ambient-verdict-expired", { header: hud.frame.header, body: hud.frame.body });
+}
+Object.assign(window, { hudQa: { controller, presentation, hud, play, fake, runV08, runAmbient } });
 
 await controller.initialize();
 log("initialized");
@@ -191,5 +216,6 @@ await controller.startListening();
 log("connected");
 await sleep(2500);
 if (params.get("scenario") === "v08") await runV08();
+else if (params.get("scenario") === "ambient") await runAmbient();
 else if (params.get("autoplay") !== "0") await play();
 window.addEventListener("beforeunload", () => { void controller.dispose(); });

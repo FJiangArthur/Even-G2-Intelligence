@@ -43,7 +43,7 @@ const question = (id: string, text: string, label: string, role: Role) => ev({ t
 const completed = (answerId: string, questionId: string, text: string) => ev({ type: "answer.completed", answerId, questionId, text, context: ctx("Helix", "unknown", "question") });
 
 async function mount(bridge = new ImageBridge(), options: ConstructorParameters<typeof GlassesHud>[1] = {}) {
-  const hud = new GlassesHud(bridge, { tickMs: 0, writeGapMs: 0, mascotIntervalMs: 1000, ...options });
+  const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0, writeGapMs: 0, mascotIntervalMs: 1000, ...options });
   const presentation = new ConversationPresentation();
   presentation.subscribe(snapshot => hud.render(snapshot.glasses, snapshot));
   await hud.initialize();
@@ -225,7 +225,7 @@ describe("v0.10 controller modes", () => {
       onEvenHubEvent: () => () => undefined,
     } as unknown as G2BridgePort;
     const presentation = new ConversationPresentation();
-    const hud = new GlassesHud(bridge as unknown as GlassesRenderBridge, { tickMs: 0 });
+    const hud = new GlassesHud(bridge as unknown as GlassesRenderBridge, { display: "always-on", tickMs: 0 });
     let options: { mode?: () => unknown; automation?: () => unknown } | undefined;
     const controller = new G2ConversationController(bridge, hud, presentation, opts => { options = opts as never; return { state: "idle" } as never; });
     await controller.initialize();

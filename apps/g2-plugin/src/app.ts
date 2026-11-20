@@ -10,7 +10,7 @@ import {
 } from "./config";
 import { G2ConversationController, LIVE_HISTORY_WRITE_DELAY_MS } from "./controller";
 import { GlassesRenderer } from "./glasses-renderer";
-import { GlassesHud, hudViewForTab, resolveGlassesLayout } from "./glasses-hud";
+import { GlassesHud, hudViewForTab, resolveGlassesDisplay, resolveGlassesLayout } from "./glasses-hud";
 import { ConversationPresentation } from "./presentation";
 import { CompanionUi } from "./ui";
 import { RESUME_PROMPT } from "./controller";
@@ -32,6 +32,8 @@ export const PHONE_RENDER_MS = 250;
 export const GLASSES_IMAGES_KEY = "helix.glasses.images.v1";
 /** Pause between glasses writes in ms (80 | 250 | 500 | 1000). Stored through the Even bridge. */
 export const GLASSES_WRITE_GAP_KEY = "helix.glasses.write-gap.v1";
+/** Glasses display: "ambient" (default; blank until an answer or cue pops up) or "always-on". Stored through the Even bridge. */
+export const GLASSES_DISPLAY_KEY = "helix.glasses.display.v1";
 export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebuildPageContainer?: unknown }, options: BootstrapOptions = {}) {
   const [config, providerCredentials] = await Promise.all([
     loadPersistedConfig(bridge),
@@ -45,8 +47,9 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   const writeGap = [80, 250, 500, 1000].includes(savedGap) ? savedGap : 80;
   // v0.11.2: Setup → Diagnostics switch for a text-only glasses display (saved on this phone).
   const pixelArt = await Promise.race([bridge.getLocalStorage(GLASSES_IMAGES_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]) !== "off";
+  const display = resolveGlassesDisplay(await Promise.race([bridge.getLocalStorage(GLASSES_DISPLAY_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]));
   const renderer = resolveGlassesLayout(new URLSearchParams(options.search ?? location.search).get("glasses")) === "hud"
-    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap })
+    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap, display })
     : new GlassesRenderer(bridge, { debounceMs: 120, onError: onGlassesError });
   const controller = new G2ConversationController(bridge, renderer, presentation, ...(options.transportFactory ? [options.transportFactory] as const : []));
   // Battery: batch live-session history saves (one shard + one index write per ~3 s, flushed on hide/stop).
@@ -65,6 +68,16 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
       void bridge.setLocalStorage(GLASSES_IMAGES_KEY, on ? "on" : "off").catch(() => false);
     });
   }
+  const alwaysOnToggle = root.querySelector<HTMLInputElement>("#glasses-always-on");
+  if (alwaysOnToggle) {
+    alwaysOnToggle.checked = display === "always-on";
+    alwaysOnToggle.addEventListener("change", () => {
+      const next = alwaysOnToggle.checked ? "always-on" : "ambient";
+      recordDiagnostic("glasses-display", next);
+      (renderer as { setDisplay?: (display: "ambient" | "always-on") => void }).setDisplay?.(next);
+      void bridge.setLocalStorage(GLASSES_DISPLAY_KEY, next).catch(() => false);
+    });
+  }
   const gapSelect = root.querySelector<HTMLSelectElement>("#glasses-write-gap");
   if (gapSelect) {
     gapSelect.value = String(writeGap);
@@ -75,7 +88,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
       void bridge.setLocalStorage(GLASSES_WRITE_GAP_KEY, String(ms)).catch(() => false);
     });
   }
-  recordDiagnostic("glasses-settings", `pixel art ${pixelArt ? "on" : "off"} · pause ${writeGap} ms`);
+  recordDiagnostic("glasses-settings", `pixel art ${pixelArt ? "on" : "off"} · pause ${writeGap} ms · display ${display}`);
   // Glasses link changes (connected / disconnected, worn, in case): the usual companions of a slow bridge.
   let lastDevice = "";
   const stopDevice = (bridge as { onDeviceStatusChanged?: (callback: (status: { connectType?: string; isWearing?: boolean; isInCase?: boolean; batteryLevel?: number }) => void) => () => void })

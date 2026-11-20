@@ -17,7 +17,7 @@ class Bridge implements GlassesRenderBridge {
 }
 const at = "2026-11-17T18:00:00.000Z";
 async function mount() {
-  const bridge = new Bridge(), hud = new GlassesHud(bridge, { tickMs: 0 }), presentation = new ConversationPresentation();
+  const bridge = new Bridge(), hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0 }), presentation = new ConversationPresentation();
   presentation.subscribe(snapshot => hud.render(snapshot.glasses, snapshot));
   await hud.initialize();
   return { bridge, hud, presentation };
@@ -66,7 +66,7 @@ describe("v0.11 mode prompts", () => {
     const bridge = { getLocalStorage: async (k: string) => storage.get(k) ?? "", setLocalStorage: async (k: string, v: string) => { storage.set(k, v); return true; },
       createStartUpPageContainer: async () => StartUpPageCreateResult.success, textContainerUpgrade: async () => true, rebuildPageContainer: async () => true,
       audioControl: async () => true, onEvenHubEvent: () => () => undefined } as unknown as G2BridgePort;
-    const controller = new G2ConversationController(bridge, new GlassesHud(bridge as never, { tickMs: 0 }), new ConversationPresentation());
+    const controller = new G2ConversationController(bridge, new GlassesHud(bridge as never, { display: "always-on", tickMs: 0 }), new ConversationPresentation());
     await controller.initialize();
     expect(controller.modePrompt("interviewer")).toEqual({ text: MODE_PROFILES.interviewer.answer, custom: false });
     await controller.setModePrompt("interviewer", "Focus on system design depth.");

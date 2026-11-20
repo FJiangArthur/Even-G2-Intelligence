@@ -257,4 +257,6 @@ export interface HudMirror {
   readonly railMode?: string;
   readonly railViews?: string;
   readonly content?: string;
+  /** Ambient display: the glasses are blank except for an answer / cue pop-up (no frame, no images). */
+  readonly ambient?: boolean;
 }
