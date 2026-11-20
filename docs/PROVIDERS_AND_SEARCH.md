@@ -54,6 +54,7 @@ Verify action for a single claim. New: Setup → Copilot → "Prefer latest news
 - Where the search runs: the answer provider's own verified search; otherwise OpenAI web search when an OpenAI key
   is entered; otherwise nowhere. Setup shows which one applies, including "Web and news checks are off for this provider".
 - Phone: Checks cards show the verdict, "latest news", "via <provider>" and clickable, dated source chips.
+- Glasses (ambient display): the verdict pops up as `CHECK` / `FACT CHECK`; a news-biased check reads `news check` and ends with one `Src: site · date · +n` line for the newest dated source. Answer length "Detailed" lets a pop-up cue use up to 6 pages instead of 3; answers always page in full.
   Glasses: unchanged lanes (a contradicted, sourced check appears as a correction).
 
 Search cost: OpenAI bills per search plus tokens; DeepSeek counts results as input tokens; Zhipu bills per search in CNY.

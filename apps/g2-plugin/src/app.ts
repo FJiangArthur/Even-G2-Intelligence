@@ -6,6 +6,7 @@ import {
   loadPersistedProviderCredentials,
   persistProviderCredentials,
   providerCredentialsFromForm,
+  providerCredentialsForSession,
   type SessionFormState,
 } from "./config";
 import { G2ConversationController, LIVE_HISTORY_WRITE_DELAY_MS } from "./controller";
@@ -49,7 +50,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   const pixelArt = await Promise.race([bridge.getLocalStorage(GLASSES_IMAGES_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]) !== "off";
   const display = resolveGlassesDisplay(await Promise.race([bridge.getLocalStorage(GLASSES_DISPLAY_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]));
   const renderer = resolveGlassesLayout(new URLSearchParams(options.search ?? location.search).get("glasses")) === "hud"
-    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap, display })
+    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap, display, answerLength: config.answerLength })
     : new GlassesRenderer(bridge, { debounceMs: 120, onError: onGlassesError });
   const controller = new G2ConversationController(bridge, renderer, presentation, ...(options.transportFactory ? [options.transportFactory] as const : []));
   // Battery: batch live-session history saves (one shard + one index write per ~3 s, flushed on hide/stop).
@@ -138,7 +139,11 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
     onShortcut: id => controller.runShortcut(id),
     onAutoExplainTerms: enabled => controller.setAutoExplainTermsEnabled(enabled),
     onClearProviderKeys: () => clearPersistedProviderCredentials(bridge),
-    onSettingsChange: form => controller.saveSettings(form),
+    onSettingsChange: form => {
+      // Answer length also sizes the ambient cue pop-ups on the glasses.
+      (renderer as { setAnswerLength?: (length: string | undefined) => void }).setAnswerLength?.(form.answerLength);
+      return controller.saveSettings(form);
+    },
     onTestKey: (key, model) => controller.testKey(key, model),
     onTestProviderKey: (provider, key, model) => controller.testProviderKey(provider, key, model),
     onVerify: (target, id) => controller.verify(target, id),
@@ -178,8 +183,10 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   // session or saved on this phone); never sends keys anywhere else, never auto-connects.
   controller.setResumeHandler(async flag => {
     const form = ui.readForm();
-    if (!form.openaiApiKey.trim()) {
-      presentation.setResumePrompt("Add your OpenAI key in Setup, then tap Connect to resume");
+    // Any provider key will do here (a DeepSeek / Qwen / GLM / Kimi session needs no OpenAI key);
+    // Connect itself names the exact key that is missing for the selected providers.
+    if (!providerCredentialsForSession(form)) {
+      presentation.setResumePrompt("Add your provider keys in Setup, then tap Connect to resume");
       ui.selectTab("setup");
       return;
     }

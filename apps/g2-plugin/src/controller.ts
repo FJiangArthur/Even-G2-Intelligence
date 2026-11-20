@@ -366,7 +366,7 @@ export class G2ConversationController {
       files = await ingestPdfs(inputs, {
         parser: request.parser, signal: run.abort.signal,
         ...(request.extractLocal ? { extractLocal: request.extractLocal } : {}),
-        ...(request.parser === "openai" ? { openai: { fetch: fetcher, key, model: this.config.copilotModel } } : {}),
+        ...(request.parser === "openai" ? { openai: { fetch: fetcher, key, model: answerProviderInfo(this.config.answerProvider)?.api === "chat" ? DEFAULT_COPILOT_MODEL : this.config.copilotModel } } : {}),
         onStatus: status => { this.pdfFiles = status; this.emitHistory(); },
         save: async ({ session, entries }) => {
           await this.archiveQueue;

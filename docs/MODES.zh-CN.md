@@ -12,6 +12,8 @@
 
 > 说明：手机界面和眼镜上的文字目前是英文，所以下文中的按钮名、标签名都保留英文原文，并在旁边给出中文解释。
 
+> **眼镜显示方式。** 下面的眼镜示例展示的是完整 HUD。默认是“环境显示”（ambient）：对话中镜片保持空白，回答、查询结果、概念解释和核查结论会弹出，读完自动消失。双击可唤出这里展示的完整 HUD；在 Setup → G2 controls 打开 “Always show the glasses HUD” 可让它常亮。详见 [PIXEL_GESTURES.md](PIXEL_GESTURES.md)。回答长度（Setup → “Answer length”）以及核查所用的服务商和新闻搜索见 [PROVIDERS_AND_SEARCH.md](PROVIDERS_AND_SEARCH.md)。
+
 ## 一览
 
 | 模式 | 适合的场合 | 眼镜标签 | "建议"视图的名字 | 是否自动回答问题 | 刻意不做的事 |

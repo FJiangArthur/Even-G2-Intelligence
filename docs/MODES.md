@@ -10,6 +10,8 @@ A mode tells Helix what kind of conversation you are in. One tap changes three t
 
 Everything here is taken from `packages/conversation-sdk/src/modes.ts` (`MODE_PROFILES`, `PICKER_MODES`) and from how `apps/g2-plugin` uses it. If the code and this page disagree, the code wins.
 
+> **Glasses display.** The glasses examples below show the full HUD. By default the display is *ambient*: it stays blank during a conversation, and answers, lookups, concepts and check verdicts pop up and disappear. Double-tap wakes the full HUD shown here; Setup → G2 controls → "Always show the glasses HUD" keeps it on. See [PIXEL_GESTURES.md](PIXEL_GESTURES.md). Answer length (Setup → "Answer length") and the providers and news search behind the checks are described in [PROVIDERS_AND_SEARCH.md](PROVIDERS_AND_SEARCH.md).
+
 ## At a glance
 
 | Mode | Pick it when | Glasses tag | Suggestions view is called | Answers questions automatically | Deliberately left out |

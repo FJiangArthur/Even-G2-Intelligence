@@ -144,6 +144,8 @@ export interface GlassesHudOptions {
   readonly writeGapMs?: number;
   /** Mascot follows each answer (thinking / speaking). Default false: images change only on a switch. */
   readonly mascotAnimation?: boolean;
+  /** Setup → Answer length ("brief" | "standard" | "detailed"); "detailed" lets an ambient cue use more pages. */
+  readonly answerLength?: string;
   /** Ambient (default) or always-on display; see GlassesDisplay. */
   readonly display?: GlassesDisplay;
   /** Ambient display: idle time after which the woken HUD blanks again. Default AMBIENT_IDLE_MS; at least 1000 ms. */
@@ -496,6 +498,21 @@ interface HudItem {
   readonly live: string;
   /** CHECKS card form, when the item is a check. */
   readonly check?: string;
+  /** Verdicts: the dated source line shown at the end of the ambient pop-up ("Src: reuters.com · 2026-11-18 · +2"). */
+  readonly source?: string;
+}
+
+/** "web check", or "news check" when the search was biased to recent reporting (Setup → news search). */
+const checkKind = (result: { recency?: string }, plain: string) => result.recency === "news" ? "news check" : plain;
+/** One line naming the newest dated source of a verdict (site or host, date, how many more); undefined without sources. */
+export function verdictSourceLine(sources: readonly { url: string; title?: string; publishedAt?: string; site?: string }[]): string | undefined {
+  if (!sources.length) return undefined;
+  const dated = sources.filter(source => source.publishedAt).sort((a, b) => b.publishedAt!.localeCompare(a.publishedAt!));
+  const best = dated[0] ?? sources[0]!;
+  let name = oneLine(best.site ?? "");
+  if (!name) { try { name = new URL(best.url).hostname.replace(/^www\./u, ""); } catch { name = oneLine(best.title ?? ""); } }
+  if (!name) return undefined;
+  return `Src: ${name}${best.publishedAt ? ` · ${best.publishedAt}` : ""}${sources.length > 1 ? ` · +${sources.length - 1}` : ""}`;
 }
 
 const ASK_LABEL: Readonly<Record<string, string>> = { lookup: "LOOKUP", propose: "PROPOSAL", question: "QUESTION" };
@@ -523,15 +540,19 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
   }
   for (const result of snapshot.verifications) {
     const summary = oneLine(result.summary);
+    const source = verdictSourceLine(result.sources);
     items.push({ key: `v:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "verification",
       live: titled(verdictLabel(result.status), `${oneLine(result.target)}${summary ? ` — ${summary}` : ""}`),
-      check: `${verdictLine(result)} · verify\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}` });
+      check: `${verdictLine(result)} · ${checkKind(result, "verify")}\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}`,
+      ...(source ? { source } : {}) });
   }
   for (const result of snapshot.factChecks) {
     const summary = oneLine(result.summary);
+    const source = verdictSourceLine(result.sources);
     items.push({ key: `f:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "fact-check",
       live: titled(verdictLabel(result.status), `${oneLine(result.claim)}${summary ? ` — ${summary}` : ""}`),
-      check: `${verdictLine(result)} · web check\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}` });
+      check: `${verdictLine(result)} · ${checkKind(result, "web check")}\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}`,
+      ...(source ? { source } : {}) });
   }
   for (const fact of snapshot.summary?.keyFacts ?? []) {
     items.push({ key: `kf:${oneLine(fact).toLowerCase()}`, sig: "", kind: "fact", live: `Fact: ${oneLine(fact)}` });
@@ -568,7 +589,7 @@ const HANDLED: HudCommand = Object.freeze({ type: "handled" });
 const HINT_CAPTION = "tap: act · double-tap: menu\nhold: talk · swipe ↑↓: views";
 const VERIFY_PENDING_MS = 45_000;
 /** Ambient cues: at most CUE_QUEUE wait their turn; one that waited longer than CUE_STALE_MS is dropped. */
-const CUE_QUEUE = 3, CUE_STALE_MS = 45_000, CUE_PAGES = 3, CUE_LAST_PAGE_MS = 5000;
+const CUE_QUEUE = 3, CUE_STALE_MS = 45_000, CUE_PAGES = 3, CUE_PAGES_DETAILED = 6, CUE_LAST_PAGE_MS = 5000;
 /** Ambient: "● listening" / "○ paused" shows this long after the mic state changes. */
 const STATUS_CUE_MS = 4000;
 const CUE_TITLE: Readonly<Partial<Record<ItemKind, string>>> = { concept: "CONCEPT", ask: "LOOKUP", conflict: "CHECK", verification: "CHECK", "fact-check": "FACT CHECK" };
@@ -670,6 +691,8 @@ export class GlassesHud implements GlassesSurface {
   private cueQueue: AmbientCue[] = [];
   private statusCueAt?: number;
   private ambientTimer?: ReturnType<typeof setTimeout>;
+  /** Pages one ambient cue may use; follows Setup → Answer length. */
+  private cuePages = CUE_PAGES;
 
   public constructor(
     private readonly bridge: GlassesRenderBridge,
@@ -682,6 +705,7 @@ export class GlassesHud implements GlassesSurface {
     this.now = options.now ?? (() => Date.now());
     this.displayMode = options.display ?? DEFAULT_GLASSES_DISPLAY;
     this.idleMs = Math.max(1000, options.ambientIdleMs ?? AMBIENT_IDLE_MS);
+    this.setAnswerLength(options.answerLength);
     this.pager = this.createPager();
     this.frameValue = this.compose();
   }
@@ -1026,6 +1050,11 @@ export class GlassesHud implements GlassesSurface {
     return this.ambientSession() && !this.menu && this.now() >= this.awakeUntil;
   }
 
+  /** Setup → Answer length. Applies to cues that arrive from now on (answers always page in full). */
+  public setAnswerLength(length: string | undefined): void {
+    this.cuePages = length === "detailed" ? CUE_PAGES_DETAILED : CUE_PAGES;
+  }
+
   /** Setup switch: ambient or always-on. Takes effect right away (the page is swapped when needed). */
   public setDisplay(display: GlassesDisplay): void {
     if (this.disposed || display === this.displayMode) return;
@@ -1058,8 +1087,11 @@ export class GlassesHud implements GlassesSurface {
     const title = CUE_TITLE[item.kind];
     // Lookups pop up when their answer arrived, not while pending or after a failure.
     if (!title || (item.kind === "ask" && /^(pending|failed)\|/u.test(item.sig))) return;
-    const lines = wrapText(clean(item.check ?? item.live), HUD_LINE_WIDTH.body);
+    // Verdict pop-ups end with the dated source line (news search), so the wearer sees how fresh the evidence is.
+    const lines = wrapText(clean(`${item.check ?? item.live}${item.source ? `\n${item.source}` : ""}`), HUD_LINE_WIDTH.body);
     const pages: string[] = [];
+    // Setup → Answer length "Detailed" writes longer lookups and verdicts: allow them more pages before the "…".
+    const CUE_PAGES = this.cuePages;
     for (let index = 0; index < lines.length && pages.length < CUE_PAGES; index += BODY_LINES) {
       const page = lines.slice(index, index + BODY_LINES);
       // The last allowed page ends with "…" when text is left over (all of it is in the woken HUD and on the phone).
