@@ -234,5 +234,7 @@ function mountResumeBanner(host: HTMLElement, onResume: () => void, onDismiss: (
     if (!banner.isConnected) host.prepend(banner);
     banner.hidden = !text;
     resume.textContent = text ?? RESUME_PROMPT;
+    // v0.13 one page scroller: the banner floats at the top of the page; the sticky tab bar sits under it.
+    host.style.setProperty("--banner-h", text ? `${banner.offsetHeight}px` : "0px");
   };
 }

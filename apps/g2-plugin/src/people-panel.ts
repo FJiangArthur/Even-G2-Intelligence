@@ -162,7 +162,7 @@ export class PeoplePanel {
         const row = el("li");
         const go = el("button", "person-session"); go.type = "button";
         const source = sessionSource(session);
-        go.append(el("span", `source-badge badge-${source}`, SOURCE_LABEL[source]), el("span", "person-session-title", sessionTitle(session)), el("small", "", formatSessionDate(session.startedAt)));
+        go.append(el("span", `source-badge badge-${source}`, SOURCE_LABEL[source]), el("span", "person-session-title", sessionTitle({ ...session, title: this.controller.historyTitle(session) })), el("small", "", formatSessionDate(session.startedAt)));
         go.addEventListener("click", () => this.options.openSession(id));
         row.append(go); list.append(row);
       }

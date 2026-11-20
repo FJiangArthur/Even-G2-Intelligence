@@ -22,4 +22,5 @@ export * from "./speaker-attribution.js";
 export * from "./captions.js";
 export * from "./knowledge-transfer.js";
 export * from "./session-digest.js";
+export * from "./session-recap.js";
 export * from "./openai-knowledge.js";

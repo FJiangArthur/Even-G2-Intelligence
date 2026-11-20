@@ -69,11 +69,15 @@ describe("live history write coalescing", () => {
     expect(f.historyWrites).toEqual([historyShardKey(f.sessionId), HISTORY_INDEX_KEY]);
     const record = f.controller.openHistorySession(f.sessionId)!;
     expect(record.entries.map(entry => entry.kind)).toEqual(["transcript", "transcript", "transcript", "fact-check"]);
-    expect(record.session).toMatchObject({ title: "Order the Jetson boards this week.", summary: ["Hardware order."], keyFacts: ["12 weeks"] });
+    // v0.13: the title stays a placeholder while live (never the first utterance); the recap is written when the session ends.
+    expect(record.session).toMatchObject({ title: expect.stringMatching(/^Helix · \d{4}-/u), summary: ["Hardware order."], keyFacts: ["12 weeks"] });
     expect(f.controller.historySnapshot().status).toBe("Saved on this phone.");
     await f.transcribe("One more line.");
     await f.controller.disconnect(); // Saves the rest.
-    expect(f.historyWrites).toEqual([historyShardKey(f.sessionId), HISTORY_INDEX_KEY, historyShardKey(f.sessionId), HISTORY_INDEX_KEY]);
+    // v0.13: + one index write for the end time and the on-phone title (the summary call gets a 404 here).
+    expect(f.historyWrites).toEqual([historyShardKey(f.sessionId), HISTORY_INDEX_KEY, historyShardKey(f.sessionId), HISTORY_INDEX_KEY, HISTORY_INDEX_KEY]);
+    await f.controller.recapSettled();
+    expect(f.controller.openHistorySession(f.sessionId)!.session).toMatchObject({ title: "Hardware order", recap: { origin: "fallback" }, endedAt: expect.any(String) });
     await f.controller.dispose();
     const restarted = await live(f.storage);
     expect(restarted.controller.openHistorySession(f.sessionId)?.entries).toHaveLength(5);
@@ -84,7 +88,8 @@ describe("live history write coalescing", () => {
     await f.transcribe("Saved by dispose.");
     expect(f.historyWrites).toEqual([]);
     await f.controller.dispose();
-    expect(f.historyWrites).toEqual([historyShardKey(f.sessionId), HISTORY_INDEX_KEY]);
+    // v0.13: the last index write records the end time and the on-phone title.
+    expect(f.historyWrites).toEqual([historyShardKey(f.sessionId), HISTORY_INDEX_KEY, HISTORY_INDEX_KEY]);
   });
   it("deletes and imports immediately during a live session instead of waiting for the window", async () => {
     const f = await live();
@@ -112,7 +117,7 @@ describe("live history write coalescing", () => {
     vi.spyOn(f.storage, "set").mockImplementation((key, value) => { if (key === HISTORY_INDEX_KEY) throw new Error("quota"); return Map.prototype.set.call(f.storage, key, value) as Map<string, string>; });
     await expect(f.controller.flushHistory()).rejects.toThrow("Could not save local history");
     expect(f.controller.historySnapshot().status).toContain("Could not save local history");
-    expect(f.controller.openHistorySession(f.sessionId)?.entries).toEqual([]);
+    expect(f.controller.openHistorySession(f.sessionId)).toBeUndefined(); // v0.13: no record until its first line is saved
     vi.restoreAllMocks();
     await f.transcribe("Recovered.");
     await f.controller.disconnect();

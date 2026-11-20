@@ -434,22 +434,34 @@ export class CompanionUi {
   }
 
   /** Switch the visible panel (role=tab semantics). */
-  /** The page scroller (v0.11.5: the shell scrolls as a whole). */
-  private scroller(): HTMLElement | null { return this.root.querySelector<HTMLElement>(".shell"); }
+  /**
+   * The page scroller. v0.13: the document itself (v0.11.5 scrolled the 100dvh shell, a second
+   * scroller nested in the document); every tab, the header and the tab bar move as one page.
+   */
+  private scroller(): HTMLElement | null {
+    const doc = this.root.ownerDocument;
+    return (doc?.scrollingElement as HTMLElement | null) ?? doc?.documentElement ?? null;
+  }
   /**
    * Tabs share one scroller: a newly shown panel starts at its top when the page was scrolled into the
    * previous one (the header stays where it is otherwise); Answers returns to the newest message.
    */
   private alignPanel(tab: CompanionTab, previous: CompanionTab): void {
-    const scroller = this.scroller(), bar = this.root.querySelector<HTMLElement>("#tabbar-wrap");
-    if (!scroller || !bar || tab === previous) return;
+    const scroller = this.scroller(), bar = this.root.querySelector<HTMLElement>("#tabbar-wrap"), panels = this.root.querySelector<HTMLElement>(".panels");
+    if (!scroller || !bar || !panels || tab === previous) return;
     this.tabBarHeight(bar);
-    if (tab === "answers" && this.lastSnapshot?.feed.length) { scroller.scrollTop = scroller.scrollHeight; return; }
-    if (scroller.scrollTop > bar.offsetTop) scroller.scrollTop = bar.offsetTop;
+    // Where the page is scrolled exactly far enough for the tab bar to stick: the panels' own (never
+    // sticky) top edge, minus what stays pinned above them. The bar's own offset is useless once it sticks.
+    const top = panelScrollTop({ scrollTop: scroller.scrollTop, panelsTop: panels.getBoundingClientRect().top, pinnedBottom: bar.getBoundingClientRect().bottom });
+    if (top !== undefined) scroller.scrollTop = top;
+    if (tab === "answers" && this.lastSnapshot?.feed.length) { // back to the newest message
+      const delta = feedFollowDelta(this.feedEdges(this.element("conversation-feed")));
+      if (delta > 0 && Number.isFinite(delta)) scroller.scrollTop += delta;
+    }
   }
   private tabBarHeight(bar: HTMLElement): void {
     const height = bar.offsetHeight;
-    if (height) this.scroller()?.style.setProperty("--tabbar-h", `${height}px`);
+    if (height) this.root.querySelector<HTMLElement>(".shell")?.style.setProperty("--tabbar-h", `${height}px`);
   }
 
   public selectTab(tab: CompanionTab): void {
@@ -867,11 +879,13 @@ export class CompanionUi {
     const feed = this.element("conversation-feed");
     // v0.11.5: the page is the scroller (the feed has no scrollbar of its own).
     const scroller = this.scroller() ?? feed;
-    const followUpdates = shouldAutoScrollConversationFeed({
+    // v0.13: follow new messages when the reader is at the end of the page or can see the end of the
+    // feed (e.g. at the top of the page with a short feed); never while they have scrolled away to read.
+    const followUpdates = this.activeTab === "answers" && (shouldAutoScrollConversationFeed({
       scrollHeight: scroller.scrollHeight,
       scrollTop: scroller.scrollTop,
       clientHeight: scroller.clientHeight,
-    });
+    }) || feedFollowDelta(this.feedEdges(feed)) <= FEED_FOLLOW_SLACK_PX);
     feed.setAttribute("aria-busy", String(connecting));
     let contentChanged = false;
     const empty = this.element("feed-empty");
@@ -915,11 +929,18 @@ export class CompanionUi {
       });
     }
     if (contentChanged && followUpdates) {
-      const visible = this.activeTab === "answers";
-      if (visible) scroller.scrollTop = scroller.scrollHeight;
+      // Scroll only as far as the newest message needs: a short feed leaves the header where it is.
+      const follow = () => { const delta = feedFollowDelta(this.feedEdges(feed)); if (delta > 0 && Number.isFinite(delta)) scroller.scrollTop += delta; };
+      follow();
       // Late layout (fonts, the live caret line) can grow the feed after this frame: follow it once more.
-      if (visible) globalThis.requestAnimationFrame?.(() => { scroller.scrollTop = scroller.scrollHeight; });
+      globalThis.requestAnimationFrame?.(() => { if (this.activeTab === "answers") follow(); });
     }
+  }
+  /** Viewport geometry of the feed's last message and the sticky composer under it. */
+  private feedEdges(feed: HTMLElement): FeedEdges {
+    const last = feed.lastElementChild as HTMLElement | null, composer = this.root.querySelector<HTMLElement>(".composer");
+    const rect = last && !last.hidden ? last.getBoundingClientRect?.() : undefined;
+    return { endBottom: rect && (rect.width || rect.height) ? rect.bottom : undefined, viewportHeight: globalThis.innerHeight ?? 0, composerHeight: composer?.offsetHeight ?? 0 };
   }
 
   private renderCardBlock(item: FeedItem, snapshot: PresentationSnapshot): { element: HTMLElement; changed: boolean } {
@@ -1892,6 +1913,28 @@ export function shouldAutoScrollConversationFeed(
 ): boolean {
   const distanceFromBottom = metrics.scrollHeight - metrics.clientHeight - metrics.scrollTop;
   return distanceFromBottom <= threshold;
+}
+
+/** v0.13 page scroll helpers (pure). */
+export interface FeedEdges { readonly endBottom: number | undefined; readonly viewportHeight: number; readonly composerHeight: number }
+/** A message this far below the composer still counts as "the reader sees the end of the feed". */
+export const FEED_FOLLOW_SLACK_PX = 48;
+/**
+ * How far the page must scroll (px) for the feed's last message to sit just above the sticky composer.
+ * <= 0: already visible. Infinity: nothing is laid out (empty feed or hidden tab), so never follow.
+ */
+export function feedFollowDelta(edges: FeedEdges): number {
+  if (edges.endBottom === undefined || !(edges.viewportHeight > 0)) return Number.POSITIVE_INFINITY;
+  return edges.endBottom - (edges.viewportHeight - edges.composerHeight - 8);
+}
+/**
+ * After a tab switch: the scroll position that puts the new panel's top right under the stuck tab bar,
+ * or undefined when the page is not scrolled into the panels (the header stays where it is).
+ * `panelsTop` and `pinnedBottom` (bottom edge of the tab bar) are viewport coordinates.
+ */
+export function panelScrollTop(metrics: { readonly scrollTop: number; readonly panelsTop: number; readonly pinnedBottom: number }): number | undefined {
+  const overshoot = metrics.pinnedBottom - metrics.panelsTop;
+  return overshoot > 1 ? Math.max(0, metrics.scrollTop - overshoot) : undefined;
 }
 
 function feedItemSignature(item: FeedItem, meta?: AnswerMeta): string {

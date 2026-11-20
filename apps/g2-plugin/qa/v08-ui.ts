@@ -71,6 +71,28 @@ const seeds: Seed[] = [
   },
 ];
 
+// v0.13 fixtures (?legacy=1): what History looked like before — records with nothing in them (one per
+// Connect / resume), sessions titled with their first utterance, a long 中文 title — plus ?many=<n> filler
+// sessions for long-list scrolling.
+if (params.get("legacy") === "1") {
+  const legacy = (id: string, offsetDays: number, hour: number, minute: number, lines: readonly (readonly [string, string, HistoryEntry["kind"]?])[]): Seed => {
+    const start = day(offsetDays, hour, minute);
+    const entries = lines.map(([speaker, text, kind], index) => line(id, index, start, speaker, text, kind ?? "transcript", kind === "answer" ? provenance : undefined));
+    return { session: { id, source: "helix", title: lines[0]?.[1].slice(0, 100) ?? `Helix · ${start}`, startedAt: start, updatedAt: entries.at(-1)?.occurredAt ?? start }, entries };
+  };
+  seeds.push(
+    legacy("session_qa_l1", 0, 20, 0, [["Other speaker", "So"], ["Other speaker", "So the Orin order slipped again and Orin stock is the blocker."], ["You", "Can Kan escalate the Orin order?"], ["Helix", "Yes: ask Kan to escalate with the distributor.", "answer"]]),
+    legacy("session_qa_e1", 0, 17, 42, []), legacy("session_qa_e2", 0, 17, 21, []), legacy("session_qa_e3", 1, 5, 30, []),
+    legacy("session_qa_l2", 0, 14, 20, [["Other speaker", "And what's up"], ["You", "Not much, heading out."]]),
+    legacy("session_qa_l3", 1, 3, 10, [["Other speaker", "我们下周把感知模块迁移到新的融合框架上，然后在夜间数据集上重新跑一遍评测，看看车道线的指标有没有回退。"], ["You", "好的，我来准备数据。"]]),
+  );
+}
+for (let index = 0; index < Number(params.get("many") ?? 0); index++) {
+  const id = `session_qa_m${index}`, start = day(4 + Math.floor(index / 3), 15 + (index % 3), 5);
+  seeds.push({ session: { id, source: "helix", title: `Weekly sync ${index + 1}`, startedAt: start, updatedAt: start, summary: [`Sync ${index + 1}: reviewed the open items and assigned owners.`],
+    recap: { origin: "fallback", generatedAt: start } }, entries: [line(id, 0, start, "Other speaker", `Item ${index + 1} is on track for the review.`)] });
+}
+
 const storage = new Map<string, string>();
 if (params.get("state") !== "empty") {
   storage.set("helix.g2.history.v1", JSON.stringify({ version: 1, sessions: seeds.map(seed => seed.session), entries: seeds.flatMap(seed => seed.entries) }));
@@ -174,4 +196,5 @@ if (params.get("mirror") === "open") root.querySelector<HTMLButtonElement>("#mir
 if (params.get("people") === "focus") root.querySelector<HTMLButtonElement>(".person-card [aria-expanded]")?.click();
 if (params.get("paste") === "1") root.querySelector<HTMLDetailsElement>(".paste-markdown")?.setAttribute("open", "");
 (document.querySelector("#peek") as HTMLElement).hidden = true;
+(window as unknown as { __qa: unknown }).__qa = { controller, presentation, ui, storage, final, answer, question, THEM, YOU };
 (window as unknown as { __ready: boolean }).__ready = true;

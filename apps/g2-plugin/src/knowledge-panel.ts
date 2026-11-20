@@ -421,7 +421,7 @@ export class KnowledgePanel {
     const when = kb.syncedAt ? new Date(kb.syncedAt).toLocaleString() : "";
     this.kbStatus.textContent = kb.syncing ? `Syncing ${kb.syncing.done} of ${kb.syncing.total}…${kb.syncing.failed ? ` ${kb.syncing.failed} failed` : ""}`
       : kb.notice ? kb.notice
-      : kb.hasStore ? `${kb.synced} session${kb.synced === 1 ? "" : "s"} in OpenAI${kb.pending ? ` · ${kb.pending} new or changed, not synced yet` : " · up to date"}${when ? ` · last sync ${when}` : ""}`
+      : kb.hasStore ? `${kb.synced} session${kb.synced === 1 ? "" : "s"} in OpenAI${kb.pending ? ` · ${kb.pending} new or changed, not synced yet` : kb.removals ? "" : " · up to date"}${kb.removals ? ` · ${kb.removals} removed on this phone, still in OpenAI until you sync` : ""}${when ? ` · last sync ${when}` : ""}`
       : kb.source === "openai" ? "Nothing is in OpenAI yet: answers use the phone until you sync." : "";
   }
 
@@ -457,7 +457,8 @@ export class KnowledgePanel {
       card.setAttribute("aria-label", `${SOURCE_LABEL[item.source]} context: ${item.sessions} sessions, ${item.entries} lines. ${SOURCE_COPY[item.source]}.`);
       return card;
     }));
-    this.mapNode.innerHTML = knowledgeMapSvg({ stats: this.controller.knowledgeStats(), sessions, people });
+    // v0.13: the map shows the titles History shows (never a placeholder or the first utterance).
+    this.mapNode.innerHTML = knowledgeMapSvg({ stats: this.controller.knowledgeStats(), sessions: sessions.map(session => ({ ...session, title: this.controller.historyTitle(session) })), people });
     this.mapNode.prepend(...[pixelLegend()]);
   }
 }
