@@ -1693,6 +1693,7 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
 
             <section class="config-group" aria-labelledby="gesture-title">
               <div class="config-group-heading"><h3 id="gesture-title">G2 controls</h3><p>Temple touchpad and R1 ring share the same gestures. Start, pause or disconnect on this phone.</p></div>
+              <label class="toggle" for="glasses-always-on"><input id="glasses-always-on" type="checkbox" data-no-persist /><span>Always show the glasses HUD<small>Off (default): the glasses stay blank during a conversation. Answers and cues pop up and disappear when done. Double-tap wakes the full HUD with its menu; double-tap on the menu, or 20 seconds without a gesture, hides it again.</small></span></label>
               <ul class="gesture-list gesture-help" aria-label="Glasses gestures">${gestureHelpLines().map(line => `<li>${gestureLineMarkup(line)}</li>`).join("")}</ul>
               <p class="field-note">The phone follows the glasses: when you switch views with the ring or temple, the matching tab opens here unless you touched the phone in the last 8 seconds.</p>
             </section>

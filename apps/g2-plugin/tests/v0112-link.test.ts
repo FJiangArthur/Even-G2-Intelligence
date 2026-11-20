@@ -27,7 +27,7 @@ class LinkBridge implements GlassesRenderBridge {
 }
 async function mount(options: ConstructorParameters<typeof GlassesHud>[1] = {}) {
   const bridge = new LinkBridge();
-  const hud = new GlassesHud(bridge, { tickMs: 0, mascotIntervalMs: 50, debounceMs: 120, captionIntervalMs: 120, ...options });
+  const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0, mascotIntervalMs: 50, debounceMs: 120, captionIntervalMs: 120, ...options });
   const presentation = new ConversationPresentation();
   presentation.subscribe(snapshot => hud.render(snapshot.glasses, snapshot));
   await hud.initialize();

@@ -6,7 +6,7 @@ import { GlassesHud } from "../src/glasses-hud";
 import { ConversationPresentation } from "../src/presentation";
 
 const bridge = await waitForEvenAppBridge();
-const hud = new GlassesHud(bridge as never, { tickMs: 0, mascotIntervalMs: 300, mascotAnimation: true });
+const hud = new GlassesHud(bridge as never, { display: "always-on", tickMs: 0, mascotIntervalMs: 300, mascotAnimation: true });
 const presentation = new ConversationPresentation();
 presentation.subscribe(snapshot => hud.render(snapshot.glasses, snapshot));
 await hud.initialize();

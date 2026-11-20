@@ -143,9 +143,10 @@ export function renderGlassesMirror(container: HTMLElement, mirror?: HudMirror):
   svg.setAttribute("aria-label", model.label);
   svg.dataset.view = model.view;
   svg.dataset.menu = String(model.menuOpen);
+  if (mirror.ambient) svg.dataset.ambient = "true";
   const body = HUD_FRAME;
-  // The one BODY box: border width and grey level as on the glasses (2 px, level 9).
-  add("rect", { x: body.xPosition + body.borderWidth / 2, y: body.yPosition + body.borderWidth / 2, width: body.width - body.borderWidth, height: body.height - body.borderWidth,
+  // The one BODY box: border width and grey level as on the glasses (2 px, level 9). The ambient page has no box.
+  if (!mirror.ambient) add("rect", { x: body.xPosition + body.borderWidth / 2, y: body.yPosition + body.borderWidth / 2, width: body.width - body.borderWidth, height: body.height - body.borderWidth,
     rx: body.borderRadius, fill: "none", stroke: greenLevel(body.borderColor), "stroke-width": body.borderWidth });
   for (const image of model.images) {
     const box = HUD_IMAGES[image.slot];
