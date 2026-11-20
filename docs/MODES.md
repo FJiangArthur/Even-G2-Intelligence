@@ -8,7 +8,7 @@ A mode tells Helix what kind of conversation you are in. One tap changes three t
 2. **What the background copilot looks for** – its tone, what "suggestions" mean, and what the summary focuses on.
 3. **Which features are on** – a preset of toggles (summary, concept cards, claims, auto-answer and so on).
 
-Everything here is taken from `packages/conversation-sdk/src/modes.ts` (`MODE_PROFILES`, `PICKER_MODES`) and from how `apps/g2-plugin` uses it. If the code and this page disagree, the code wins.
+Everything here is taken from `packages/conversation-sdk/src/modes.ts` (`MODE_PROFILES`, `PICKER_MODES`) and from how `apps/g2-plugin` uses it; the Notes mode section also draws on `todo-list.ts` and `session-notebook.ts`. If the code and this page disagree, the code wins.
 
 > **Glasses display.** The glasses examples below show the full HUD. By default the display is *ambient*: it stays blank during a conversation, and answers, lookups, concepts and check verdicts pop up and disappear. Double-tap wakes the full HUD shown here; Setup → G2 controls → "Always show the glasses HUD" keeps it on. See [PIXEL_GESTURES.md](PIXEL_GESTURES.md). Answer length (Setup → "Answer length") and the providers and news search behind the checks are described in [PROVIDERS_AND_SEARCH.md](PROVIDERS_AND_SEARCH.md).
 
@@ -24,6 +24,7 @@ Everything here is taken from `packages/conversation-sdk/src/modes.ts` (`MODE_PR
 | **Learning** | Lectures and walkthroughs: concepts, study notes, smart questions | `LEARN` | `ASK` | Yes | Conflicts, claims, people tracking |
 | **Social** | Casual talk: easy follow-ups and quick look-ups | `SOCIAL` | `TALK` | No | Conflicts, claims |
 | **Quiet** | Captions and a running summary only (phone and woken HUD) | `QUIET` | `ASK THEM` | No | Suggestions, concept cards, conflicts, claims, people, anything proactive |
+| **Notes** | You want action items, a to-do list and meeting notes, not answers | `NOTES` | `ASK THEM` | No | Suggestions, concept cards, conflicts, claims, answering things people mention |
 
 The order above is the order of the picker on the phone and on the glasses.
 
@@ -31,18 +32,21 @@ The order above is the order of the picker on the phone and on the glasses.
 
 `●` on, `○` off. The row names are the keys in `ModePresets`; the Setup label is what the same switch is called on the phone.
 
-| Preset key | Setup label | Meeting | Technical | Interviewer | Partner | Negotiation | Learning | Social | Quiet |
-| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
-| `summarize` | Rolling summary | ● | ● | ● | ● | ● | ● | ● | ● |
-| `concepts` | Concept cards | ● | ● | ● | ○ | ● | ● | ● | ○ |
-| `conflicts` | Flag conflicting statements | ● | ● | ● | ○ | ● | ○ | ○ | ○ |
-| `suggestions` | Suggest questions | ● | ● | ● | ● | ● | ● | ● | ○ |
-| `implicitAsks` | Answer things people mention | ● | ● | ○ | ○ | ● | ● | ● | ○ |
-| `webGrounding` | Use web search | ● | ● | ● | ○ | ● | ● | ● | ● |
-| `claims` | Find claims to verify | ● | ● | ● | ○ | ● | ○ | ○ | ○ |
-| `people` | Track people | ● | ● | ● | ● | ● | ○ | ● | ○ |
-| `autoAnswer` | Answer automatically | ● | ● | ● | ○ | ● | ● | ○ | ○ |
-| `responseStrategy` | Response strategy | reactive | reactive | reactive | reactive | reactive | reactive | reactive | reactive |
+| Preset key | Setup label | Meeting | Technical | Interviewer | Partner | Negotiation | Learning | Social | Quiet | Notes |
+| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| `summarize` | Rolling summary | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| `concepts` | Concept cards | ● | ● | ● | ○ | ● | ● | ● | ○ | ○ |
+| `conflicts` | Flag conflicting statements | ● | ● | ● | ○ | ● | ○ | ○ | ○ | ○ |
+| `suggestions` | Suggest questions | ● | ● | ● | ● | ● | ● | ● | ○ | ○ |
+| `implicitAsks` | Answer things people mention | ● | ● | ○ | ○ | ● | ● | ● | ○ | ○ |
+| `webGrounding` | Use web search | ● | ● | ● | ○ | ● | ● | ● | ● | ● |
+| `claims` | Find claims to verify | ● | ● | ● | ○ | ● | ○ | ○ | ○ | ○ |
+| `people` | Track people | ● | ● | ● | ● | ● | ○ | ● | ○ | ● |
+| `autoAnswer` | Answer automatically | ● | ● | ● | ○ | ● | ● | ○ | ○ | ○ |
+| `responseStrategy` | Response strategy | reactive | reactive | reactive | reactive | reactive | reactive | reactive | reactive | reactive |
+| `noteTaking` | (no switch; set by the mode) | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ● |
+
+`noteTaking` is the one preset without a Setup switch: it turns on the to-do list, the running notes and the spoken to-do commands, and only Notes sets it.
 
 ## How modes work
 
@@ -61,8 +65,8 @@ Presets are a starting point, not a lock. After switching you can flip any toggl
 
 Two side effects are worth knowing:
 
-- Switching to a mode with **Concept cards** off (Partner, Quiet) also turns off the separate "Explain technical terms automatically" option.
-- Switching to a mode with **Find claims to verify** off (Partner, Learning, Social, Quiet) turns off live web fact-checking if it was on and cancels checks in flight.
+- Switching to a mode with **Concept cards** off (Partner, Quiet, Notes) also turns off the separate "Explain technical terms automatically" option.
+- Switching to a mode with **Find claims to verify** off (Partner, Learning, Social, Quiet, Notes) turns off live web fact-checking if it was on and cancels checks in flight.
 
 Neither is switched back on by returning to another mode. Re-enable them yourself if you want them.
 
@@ -72,6 +76,7 @@ Neither is switched back on by returning to another mode. Re-enable them yoursel
 - When the HUD is drawing images, the mode has an icon badge, and the splash shows `HELIX` with the mode name.
 - When images are off, the short tag from the table above is appended to the status line instead (`… · TECH`). Meeting is the default and shows no tag.
 - The suggestions view takes the mode's own name: it appears as `PROBE`, `CHECK IN`, `TALK` and so on in the view list, in the header of that view, and as the matching menu item (`Probe`, `Check in`, `Talk`).
+- In Notes mode the SUMMARY view is called `TO-DO` in the same three places (menu item `To-do`).
 
 ### Your own questions
 
@@ -467,6 +472,113 @@ Double-tap: menu ▶ Mode to change.
 > Remain quiet unless directly asked a clear question or given a manual query. Never proactively interrupt.
 
 Customise it to shape the answers you ask for by hand, for example to keep them to a single line.
+
+---
+
+### Notes
+
+*"Note-taker: action items, a living to-do list and meeting notes. No auto-answers."*
+
+**What it is for.** Taking the notes so you can stay in the conversation. Helix listens for action items (who will do what, by when), keeps them in one to-do list that it edits instead of appending to, and writes short notes of what was discussed and decided. It does not answer for you.
+
+**Choose it when** the outcome of the meeting is a list: a stand-up, a planning session, a customer call with follow-ups. If you also want Helix to answer questions and suggest follow-ups, use Meeting instead.
+
+**What it shows.**
+
+- **On the phone, Summary tab:** the to-do list comes first. Each item has a checkbox, its text, an owner and a due field, buttons to move it up or down or delete it, and a line saying where it came from (the quoted words and the speaker, or "Added by voice" / "Added on phone"). Below it are the notes, then the rolling summary, which focuses on decisions, action items with owners and due dates, open questions and numbers.
+- **On the glasses:** one short confirmation line per change, and nothing else. The forms are `TODO + …` (added), `TODO ~ …` (changed), `TODO done: …`, `TODO open: …` and `TODO removed: …`; owner and due date follow the text, with weekdays shortened (`TODO + Send the quote - Mei, Fri`). With the default ambient display the line pops up under the title `TO-DO` and disappears like any other cue (it stays at least 5 seconds, a tap closes it). Notes and the summary do not pop up. In the woken HUD the confirmations are in the LIVE list, and the SUMMARY view is called `TO-DO` in this mode: in the view list, in its header and in the menu (`To-do`). It lists open items first (`[ ]`), then done ones (`[x]`), then the six newest notes, then the summary.
+- **In History:** to-dos and notes are saved with the session. The session card counts them (`… · 3 to-dos (2 open)`), the session view shows them under the summary, and once the session has ended you can keep editing the list there. Markdown export writes them as task checkboxes (`- [ ] Send the quote (Mei, due Friday)`) under `## To-dos`, followed by `## Notes`; importing such a note brings the to-dos back.
+
+**How items get on the list.** Two ways, and they edit the same list:
+
+1. **From the conversation.** The background copilot proposes operations on the list: add, update, complete, remove. Every proposed to-do and note must quote words that were actually said in the recent conversation; one that does not is dropped. A repeated or reworded item updates the existing one instead of adding a second. At most 4 to-do changes and 3 notes are taken per pass. A session holds up to 60 to-dos and 80 notes.
+2. **By voice.** A sentence that matches one of the commands below is applied at once on the phone, without a model call. Commands are taken from your own speech: a line that the transcription attributes to another speaker is not treated as a command (the copilot still hears it).
+
+**Voice commands.** "X" is the item; a few words of it are enough (at least 60% of the words you say must be in the item). "It", "that one" or "the last one" mean the item you touched last, or the only open item. A leading "hey", "okay", "please", "Helix" or "can you" is ignored. Instead of "to-do" you can say "task", "action item" or "reminder".
+
+| You want to | Say, for example |
+| --- | --- |
+| Add an item | "Add a to-do to call the vendor by Friday" · "Add a task: book the demo room" · "Put the vendor call on my to-do list" · "Remind me to send the notes" (owner becomes Me) |
+| Add with an owner | "Add a to-do for Mei to send the quote" · "Add a to-do: Mei will send the quote by Friday" · "… assigned to Mei" |
+| Mark it done | "Mark the vendor call done" · "Check off the vendor call" · "The vendor call to-do is done" |
+| Reopen it | "Mark the vendor call as not done" · "Reopen the vendor call" |
+| Change the due date | "Change the deadline to Monday" (the last item) · "Move the deadline for the quote to Monday" · "Make the quote due Friday" |
+| Change the owner | "Assign the quote to Raj" · "Change the owner of the quote to Raj" |
+| Reword it | "Rename the vendor call to call the distributor" |
+| Remove it | "Remove the vendor call from my to-do list" · "Delete the vendor call" · "Cancel the task book the room" |
+
+A due date is recognised at the end of an add command after "by", "due", "before", "on" or "until": a weekday, "tomorrow", "next week", "end of month", a date such as "March 3" or "3/14", or a time such as "5 pm". It is kept as the words you said, not converted to a calendar date.
+
+Basic Chinese commands (add, complete and remove only; owner, due date and rename have no Chinese form yet):
+
+| 想做的事 | 说法举例 |
+| --- | --- |
+| Add | 「添加待办 给供应商打电话」 · 「新增任务 预订会议室」 · 「记一个待办 发报价」 |
+| Mark done | 「把给供应商打电话标记为完成」 · 「完成待办 发报价」 |
+| Remove | 「删除待办 预订会议室」 · 「取消任务 预订会议室」 |
+
+**What it does not do.**
+
+- No automatic answers. Ask from the menu (**Answer**) or hold to talk when you want one; the answer is brief and drawn from the conversation.
+- No suggestions, concept cards, conflict flags or claims, and statements are not treated as look-up requests.
+- No invented tasks: a copilot item without a matching quote is dropped, and the prompt tells the model never to invent tasks, owners or dates.
+- No reminders or notifications, and no sync to a task app. The list lives in the session; take it with you through the Markdown export.
+- Text that looks like a credential, a card or ID number, or a medical record is not written into a to-do or note.
+
+**Track people** and **Use web search** stay on. The mode also sets `noteTaking`, which has no switch in Setup: to-do capture and the voice commands are active exactly while the mode is Notes.
+
+| Preset key | Setup label | Value |
+| --- | --- | --- |
+| `summarize` | Rolling summary | on |
+| `concepts` | Concept cards | **off** |
+| `conflicts` | Flag conflicting statements | **off** |
+| `suggestions` | Suggest questions | **off** |
+| `implicitAsks` | Answer things people mention | **off** |
+| `webGrounding` | Use web search | on |
+| `claims` | Find claims to verify | **off** |
+| `people` | Track people | on |
+| `autoAnswer` | Answer automatically | **off** |
+| `responseStrategy` | Response strategy | `reactive` |
+| `noteTaking` | (no switch; set by the mode) | on |
+
+**On the glasses.** A confirmation popping up on the ambient display, and the TO-DO view in the woken HUD:
+
+```text
+TO-DO
+TODO + Send the quote - Mei, Fri
+```
+
+```text
+TO-DO 1/1
+[ ] Send the quote - Mei, Fri
+[ ] Call the vendor
+[x] Book the room
+Notes
+• Budget approved at 40k.
+```
+
+Before anything is captured the view reads:
+
+```text
+TO-DO
+No to-dos or notes yet.
+
+Action items and notes appear
+here as people talk.
+```
+
+**Built-in prompt**
+
+> Act as the wearer's note-taker. Stay quiet unless the wearer asks directly; then answer briefly from the conversation: what was decided, who owns what and by when. Never invent action items, owners or dates.
+
+Customise it to shape the answers you ask for by hand, for example "answer with the open to-dos first". It does not change how to-dos and notes are captured: that part of the copilot's instructions is fixed in the code. You can still flip any preset switch in Setup after choosing the mode, for example turn **Suggest questions** back on.
+
+**Honest status.**
+
+- The capture prompts have only been tested with mocked model replies. They have not been run against a live model, so how well a real model fills the list is not measured.
+- Voice commands are pattern matches on the transcript. A transcription error can make Helix miss a command, and an ordinary sentence that happens to start like one ("delete the vendor call slide") can change the list. The glasses confirm every change, and the list can be corrected on the phone at any time.
+- With OpenAI the reply format is enforced by a strict JSON schema. DeepSeek, Qwen, Zhipu GLM and Moonshot Kimi have no strict schema, so the schema (including the to-do and note fields) is sent inside the prompt; the reply is validated the same way, but a model that ignores the format produces no to-dos for that pass.
+- Tested in the unit tests and on the desktop with fake providers. Not accepted on G2 hardware.
 
 ## Legacy modes
 

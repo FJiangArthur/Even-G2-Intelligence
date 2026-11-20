@@ -57,7 +57,7 @@ Choose how the PDFs are read:
 
 The on-phone parser is pdf.js. It is loaded only when the first PDF is parsed, so it does not slow app start, but it adds about 1.8 MB to the plugin package.
 
-The text is saved on the phone as an ordinary knowledge document: listed under **Obsidian** with the tag `pdf`, visible in History, deletable there, and counted in the 5 MiB archive limit. The on-phone keyword search uses it in answers like any other passage, with the page number kept. If **OpenAI knowledge base** is selected and already created, newly added PDFs are synced to it right away; otherwise they are included in the next **Sync to OpenAI**. PDFs are not sent by **Send Obsidian notes to Omi**.
+The text is saved on the phone as an ordinary knowledge document: stored under the **Obsidian** source with the tag `pdf`, listed in History in the **Documents** group after the conversations (open or remove it there), and counted in the 5 MiB archive limit. The on-phone keyword search uses it in answers like any other passage, with the page number kept. If **OpenAI knowledge base** is selected and already created, newly added PDFs are synced to it right away; otherwise they are included in the next **Sync to OpenAI**. PDFs are not sent by **Send Obsidian notes to Omi**.
 
 ### What was checked where
 
@@ -67,7 +67,7 @@ Not checked, needs the real Even app on a phone: whether its WebView opens a fil
 
 ## Search and use local memory
 
-History contains past Helix sessions and imported Omi conversations. Search accepts English and Chinese. Open a result to see its original session, passage, time and speaker when available. Generated answers and Omi summaries remain searchable, but only original transcript passages are eligible for RAG.
+History contains past Helix sessions, imported Omi conversations and notes, and (under **Documents**) the PDFs you added. Since 0.13 a Helix session is saved with its first content rather than at Connect, gets a title and overview when it ends (one OpenAI call; a title made on the phone otherwise), and carries its Notes-mode to-dos and notes; sessions are grouped by day and removed with an in-page confirmation. The switch **Let the knowledge base read history** in History is the same setting as **Use saved knowledge in answers** in Knowledge: off, nothing saved (conversations, Omi, Obsidian notes, PDFs) is read for answers or synced to OpenAI. Search accepts English and Chinese. Open a result to see its original session, passage, time and speaker when available. Generated answers and Omi summaries remain searchable, but only original transcript passages are eligible for RAG.
 
 With local memory enabled (the default), relevant past transcript passages are supplied alongside the current question and captured session context. Each quoted passage retains its available speaker, session ID/title and Helix/Omi source. First-person preferences belong to that recorded speaker, and an unknown speaker stays unknown. The current conversation takes priority over old or conflicting memories. Retrieval updates as completed transcripts are saved and imports finish; it does not make a separate network request. It uses bilingual lexical matching with recency weighting, so a paraphrase with no shared terms can be missed. At most five snippets of 600 characters each are included, within the existing aggregate model request budget.
 

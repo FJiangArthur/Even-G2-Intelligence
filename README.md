@@ -37,6 +37,7 @@ It is cloud AI called from the phone, not offline AI.
 - [News-backed fact checks](#news-backed-fact-checks)
 - [Answer length](#answer-length)
 - [Knowledge base and PDF import](#knowledge-base-and-pdf-import)
+- [History](#history)
 - [Keys, data and privacy](#keys-data-and-privacy)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -51,7 +52,7 @@ It is cloud AI called from the phone, not offline AI.
 | Moment | On the glasses |
 |---|---|
 | Someone asks a question, or you ask for an answer | The question and answer pop up (`THEY ASKED`, `ANSWER`, `ANSWER KEY`). Long answers turn their own pages. The pop-up disappears 8 seconds after the answer is finished. |
-| A cue arrives: a concept, a finished lookup, a conflict, a check verdict | A short card titled `CONCEPT`, `LOOKUP`, `CHECK` or `FACT CHECK`, then blank again. |
+| A cue arrives: a concept, a finished lookup, a conflict, a check verdict, a to-do change in Notes mode | A short card titled `CONCEPT`, `LOOKUP`, `CHECK`, `FACT CHECK` or `TO-DO`, then blank again. |
 | The microphone turns on or off | `● listening`, `○ paused` or `○ mic off` in the corner for 4 seconds. |
 | You double-tap | The full HUD wakes with its menu open: Answer, Answer all, Verify, the views, Mode ▶, Pause/Resume, Stop, Close. |
 | You double-tap on the menu, or make no gesture for 20 seconds | Blank again. |
@@ -81,6 +82,7 @@ A mode tells Helix what kind of conversation you are in. One tap (phone) or doub
 | **Learning** | Lectures and walkthroughs | Yes | `ASK` | Conflicts, claims, people tracking |
 | **Social** | Casual talk | No | `TALK` | Conflicts, claims |
 | **Quiet** | Captions and a running summary only (on the phone and in the woken HUD; the ambient display shows no caption) | No | `ASK THEM` | Suggestions, concept cards, anything proactive |
+| **Notes** | You want action items, a to-do list and meeting notes | No | `ASK THEM` | Suggestions, concept cards, conflicts, claims |
 
 - **Meeting** is the default, all-purpose mode: a direct answer first, then the decision, owner, risk or next step it implies.
 - **Technical** keeps every feature on and tunes answers and follow-ups for engineering detail: specs, trade-offs, sharp probes.
@@ -90,8 +92,9 @@ A mode tells Helix what kind of conversation you are in. One tap (phone) or doub
 - **Learning** explains concepts, keeps study notes and suggests smart questions during a lecture or walkthrough.
 - **Social** offers easy follow-ups and quick lookups for casual talk, and does not answer on its own.
 - **Quiet** only captions and summarises, on the phone and in the woken HUD. Ask when you want help.
+- **Notes** is a note-taker: it captures action items with owner and due date into one to-do list that it edits instead of appending to, and writes short meeting notes. You can also edit the list by voice ("add a to-do to call the vendor by Friday", "mark the vendor call done", and basic Chinese forms such as 「添加待办 …」) or on the phone. The glasses show only a one-line `TODO + …` confirmation; the list is in the `TO-DO` view of the woken HUD, in the phone's Summary tab, and saved with the session in History and its Markdown export. It does not answer automatically.
 
-Every mode's system prompt is editable in Setup (up to 4,000 characters), and a preset is a starting point: you can flip any switch after choosing a mode. The full guide, with each preset table and the built-in prompts quoted verbatim, is [docs/MODES.md](docs/MODES.md) ([简体中文](docs/MODES.zh-CN.md)).
+There are nine modes in the picker. Every mode's system prompt is editable in Setup (up to 4,000 characters), and a preset is a starting point: you can flip any switch after choosing a mode. The full guide, with each preset table and the built-in prompts quoted verbatim, is [docs/MODES.md](docs/MODES.md) ([简体中文](docs/MODES.zh-CN.md)).
 
 ## Providers
 
@@ -176,6 +179,17 @@ Two ways to read a PDF:
 The on-phone parser is [pdf.js](https://mozilla.github.io/pdf.js/), loaded only when the first PDF is parsed.
 
 **A known limit of the host app:** the Even Hub bridge has no file picker and no file-save API. Whether the Even app's WebView opens a file picker or a share sheet has not been verified on a phone, so every transfer has a fallback (paste text, add a PDF by link, copy to clipboard, show Markdown in the page) and tells you which one happened. Details: [docs/MEMORY_GUIDE.md](docs/MEMORY_GUIDE.md).
+
+## History
+
+The History tab is the record of your conversations. Everything in it is stored on the phone.
+
+- **A summary after each conversation.** When a session ends, Helix makes one model call over the transcript and saves a short title, a one-to-two sentence overview, summary bullets and key facts, together with which model and prompt version wrote them and when. This call uses your OpenAI key. Without one, with almost nothing said, or if the call fails, the session gets a title made on the phone from what was said (for example "About Orin, Jetson") and you can tap **Generate summary** in the session later.
+- **Only real conversations are kept.** Connecting does not create a session: the record appears with the first saved line, summary item, to-do or note. Empty records left by earlier versions are removed at startup. If the app is interrupted and you tap to resume within 30 minutes, the conversation continues as the same session, including its to-do list.
+- **Cards.** Sessions are grouped by day (Today, Yesterday, then dates). A card shows the title, the time and duration, the overview, and labelled counts such as "10 speaker turns · 2 Helix answers · 3 to-dos (2 open)". PDFs you added to the knowledge base are listed last under **Documents**, not among the conversations. Open a card for the summary, to-dos and notes, AI cues, transcript and mindmap, and to export it as Markdown.
+- **Removing sessions.** Open a session and tap **Remove**, or tap **Select**, tick several and remove them together. The confirmation is part of the page (no system dialog). Removal deletes the transcript, answers, summary, to-dos and notes from the phone and from local retrieval, and removes the session's file from your OpenAI knowledge base: at once when an OpenAI key is entered, otherwise at the next Sync.
+- **"Let the knowledge base read history".** One switch decides whether answers may use what is saved. It is the same setting as Knowledge → "Use saved knowledge in answers" and covers everything saved on the phone: your conversations and what you imported (Omi, Obsidian notes, PDFs). On: for each answer, up to 5 short matching passages are sent to your answer provider with the question. Off: nothing saved is read for answers and Sync to OpenAI is refused; nothing is deleted, and files already synced stay in your OpenAI project until you delete them there (Knowledge → Delete from OpenAI).
+- **One page, one scroll.** The companion page scrolls as a single page. The tab bar stays at the top and the Answers composer at the bottom; no panel has its own scroll area that could trap a drag.
 
 ## Keys, data and privacy
 
@@ -282,6 +296,8 @@ What is not verified yet:
 - **Live calls to DeepSeek, Qwen, Zhipu and Moonshot**, and whether the Even app's WebView reaches their origins (whitelist, CORS, streaming).
 - **File picker, share sheet and clipboard** inside the Even app's WebView, and pdf.js on a phone.
 - **Live OpenAI PDF parsing and Omi automatic import** with real accounts.
+- **Notes mode with a live model.** The prompts that capture to-dos and notes were tested with mocked replies only. Spoken to-do commands are pattern matches on the transcript: a transcription error can hide a command, and an ordinary sentence that starts like one can change the list.
+- **The end-of-session summary with a live model**, and the History page (cards, in-page confirmation, one-page scrolling) inside the Even app's WebView.
 
 The phone UI is English only. Conversations, search and retrieval work in English and Chinese.
 

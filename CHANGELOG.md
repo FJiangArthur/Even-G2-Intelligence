@@ -2,9 +2,9 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
-## v0.13.0 — ambient glasses display, more answer providers, news-backed checks, PDFs
+## v0.13.0 — ambient glasses display, more answer providers, news-backed checks, PDFs, Notes mode, History
 
-Nothing in this release was run on G2 glasses or inside the Even Realities app, and no live request was made to DeepSeek, Qwen, Zhipu, Moonshot, OpenAI or Omi. Evidence: `npm run check` (conversation-sdk 389 tests, gateway 104, g2-plugin 298, all with fake providers and a fake bridge), one simulator smoke run of the ambient display, and a desktop browser with a fake bridge for the knowledge transfers. The device-only gates are listed in `docs/PIXEL_GESTURES.md`, `docs/PROVIDERS_AND_SEARCH.md` and `docs/MEMORY_GUIDE.md`.
+Nothing in this release was run on G2 glasses or inside the Even Realities app, and no live request was made to DeepSeek, Qwen, Zhipu, Moonshot, OpenAI or Omi. Evidence: `npm run check` (conversation-sdk 425 tests, gateway 104, g2-plugin 333, all with fake providers and a fake bridge), one simulator smoke run of the ambient display, and a desktop browser with a fake bridge for the knowledge transfers. The device-only gates are listed in `docs/PIXEL_GESTURES.md`, `docs/PROVIDERS_AND_SEARCH.md` and `docs/MEMORY_GUIDE.md`.
 
 **Review fixes (after the first 0.13.0 cut).**
 
@@ -16,7 +16,7 @@ Nothing in this release was run on G2 glasses or inside the Even Realities app, 
 **Glasses: ambient display (new default).** Details: `docs/PIXEL_GESTURES.md`.
 
 - During a session the glasses are blank: no caption, views, clock or images. The start screen still shows when not connected, connecting, ended or waiting for "tap to resume"; a failed session shows the full HUD.
-- Answers pop up (THEY ASKED, a requested ANSWER with "Thinking…" while pending, ANSWER KEY), page by themselves and disappear 8 s after they finish. Cues pop up as `CONCEPT` / `LOOKUP` / `CHECK` / `FACT CHECK` (concept, finished lookup, conflict, verification and fact-check verdicts), last page at least 5 s. An answer has the display first; up to 3 cues wait and one that waited more than 45 s is dropped. Suggestions, summaries, key facts, claims and pending or failed lookups do not pop up.
+- Answers pop up (THEY ASKED, a requested ANSWER with "Thinking…" while pending, ANSWER KEY), page by themselves and disappear 8 s after they finish. Cues pop up as `CONCEPT` / `LOOKUP` / `CHECK` / `FACT CHECK` / `TO-DO` (concept, finished lookup, conflict, verification and fact-check verdicts, and to-do changes in Notes mode), last page at least 5 s. An answer has the display first; up to 3 cues wait and one that waited more than 45 s is dropped. Suggestions, summaries, key facts, claims and pending or failed lookups do not pop up.
 - Double-tap wakes the full HUD with the menu open; double-tap on the menu, or 20 s without a glasses gesture, returns to blank. While blank: tap pages or closes a pop-up, or asks about the last few sentences when nothing is showing; swipes page a pop-up; hold is unchanged. Selecting a phone tab does not wake the glasses.
 - `● listening` / `○ paused` / `○ mic off` shows in the status corner for 4 s on a mic change.
 - Pop-ups and their expiry are text writes only, under the existing debounce and write pacing; wake and hide are one page swap each.
@@ -47,9 +47,30 @@ Nothing in this release was run on G2 glasses or inside the Even Realities app, 
 - **Note import fix:** one unreadable file used to reject the whole batch without a message, and notes past 200 were dropped silently. Each file is now read on its own and gets a result row; the picker no longer filters by type; paste and `https://` link import are fallbacks (link import is expected to fail inside the Even app, where only whitelisted origins are reachable).
 - **Omi automatic import** (new, off by default): at startup, on return to the foreground and every 30 min while open; retry 5 min after a failure. The switch and last outcome are stored under `helix.omi.auto-import.v1`; the key is not. An unreadable Omi conversation is skipped and counted instead of failing the import.
 - **PDF → Helix** (new): up to 20 PDFs per batch, 30 MB each, 400,000 characters kept per PDF, per-file progress and Cancel. Parser choice: on the phone (pdf.js 4.10.38, lazy-loaded, text layer only, first 500 pages, no OCR) or with OpenAI (Files API upload with `purpose=user_data`, Responses `input_file`, upload deleted afterwards; "Add a PDF by link" passes the URL to OpenAI). Parsed text is saved as a history session tagged `pdf` with page numbers, found by the existing keyword retrieval, and synced to the OpenAI knowledge base when that is in use.
-- **Package size:** pdf.js adds about 1.8 MB of lazily loaded chunks to the build, so the `.ehpk` grows. `npm run pack:g2` was not run for this release.
+- **Package size:** pdf.js adds about 1.8 MB of lazily loaded chunks to the build, so the `.ehpk` grows: `npm run pack:g2` on 2026-11-19 produced a 1,534,915-byte `helix-g2.ehpk` (not committed).
 
-**Docs:** `docs/MODES.md` and `docs/MODES.zh-CN.md` (a guide to all eight modes), `docs/PROVIDERS_AND_SEARCH.md`, a rewritten `README.md` and a new `README.zh-CN.md`. The app UI is still English only, so `supported_languages` is unchanged.
+**Notes mode (new, ninth picker mode).** Details: `docs/MODES.md` → Notes.
+
+- Mode id `notes`, tag `NOTES`. Preset: summary, people and web search on; concept cards, conflicts, suggestions, "answer things people mention", claims and automatic answers off; plus `noteTaking`, a preset flag without a Setup switch.
+- The copilot lane returns `todoOps` (add / update / complete / remove, each with a verbatim quote) and `notes`. An item whose quote is not found in the recent speech is dropped; at most 4 to-do changes and 3 notes per pass; a session holds up to 60 to-dos and 80 notes. A repeated or reworded item updates the existing one. Provenance per to-do: transcript id, quote, speaker, model, prompt version `notes-1`.
+- Spoken commands on the wearer's own lines are applied on the phone without a model call: add (with owner and due date), complete, reopen, change owner, change due date, rename, remove; basic Chinese forms for add, complete and remove.
+- Phone: Summary tab leads with the editable list (check, edit text / owner / due, reorder, delete, where each item came from) and the notes. History shows and edits the saved list; Markdown export writes `## To-dos` as task checkboxes and `## Notes`, and import reads the to-dos back.
+- Glasses: one line per change (`TODO + …`, `TODO ~ …`, `TODO done: …`, `TODO open: …`, `TODO removed: …`). On the ambient display it pops up under `TO-DO` and expires like the other cues; in the woken HUD the SUMMARY view is `TO-DO` (view list, header, menu item `To-do`).
+- On DeepSeek, Qwen, Zhipu and Moonshot the schema, including `todoOps` and `notes`, travels in the prompt (no strict JSON schema there); replies are validated the same way.
+- Not run against a live model: the capture prompts were tested with mocked replies. Voice commands are pattern matches, so a mis-transcribed command is missed and an ordinary sentence that starts like one can change the list.
+
+**History: summary after each conversation, cleaner list, one scroll.** Details: `README.md` → History.
+
+- A session record is created with its first content (a saved line, summary item, to-do or note), not at Connect. Helix records with nothing in them, left by earlier versions (one per Connect or resume), are removed at startup. Tap-to-resume within 30 minutes continues the interrupted session: the parts are merged into one record, including one to-do list and one set of notes.
+- When a session ends with at least 40 characters of speech and an OpenAI key in the session, one call (`session-digest-v2`) writes title, overview, summary, key facts and concepts; model, prompt version, endpoint, latency and time are stored as `session.recap` and shown in the session view. Otherwise the title is derived on the phone (never the first thing said) and Generate summary retries. With a DeepSeek, Qwen, Zhipu or Moonshot answer provider the call still goes to OpenAI with the default copilot model; imported sessions and PDFs keep their own title when a summary is generated for them.
+- Cards are grouped by day and show title, time and duration, overview and labelled counts ("10 speaker turns · 2 Helix answers", plus to-dos and notes). PDF documents are listed last under Documents, described by page count and parser.
+- Select → Remove for several sessions, Remove in the session view; both confirm in the page (no `window.confirm`, which can block the WebView), and so does Knowledge → Delete from OpenAI. Removal deletes the record, its shards, its to-dos and notes, and its file in the OpenAI knowledge base (immediately with a key, otherwise at the next Sync).
+- History → "Let the knowledge base read history" is the existing `useLocalMemory` setting (Knowledge → "Use saved knowledge in answers"). Off: nothing saved is read for answers, and Sync to OpenAI is refused. It covers everything in the phone archive, imported Omi conversations, Obsidian notes and PDFs included; the note under the switch says so.
+- Editing a saved session's to-dos does not touch `updatedAt`; the OpenAI sync stamp now includes a hash of the to-dos and notes, so an edit marks the session as changed. Sessions without a notebook keep their old stamp (no re-upload).
+- The document is the only vertical scroller (tab bar sticky at the top, composer sticky at the bottom); the Setup fields, the PDF card and the notebook add no scroll container of their own (tested against the stylesheet).
+- Not verified: the summary call with a live model, and the History page inside the Even app's WebView.
+
+**Docs:** `docs/MODES.md` and `docs/MODES.zh-CN.md` (a guide to all nine modes), `docs/PROVIDERS_AND_SEARCH.md`, a rewritten `README.md` and a new `README.zh-CN.md`. The app UI is still English only, so `supported_languages` is unchanged.
 
 ## v0.12.1 — cooler phone during long sessions
 

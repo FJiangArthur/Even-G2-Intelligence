@@ -24,7 +24,7 @@ the idle time is `GlassesHudOptions.ambientIdleMs` (default `AMBIENT_IDLE_MS`, 2
 | People talk | Nothing. No caption, no LIVE view, no clock, no images. |
 | A question is answered (THEY ASKED, a requested ANSWER, ANSWER KEY) | Title and answer in the HUD text style. Long answers turn pages by themselves (3–10 s per page by length). Gone 8 s after the last page of a finished answer. |
 | A requested answer is on its way | `◆ ANSWER` / `Thinking…` until the answer arrives. |
-| A cue of the current mode: concept, finished lookup, conflict, verification or fact-check verdict | Title (`CONCEPT`, `LOOKUP`, `CHECK`, `FACT CHECK`) and text, up to 3 pages (6 with Answer length "Detailed"), then gone (last page at least 5 s). A verdict from a news-biased check reads `news check` and ends with its newest dated source (`Src: site · YYYY-MM-DD · +n`). |
+| A cue of the current mode: concept, finished lookup, conflict, verification or fact-check verdict, or a to-do change in Notes mode (`TODO + Send the quote - Mei, Fri`) | Title (`CONCEPT`, `LOOKUP`, `CHECK`, `FACT CHECK`, `TO-DO`) and text, up to 3 pages (6 with Answer length "Detailed"), then gone (last page at least 5 s). A verdict from a news-biased check reads `news check` and ends with its newest dated source (`Src: site · YYYY-MM-DD · +n`). |
 | Hold to talk, mode switch and other gesture feedback | Short text in the status corner (`● HOLD · release to send`, 4 s for the others). |
 | Session failed | The full HUD with the problem (it needs attention). |
 

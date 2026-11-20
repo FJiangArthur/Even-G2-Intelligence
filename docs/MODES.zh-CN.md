@@ -8,7 +8,7 @@
 2. **后台助手（Copilot）关注什么**：语气、"建议"指的是什么、摘要侧重哪些内容。
 3. **哪些功能开着**：一组预设开关（摘要、概念卡片、待核实说法、自动回答等）。
 
-本文内容全部来自 `packages/conversation-sdk/src/modes.ts`（`MODE_PROFILES`、`PICKER_MODES`）以及 `apps/g2-plugin` 对它的用法。如果本文与代码不一致，以代码为准。
+本文内容全部来自 `packages/conversation-sdk/src/modes.ts`（`MODE_PROFILES`、`PICKER_MODES`）以及 `apps/g2-plugin` 对它的用法；Notes 模式一节还参考了 `todo-list.ts` 和 `session-notebook.ts`。如果本文与代码不一致，以代码为准。
 
 > 说明：手机界面和眼镜上的文字目前是英文，所以下文中的按钮名、标签名都保留英文原文，并在旁边给出中文解释。
 
@@ -26,6 +26,7 @@
 | **Learning**（学习） | 讲座与讲解：概念解释、学习笔记、聪明的提问 | `LEARN` | `ASK` | 是 | 矛盾提示、待核实说法、人物追踪 |
 | **Social**（社交） | 闲聊：轻松的接话和随手查一查 | `SOCIAL` | `TALK` | 否 | 矛盾提示、待核实说法 |
 | **Quiet**（安静） | 只要字幕和滚动摘要（手机和唤出的 HUD） | `QUIET` | `ASK THEM` | 否 | 建议、概念卡片、矛盾提示、待核实说法、人物追踪，以及任何主动插话 |
+| **Notes**（记录） | 要的是行动项、待办清单和会议笔记，而不是回答 | `NOTES` | `ASK THEM` | 否 | 建议、概念卡片、矛盾提示、待核实说法、回应别人顺口提到的事 |
 
 上表的顺序就是手机和眼镜上模式选择器的顺序。
 
@@ -33,18 +34,21 @@
 
 `●` 表示开，`○` 表示关。第一列是 `ModePresets` 里的键名，第二列是同一个开关在手机 Setup 页上的名字。
 
-| 预设键 | Setup 中的名称 | Meeting | Technical | Interviewer | Partner | Negotiation | Learning | Social | Quiet |
-| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
-| `summarize` | Rolling summary（滚动摘要） | ● | ● | ● | ● | ● | ● | ● | ● |
-| `concepts` | Concept cards（概念卡片） | ● | ● | ● | ○ | ● | ● | ● | ○ |
-| `conflicts` | Flag conflicting statements（提示前后矛盾） | ● | ● | ● | ○ | ● | ○ | ○ | ○ |
-| `suggestions` | Suggest questions（建议提问） | ● | ● | ● | ● | ● | ● | ● | ○ |
-| `implicitAsks` | Answer things people mention（回应别人提到的事） | ● | ● | ○ | ○ | ● | ● | ● | ○ |
-| `webGrounding` | Use web search（联网搜索） | ● | ● | ● | ○ | ● | ● | ● | ● |
-| `claims` | Find claims to verify（找出待核实的说法） | ● | ● | ● | ○ | ● | ○ | ○ | ○ |
-| `people` | Track people（追踪人物） | ● | ● | ● | ● | ● | ○ | ● | ○ |
-| `autoAnswer` | Answer automatically（自动回答） | ● | ● | ● | ○ | ● | ● | ○ | ○ |
-| `responseStrategy` | Response strategy（响应策略） | reactive | reactive | reactive | reactive | reactive | reactive | reactive | reactive |
+| 预设键 | Setup 中的名称 | Meeting | Technical | Interviewer | Partner | Negotiation | Learning | Social | Quiet | Notes |
+| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| `summarize` | Rolling summary（滚动摘要） | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| `concepts` | Concept cards（概念卡片） | ● | ● | ● | ○ | ● | ● | ● | ○ | ○ |
+| `conflicts` | Flag conflicting statements（提示前后矛盾） | ● | ● | ● | ○ | ● | ○ | ○ | ○ | ○ |
+| `suggestions` | Suggest questions（建议提问） | ● | ● | ● | ● | ● | ● | ● | ○ | ○ |
+| `implicitAsks` | Answer things people mention（回应别人提到的事） | ● | ● | ○ | ○ | ● | ● | ● | ○ | ○ |
+| `webGrounding` | Use web search（联网搜索） | ● | ● | ● | ○ | ● | ● | ● | ● | ● |
+| `claims` | Find claims to verify（找出待核实的说法） | ● | ● | ● | ○ | ● | ○ | ○ | ○ | ○ |
+| `people` | Track people（追踪人物） | ● | ● | ● | ● | ● | ○ | ● | ○ | ● |
+| `autoAnswer` | Answer automatically（自动回答） | ● | ● | ● | ○ | ● | ● | ○ | ○ | ○ |
+| `responseStrategy` | Response strategy（响应策略） | reactive | reactive | reactive | reactive | reactive | reactive | reactive | reactive | reactive |
+| `noteTaking` | （没有开关，由模式决定） | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ● |
+
+`noteTaking` 是唯一一个在 Setup 里没有开关的预设：它打开待办清单、随记笔记和待办语音命令，只有 Notes 模式会设置它。
 
 ## 模式是怎么工作的
 
@@ -63,8 +67,8 @@
 
 有两个连带效果值得留意：
 
-- 切到关闭了 **Concept cards** 的模式（Partner、Quiet）时，独立的"Explain technical terms automatically"（自动解释技术术语）选项也会一并关闭。
-- 切到关闭了 **Find claims to verify** 的模式（Partner、Learning、Social、Quiet）时，如果实时联网事实核查原本开着，它会被关掉，正在进行的核查也会取消。
+- 切到关闭了 **Concept cards** 的模式（Partner、Quiet、Notes）时，独立的"Explain technical terms automatically"（自动解释技术术语）选项也会一并关闭。
+- 切到关闭了 **Find claims to verify** 的模式（Partner、Learning、Social、Quiet、Notes）时，如果实时联网事实核查原本开着，它会被关掉，正在进行的核查也会取消。
 
 再切回其他模式时，这两项都不会自动重新打开，需要的话请手动开启。
 
@@ -74,6 +78,7 @@
 - HUD 显示图像时，模式会有一个图标徽标；启动画面上会显示 `HELIX` 和模式名。
 - 图像关闭时，改为在状态行末尾追加上表里的短标签（`… · TECH`）。Meeting 是默认模式，不显示标签。
 - "建议"视图会换成模式自己的叫法：在视图列表里、该视图的标题里显示为 `PROBE`、`CHECK IN`、`TALK` 等，菜单里对应的那一项也随之变成 `Probe`、`Check in`、`Talk`。
+- 在 Notes 模式下，SUMMARY 视图在这三个地方都改叫 `TO-DO`（菜单项为 `To-do`）。
 
 ### 你自己说出的问题
 
@@ -468,6 +473,115 @@ Double-tap: menu ▶ Mode to change.
 > Remain quiet unless directly asked a clear question or given a manual query. Never proactively interrupt.
 
 可以用它来规定你手动提问时回答的样子，比如要求只用一句话回答。
+
+---
+
+### Notes（记录）
+
+*"Note-taker: action items, a living to-do list and meeting notes. No auto-answers."*（记录员：行动项、一份随对话更新的待办清单和会议笔记。不自动回答。）
+
+**用来做什么。** 替你做记录，让你专心参与对话。Helix 会留意行动项（谁、做什么、什么时候之前），把它们放进同一份待办清单，并且是在原有条目上修改而不是不断追加；同时用简短的笔记记下讨论了什么、定了什么。它不会替你回答问题。
+
+**什么时候选。** 会议的产出就是一份清单的时候：站会、计划会、需要跟进的客户电话。如果你还希望 Helix 回答问题、给出追问建议，请用 Meeting。
+
+**会显示什么。**
+
+- **手机上的 Summary 标签页：** 待办清单排在最前面。每一条都有勾选框、内容、负责人（Owner）和截止时间（Due）两个可编辑的字段，以及上移、下移、删除按钮，下面还有一行说明它的来历（引用的原话和说话人，或者 "Added by voice"、"Added on phone"）。清单下面是笔记，再往下是滚动摘要；这个模式的摘要侧重决定、带负责人和截止时间的行动项、遗留问题和数字。
+- **眼镜上：** 每次改动只显示一行简短的确认，别的什么都不显示。格式有 `TODO + …`（新增）、`TODO ~ …`（修改）、`TODO done: …`（完成）、`TODO open: …`（重新打开）和 `TODO removed: …`（删除）；负责人和截止时间跟在内容后面，星期会缩写（`TODO + Send the quote - Mei, Fri`）。默认的按需显示下，这一行会以 `TO-DO` 为标题弹出，和其他提示一样自动消失（至少停留 5 秒，单击可立即关闭）。笔记和摘要不会弹出。在唤出的 HUD 里，这些确认出现在 LIVE 列表中；此模式下 SUMMARY 视图改叫 `TO-DO`，视图列表、视图标题和菜单项（`To-do`）都是如此。它先列未完成的条目（`[ ]`），再列已完成的（`[x]`），然后是最新的 6 条笔记，最后是摘要。
+- **History 里：** 待办和笔记随会话一起保存。会话卡片上会标出数量（`… · 3 to-dos (2 open)`），打开会话后它们显示在摘要下面；会话结束之后，你可以在那里继续编辑清单。导出 Markdown 时，待办会写成任务勾选框（`- [ ] Send the quote (Mei, due Friday)`），放在 `## To-dos` 下面，后面是 `## Notes`；把这样的笔记再导入，待办会被还原。
+
+**条目是怎么进清单的。** 有两条途径，改的是同一份清单：
+
+1. **从对话里来。** 后台助手会对清单提出操作：新增、修改、完成、删除。它提出的每一条待办和笔记都必须引用最近对话里确实说过的话，引用对不上的会被丢弃。重复或换了说法的条目会更新原有的那一条，而不是再加一条。每一轮最多采纳 4 项待办改动和 3 条笔记。一个会话最多保存 60 条待办和 80 条笔记。
+2. **用语音。** 一句话如果符合下面的命令句式，会立刻在手机上执行，不需要调用模型。命令只认你自己说的话：被转写判定为其他人说的那一行不会当作命令（后台助手仍然会听到它）。
+
+**语音命令。** 下表中的 X 指条目，说出其中几个词就够（你说的词里至少要有 60% 出现在条目中）。"it"、"that one"、"the last one" 指你最近动过的那一条，或者唯一一条未完成的条目。句首的 "hey"、"okay"、"please"、"Helix"、"can you" 会被忽略。"to-do" 也可以说成 "task"、"action item" 或 "reminder"。
+
+| 想做的事 | 说法举例 |
+| --- | --- |
+| 新增一条 | "Add a to-do to call the vendor by Friday" · "Add a task: book the demo room" · "Put the vendor call on my to-do list" · "Remind me to send the notes"（负责人记为 Me） |
+| 新增并指定负责人 | "Add a to-do for Mei to send the quote" · "Add a to-do: Mei will send the quote by Friday" · "… assigned to Mei" |
+| 标记完成 | "Mark the vendor call done" · "Check off the vendor call" · "The vendor call to-do is done" |
+| 重新打开 | "Mark the vendor call as not done" · "Reopen the vendor call" |
+| 改截止时间 | "Change the deadline to Monday"（针对最近一条） · "Move the deadline for the quote to Monday" · "Make the quote due Friday" |
+| 改负责人 | "Assign the quote to Raj" · "Change the owner of the quote to Raj" |
+| 改内容 | "Rename the vendor call to call the distributor" |
+| 删除 | "Remove the vendor call from my to-do list" · "Delete the vendor call" · "Cancel the task book the room" |
+
+新增命令的末尾如果跟着 "by"、"due"、"before"、"on" 或 "until" 加时间，会被识别为截止时间：星期几、"tomorrow"、"next week"、"end of month"、"March 3" 或 "3/14" 这样的日期，或者 "5 pm" 这样的时刻。截止时间按你说的原话保存，不会换算成日历日期。
+
+基本的中文命令（目前只支持新增、完成和删除；负责人、截止时间和改内容还没有中文句式）：
+
+| 想做的事 | 说法举例 |
+| --- | --- |
+| 新增 | "添加待办 给供应商打电话" · "新增任务 预订会议室" · "记一个待办 发报价" |
+| 标记完成 | "把给供应商打电话标记为完成" · "完成待办 发报价" |
+| 删除 | "删除待办 预订会议室" · "取消任务 预订会议室" |
+
+**不做什么。**
+
+- 不自动回答。需要回答时，在菜单里选 **Answer** 或长按说话；回答会很简短，并以对话内容为依据。
+- 没有建议、概念卡片、矛盾提示和待核实说法，也不会把普通陈述当成查询请求。
+- 不编造任务：后台助手提出的条目如果没有对得上的引用就会被丢弃，提示词也要求模型绝不编造任务、负责人或日期。
+- 没有到期提醒或通知，也不会同步到任何任务管理应用。清单保存在会话里，需要带走时请用 Markdown 导出。
+- 看起来像密钥、银行卡号或证件号、医疗记录的文字不会被写进待办或笔记。
+
+**Track people** 和 **Use web search** 保持开启。这个模式还会打开 `noteTaking`，它在 Setup 里没有对应的开关：只有当前模式是 Notes 时，待办记录和语音命令才生效。
+
+| 预设键 | Setup 中的名称 | 值 |
+| --- | --- | --- |
+| `summarize` | Rolling summary | 开 |
+| `concepts` | Concept cards | **关** |
+| `conflicts` | Flag conflicting statements | **关** |
+| `suggestions` | Suggest questions | **关** |
+| `implicitAsks` | Answer things people mention | **关** |
+| `webGrounding` | Use web search | 开 |
+| `claims` | Find claims to verify | **关** |
+| `people` | Track people | 开 |
+| `autoAnswer` | Answer automatically | **关** |
+| `responseStrategy` | Response strategy | `reactive` |
+| `noteTaking` | （没有开关，由模式决定） | 开 |
+
+**眼镜上的样子。** 按需显示下弹出的一条确认，以及唤出的 HUD 里的 TO-DO 视图：
+
+```text
+TO-DO
+TODO + Send the quote - Mei, Fri
+```
+
+```text
+TO-DO 1/1
+[ ] Send the quote - Mei, Fri
+[ ] Call the vendor
+[x] Book the room
+Notes
+• Budget approved at 40k.
+```
+
+还没有记下任何内容时，这个视图显示的是：
+
+```text
+TO-DO
+No to-dos or notes yet.
+
+Action items and notes appear
+here as people talk.
+```
+
+（意思是：还没有待办或笔记。行动项和笔记会随着对话出现在这里。）
+
+**内置提示词**
+
+> Act as the wearer's note-taker. Stay quiet unless the wearer asks directly; then answer briefly from the conversation: what was decided, who owns what and by when. Never invent action items, owners or dates.
+
+可以用它来规定你手动提问时回答的样子，比如"先列出未完成的待办"。它不会改变待办和笔记的记录方式：后台助手的这部分指令写死在代码里。选了这个模式之后，你仍然可以在 Setup 里调整任何一个预设开关，比如把 **Suggest questions** 重新打开。
+
+**如实说明现状。**
+
+- 记录用的提示词只用模拟的模型回复测试过，还没有对真实模型运行过，所以真实模型能把清单填得多好，目前没有数据。
+- 语音命令是对转写文字做句式匹配。转写出错时，Helix 可能漏掉一条命令；一句普通的话如果碰巧以命令的方式开头（比如 "delete the vendor call slide"），也可能改动清单。每次改动眼镜都会给出确认，清单随时可以在手机上改回来。
+- 使用 OpenAI 时，回复格式由严格的 JSON Schema 约束。DeepSeek、Qwen、智谱 GLM 和 Moonshot Kimi 没有严格 Schema，所以 Schema（包括待办和笔记的字段）是放在提示词里发送的；回复会经过同样的校验，但如果模型没有按格式输出，这一轮就不会产生待办。
+- 已在单元测试和桌面环境中用模拟服务商测试过，尚未在 G2 真机上验收。
 
 ## 旧版模式
 

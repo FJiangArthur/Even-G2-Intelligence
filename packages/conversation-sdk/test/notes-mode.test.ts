@@ -142,7 +142,7 @@ describe("SessionNotebook", () => {
     expect(notebook.addNote("Budget approved at 40k for Q3", "tr-1")).toMatchObject({ id: "t1", transcriptId: "tr-1" });
     expect(notebook.addNote("budget approved at 40k for q3.")).toBeUndefined();
     expect(notebook.addNote("The password: hunter2hunter2")).toBeUndefined();
-    expect(notebook.apply({ op: "add", text: "Rotate api_key=sk-abcdefghijklmnopqrstuv" }, { origin: "user" })).toBeUndefined();
+    expect(notebook.apply({ op: "add", text: `Rotate api_key=${"sk"}-${"abcdefghijklmnopqrstuv"}` }, { origin: "user" })).toBeUndefined();
     for (let i = 0; i < 100; i++) notebook.addNote(`Distinct decision ${i} about topic zz${i} qq${i}`);
     expect(notebook.notes).toHaveLength(80);
     expect(notebook.removeNote(notebook.notes[0]!.id)).toBe(true);
