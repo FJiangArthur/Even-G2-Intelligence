@@ -932,6 +932,20 @@ input:disabled { opacity: 0.55; }
 .paste-markdown summary { min-height: 40px; display: flex; align-items: center; color: var(--ink-2); font-size: 13px; font-weight: 700; cursor: pointer; }
 .paste-markdown textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 .download-slot:empty { display: none; }
+/* v0.13 knowledge I/O: inline results, per-file rows, in-page export view */
+.io-status:empty { display: none; }
+.io-status { color: var(--ink-2); }
+.file-status-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.file-status-list:empty { display: none; }
+.file-status { display: grid; gap: 1px; padding: 6px 8px; font-size: 12.5px; line-height: 17px; box-shadow: inset 3px 0 0 0 var(--line-soft); }
+.file-status.is-done { box-shadow: inset 3px 0 0 0 var(--cyan); }
+.file-status.is-failed { box-shadow: inset 3px 0 0 0 var(--rose); }
+.file-status-name { color: var(--ink); font-weight: 700; overflow-wrap: anywhere; }
+.file-status-detail { color: var(--ink-3); overflow-wrap: anywhere; }
+.file-status.is-failed .file-status-detail { color: var(--rose); }
+.export-view { min-height: 160px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 17px; }
+.badge-pdf { --tone: var(--rose); }
+.pdf-parser { margin-bottom: 4px; }
 
 /* -------------------------------------------------------------- people */
 .people-panel { display: grid; gap: 12px; }

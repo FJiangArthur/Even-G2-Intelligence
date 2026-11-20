@@ -1,10 +1,19 @@
 import type { DirectFetch } from "./direct-providers.js";
 import { LocalHistoryStore, type HistoryEntry, type HistorySession } from "./local-history.js";
 
-export interface OmiImportProgress { /** Conversations successfully processed/upserted, including existing records. */ imported: number; pages: number }
+export interface OmiImportProgress {
+  /** Conversations successfully processed/upserted, including existing records. */ imported: number; pages: number;
+  /** Only with `skipInvalid`, and only when > 0: conversations Omi returned in a shape Helix could not read. */ skipped?: number;
+}
 export interface OmiImportOptions {
   key: string; store: LocalHistoryStore; fetch?: DirectFetch; signal?: AbortSignal;
   startDate?: string; endDate?: string; onProgress?: (progress: OmiImportProgress) => void;
+  /**
+   * Default false: one unreadable conversation fails its whole page (strict, nothing partial).
+   * True: an unreadable conversation is skipped and counted in `skipped`, so one odd record cannot
+   * block every later import. The response envelope (a JSON array of at most one page) stays strict.
+   */
+  skipInvalid?: boolean;
 }
 const API = "https://api.omi.me/v1/dev/user/conversations";
 const PAGE_SIZE = 25, PAGE_CAP = 200;
@@ -13,8 +22,9 @@ const nonempty = (value: unknown): value is string => typeof value === "string" 
 const invalid = () => new Error("Omi returned an invalid conversation response. Import is incomplete; earlier saved records remain available.");
 function cancelled(signal?: AbortSignal): void { if (signal?.aborted) throw new DOMException("Omi import cancelled. Earlier saved records remain available.", "AbortError"); }
 function iso(value: unknown): string {
-  if (!nonempty(value) || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value)) throw invalid();
-  const parsed = Date.parse(value);
+  if (!nonempty(value) || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$/.test(value)) throw invalid();
+  // A timestamp without an offset (Python's naive datetime.isoformat()) is read as UTC, not as phone-local time.
+  const parsed = Date.parse(/T/.test(value) && !/(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? `${value}Z` : value);
   const [year, month, day] = value.slice(0, 10).split("-").map(Number);
   const calendar = new Date(Date.UTC(year!, month! - 1, day!));
   if (!Number.isFinite(parsed) || calendar.toISOString().slice(0, 10) !== value.slice(0, 10)) throw invalid();
@@ -94,7 +104,8 @@ export async function importOmiConversations(options: OmiImportOptions): Promise
   const startDate = filterDate(options.startDate), endDate = filterDate(options.endDate);
   if (startDate && endDate && Date.parse(startDate) > Date.parse(endDate)) throw new Error("Omi import start date must not be after end date.");
   const fetcher: DirectFetch = options.fetch ?? globalThis.fetch.bind(globalThis);
-  const seen = new Set<string>(); let imported = 0, pages = 0;
+  const seen = new Set<string>(); let imported = 0, pages = 0, skipped = 0;
+  const progress = (): OmiImportProgress => ({ imported, pages, ...(skipped ? { skipped } : {}) });
   cancelled(signal); await store.load(); cancelled(signal);
   for (let page = 0; page < PAGE_CAP; page++) {
     cancelled(signal);
@@ -109,7 +120,10 @@ export async function importOmiConversations(options: OmiImportOptions): Promise
     cancelled(signal);
     if (!Array.isArray(data) || data.length > PAGE_SIZE) throw invalid();
     // Validate the entire page before committing any conversation from it.
-    const conversations = data.map(parseConversation), pageIds = new Set<string>();
+    const conversations = options.skipInvalid
+      ? data.flatMap(item => { try { return [parseConversation(item)]; } catch { skipped++; return []; } })
+      : data.map(parseConversation);
+    const pageIds = new Set<string>();
     for (const { session } of conversations) {
       if (seen.has(session.id) || pageIds.has(session.id)) throw new Error("Omi returned duplicate conversation IDs. Import is incomplete; earlier saved records remain available.");
       pageIds.add(session.id);
@@ -119,8 +133,8 @@ export async function importOmiConversations(options: OmiImportOptions): Promise
       if (entries.length) await store.upsertEntries(entries);
       imported++; seen.add(session.id); cancelled(signal);
     }
-    pages++; onProgress?.({ imported, pages }); cancelled(signal);
-    if (data.length < PAGE_SIZE) return { imported, pages };
+    pages++; onProgress?.(progress()); cancelled(signal);
+    if (data.length < PAGE_SIZE) return progress();
   }
   throw new Error("Omi import is incomplete after the 200-page limit. Narrow the date range and import again; earlier saved records remain available.");
 }
