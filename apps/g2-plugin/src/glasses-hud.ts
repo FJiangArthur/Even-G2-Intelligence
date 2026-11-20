@@ -849,7 +849,10 @@ export class GlassesHud implements GlassesSurface {
 
   /** Click on the native MENU list (listEvent.currentSelectItemIndex, name when the host sends it). */
   public selectListItem(index: number, name?: string): HudCommand | undefined {
-    if (this.disposed || !this.menu) return undefined;
+    if (this.disposed) return undefined;
+    // Ambient display: the woken menu closes by itself (idle or hide). A list click that arrives after
+    // that is stale; it must not fall through to a tap on the blank display (which asks a billable question).
+    if (!this.menu) return this.ambientActive() ? HANDLED : undefined;
     try {
       const items = this.menu.items;
       const byName = name ? items.findIndex(item => item.label === name) : -1;
@@ -1071,7 +1074,7 @@ export class GlassesHud implements GlassesSurface {
   }
   /** A gesture on the woken HUD restarts the idle time. */
   private touch(): void {
-    if (this.displayMode === "ambient" && this.awakeUntil) this.awakeUntil = this.now() + this.idleMs;
+    if (this.ambientSession() && this.awakeUntil) this.awakeUntil = this.now() + this.idleMs;
   }
   /** Back to the blank display (double-tap on the menu, or idle). */
   private sleep(): HudCommand {
@@ -1117,8 +1120,11 @@ export class GlassesHud implements GlassesSurface {
   private stepAmbient(): void {
     if (this.displayMode !== "ambient") return;
     const now = this.now();
+    // Outside a session nothing is ambient: a wake left over from the ended session must not later
+    // "sleep" (close) the Connect/Mode menu opened since.
+    if (!ACTIVE.includes(this.glasses.status)) { this.awakeUntil = 0; this.cue = undefined; this.cueQueue = []; return; }
     if (this.awakeUntil && now >= this.awakeUntil) this.sleep();
-    if (this.awakeUntil || !ACTIVE.includes(this.glasses.status)) { this.cue = undefined; this.cueQueue = []; return; }
+    if (this.awakeUntil) { this.cue = undefined; this.cueQueue = []; return; }
     if (this.answerBusy()) {
       // An answer has the display: the cue waits and starts over afterwards.
       if (this.cue) { this.cueQueue = [{ ...this.cue, page: 0 }, ...this.cueQueue].slice(0, CUE_QUEUE); this.cue = undefined; }
@@ -1181,7 +1187,7 @@ export class GlassesHud implements GlassesSurface {
       else if (page >= 0) { cue.page = page; cue.until = this.now() + this.cueReadMs(cue); }
       return HANDLED;
     }
-    // Nothing on screen: a tap asks about the last minute (the answer pops up); swipes have nothing to turn.
+    // Nothing on screen: a tap asks about the last few sentences (the answer pops up); swipes have nothing to turn.
     return gesture === "click" ? { type: "askLocal" } : HANDLED;
   }
 
@@ -1634,14 +1640,14 @@ export class GlassesHud implements GlassesSurface {
     }
     if (glasses.manualPending) {
       const speaker = glasses.question?.speaker;
-      const about = speaker === "Local context" ? "About the last minute of conversation."
+      const about = speaker === "Local context" ? "About the last few sentences."
         : speaker === "Whole conversation" ? "Using the whole conversation."
           : glasses.question?.text ? `Q: ${oneLine(glasses.question.text)}` : "";
       return { label: VIEW_LABEL.answer, status: "thinking", text: `Thinking…${about ? `\n\n${about}` : ""}` };
     }
     const pages = this.recallPages();
     if (!pages.length) {
-      return { label: VIEW_LABEL.answer, text: "No answer yet.\n\nTap: ask about the last minute.\nMenu (double-tap): the whole talk." };
+      return { label: VIEW_LABEL.answer, text: "No answer yet.\n\nTap: ask about the last few lines.\nMenu (double-tap): the whole talk." };
     }
     const index = Math.min(this.cursor.answer, pages.length - 1);
     return { label: VIEW_LABEL.answer, position: `${index + 1}/${pages.length}`, status: "last answer",

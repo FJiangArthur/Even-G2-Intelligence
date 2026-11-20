@@ -43,7 +43,7 @@ Rules:
 | Gesture | Blank display or pop-up | Woken HUD |
 | --- | --- | --- |
 | Double-tap | Wake: full HUD with the MENU open | On a view: open the MENU. On the MENU: hide the HUD (back to blank). |
-| Tap | Pop-up: next page, or close on the last page. Blank: ask about the last minute (the answer pops up). | As before (context action, or select the MENU item). |
+| Tap | Pop-up: next page, or close on the last page. Blank: ask about the last few sentences (the answer pops up; a billed request). | As before (context action, or select the MENU item). |
 | Swipe ↑ / ↓ | Pop-up: previous / next page; ↓ on the last page closes it. Blank: nothing. | As before (views, pages, MENU highlight). |
 | Hold | Push to talk, as before. | As before. |
 

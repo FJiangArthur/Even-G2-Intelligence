@@ -642,6 +642,28 @@ export class LocalHistoryStore {
       }
     });
   }
+  /**
+   * v0.13: stores a whole document (session + all of its entries) as ONE save, replacing an earlier
+   * copy of the same session id. All or nothing: when the save fails (for example the 5 MiB cap),
+   * neither the new session nor a half-written one exists and the earlier copy is untouched.
+   */
+  async replaceSession(session: HistorySession, entries: HistoryEntry[]): Promise<void> {
+    if (!Array.isArray(entries)) throw invalid();
+    const clean = cleanSession(session), cleaned = [...new Map(entries.map(cleanEntry).map(entry => [entry.id, entry])).values()];
+    if (cleaned.some(entry => entry.sessionId !== clean.id)) throw new Error("Cannot save history entries without their session.");
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === clean.id), sessions = draft.writableSessions();
+      if (index < 0) sessions.push(clean); else sessions[index] = clean;
+      draft.dropList(clean.id);
+      const list = draft.writableList(clean.id);
+      for (const entry of cleaned) {
+        // Entry ids are archive-wide: an id saved under another session moves here.
+        const owner = draft.ownerOf(entry.id);
+        if (owner !== undefined && owner !== clean.id) { const from = draft.writableList(owner), i = from.findIndex(e => e.id === entry.id); if (i >= 0) from.splice(i, 1); }
+        list.push(entry); draft.setOwner(entry.id, clean.id);
+      }
+    });
+  }
   listSessions(): HistorySession[] { return copy([...this.state.sessions]).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.id.localeCompare(b.id)); }
   /** One session without copying the whole archive (listSessions clones every session). */
   getSession(sessionId: string): HistorySession | undefined { const found = this.state.sessions.find(session => session.id === sessionId); return found ? copy(found) : undefined; }

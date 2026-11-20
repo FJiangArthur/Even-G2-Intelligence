@@ -439,7 +439,7 @@ export class KnowledgePanel {
     const to = el("span", "source-badge badge-helix"); to.append(iconSpan(SOURCE_ICON.helix, "badge-icon"), SOURCE_LABEL.helix);
     head.append(from, arrow, to); head.setAttribute("aria-label", "PDF documents to Helix");
     const megabytes = Math.round(PDF_LIMITS.maxBytes / 1024 / 1024);
-    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. They are listed under Obsidian with the tag “pdf”.`);
+    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. The parsed text is stored with your history, which holds 5 MiB in total, so several large PDFs may not all fit; one that does not fit is reported as failed and nothing of it is kept. They are listed under Obsidian with the tag “pdf”.`);
     const box = el("fieldset", "toggle-group pdf-parser"); box.append(el("legend", "", "Read the PDFs"));
     const local = el("input"), openai = el("input");
     const option = (input: HTMLInputElement, value: PdfParser, title: string, note: string) => {

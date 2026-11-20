@@ -192,7 +192,7 @@ describe("ambient glasses display", () => {
     hud.dispose();
   });
 
-  it("tap and swipe act on the pop-up only; a tap on the blank display asks about the last minute", async () => {
+  it("tap and swipe act on the pop-up only; a tap on the blank display asks about the last few sentences", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening();
     expect(hud.handleGesture("down")).toEqual({ type: "handled" });
@@ -488,7 +488,70 @@ describe("ambient glasses display", () => {
   });
 });
 
+describe("ambient display: review fixes", () => {
+  it("a wake left over from an ended session does not close the Connect/Mode menu opened afterwards", async () => {
+    vi.useFakeTimers();
+    const { hud, presentation } = await listening({ ambientIdleMs: 5000 });
+    hud.handleGesture("double"); // wake: idle deadline in 5 s
+    hud.handleGesture("double"); // hide again, then wake once more and leave the menu via Close
+    hud.handleGesture("double");
+    const close = hud.menuItems.findIndex(item => item.action === "close");
+    hud.selectListItem(close, hud.menuItems[close]!.label);
+    expect(hud.menuOpen).toBe(false);
+    presentation.setStatus("stopped");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(hud.handleGesture("double")).toEqual({ type: "handled" }); // the idle Connect / Mode menu
+    expect(hud.menuOpen).toBe(true);
+    const items = hud.menuItems.map(item => item.label);
+    hud.handleGesture("down"); // a gesture on the idle menu is not an ambient "touch"
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(hud.menuOpen).toBe(true);
+    expect(hud.menuItems.map(item => item.label)).toEqual(items);
+    expect(hud.mirror.lastGesture).not.toBe("ambient:sleep");
+    hud.dispose();
+  });
+
+  it("a list click that arrives after the woken menu closed itself is consumed, not turned into a tap", async () => {
+    vi.useFakeTimers();
+    const { hud } = await listening({ ambientIdleMs: 5000 });
+    hud.handleGesture("double");
+    expect(hud.menuOpen).toBe(true);
+    await vi.advanceTimersByTimeAsync(5500); // idle: the menu is gone, the display is blank
+    expect(hud.menuOpen).toBe(false);
+    expect(hud.ambient).toBe(true);
+    expect(hud.selectListItem(0, "Answer")).toEqual({ type: "handled" });
+    hud.dispose();
+  });
+});
+
 describe("ambient display through the real controller", () => {
+  it("a deferred MENU click does not ask a question when the menu has idled away in the meantime", async () => {
+    let listener: ((event: EvenHubEvent) => void) | undefined;
+    const bridge: G2BridgePort & TrackedBridge = Object.assign(new TrackedBridge(), {
+      getLocalStorage: async () => "", setLocalStorage: async () => true,
+      audioControl: async () => true, shutDownPageContainer: async () => true,
+      onEvenHubEvent: (callback: (event: EvenHubEvent) => void) => { listener = callback; return () => { listener = undefined; }; },
+    });
+    const presentation = new ConversationPresentation();
+    const hud = new GlassesHud(bridge, { tickMs: 0, writeGapMs: 0, ambientIdleMs: 1000 });
+    const controller = new G2ConversationController(bridge, hud, presentation);
+    await controller.initialize();
+    const asked = vi.spyOn(controller, "askContext").mockResolvedValue(undefined as never);
+    presentation.setStatus("listening");
+    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1) ?? {})).toEqual(PANELS));
+    const emit = (event: object) => listener?.(event as EvenHubEvent);
+    emit({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT, eventSource: 1 } });
+    expect(hud.menuOpen).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 850));
+    // The click lands just before the idle time ends; its 250 ms deferral outlives the menu.
+    emit({ listEvent: { containerID: 4, containerName: "hud-menu", currentSelectItemIndex: 0, eventType: OsEventTypeList.CLICK_EVENT } });
+    await vi.waitFor(() => expect(hud.ambient).toBe(true), { timeout: 2000 });
+    await new Promise(resolve => setTimeout(resolve, 400));
+    expect(asked).not.toHaveBeenCalled();
+    await controller.dispose();
+  });
+
+
   it("captures Even Hub gestures on the blank page: double press wakes the menu, a list click runs it", async () => {
     let listener: ((event: EvenHubEvent) => void) | undefined;
     const bridge: G2BridgePort & TrackedBridge = Object.assign(new TrackedBridge(), {

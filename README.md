@@ -58,7 +58,7 @@ It is cloud AI called from the phone, not offline AI.
 
 An answer has the display first; up to three cues wait behind it. Suggested questions, summaries and pending lookups never pop up. They wait in the woken HUD and on the phone.
 
-Gestures on the blank display: **tap** pages or closes a pop-up, or asks about the last minute when nothing is showing; **swipe** pages a pop-up; **hold** is push-to-talk; **double-tap** wakes the HUD.
+Gestures on the blank display: **tap** pages or closes a pop-up, or asks about the last few sentences when nothing is showing (a billed request); **swipe** pages a pop-up; **hold** is push-to-talk; **double-tap** wakes the HUD.
 
 Prefer the HUD always visible? Phone → Setup → G2 controls → **Always show the glasses HUD**. The full details are in [docs/PIXEL_GESTURES.md](docs/PIXEL_GESTURES.md).
 
@@ -80,7 +80,7 @@ A mode tells Helix what kind of conversation you are in. One tap (phone) or doub
 | **Negotiation** | Offers, numbers and concessions | Yes | `ASK` | Deception or pressure tactics |
 | **Learning** | Lectures and walkthroughs | Yes | `ASK` | Conflicts, claims, people tracking |
 | **Social** | Casual talk | No | `TALK` | Conflicts, claims |
-| **Quiet** | Captions and a running summary only | No | `ASK THEM` | Suggestions, concept cards, anything proactive |
+| **Quiet** | Captions and a running summary only (on the phone and in the woken HUD; the ambient display shows no caption) | No | `ASK THEM` | Suggestions, concept cards, anything proactive |
 
 - **Meeting** is the default, all-purpose mode: a direct answer first, then the decision, owner, risk or next step it implies.
 - **Technical** keeps every feature on and tunes answers and follow-ups for engineering detail: specs, trade-offs, sharp probes.
@@ -89,7 +89,7 @@ A mode tells Helix what kind of conversation you are in. One tap (phone) or doub
 - **Negotiation** tracks offers, numbers and concessions and suggests questions that uncover interests.
 - **Learning** explains concepts, keeps study notes and suggests smart questions during a lecture or walkthrough.
 - **Social** offers easy follow-ups and quick lookups for casual talk, and does not answer on its own.
-- **Quiet** only captions and summarises. Ask when you want help.
+- **Quiet** only captions and summarises, on the phone and in the woken HUD. Ask when you want help.
 
 Every mode's system prompt is editable in Setup (up to 4,000 characters), and a preset is a starting point: you can flip any switch after choosing a mode. The full guide, with each preset table and the built-in prompts quoted verbatim, is [docs/MODES.md](docs/MODES.md) ([简体中文](docs/MODES.zh-CN.md)).
 
@@ -133,9 +133,9 @@ Fact checking is opt-in: turn on Knowledge → Memory → **Live web fact check*
 
 - **Recent reporting first.** With Setup → Copilot → **Prefer latest news in fact checks** on (the default), the check carries today's date, and time-sensitive claims ("latest", "today", "just announced", 最新, 今天…) are searched news-first.
 - **Dated sources.** Citations carry a publication date when one is known, and Helix records whether the date came from the search engine (DeepSeek, Zhipu) or was reported by the model for a page it really cited (OpenAI).
-- **No source, no verdict.** A check without a real source is returned as "uncertain". Missing evidence is not proof that a claim is false.
+- **No source, no verdict.** A check without a real source is returned as "uncertain". Missing evidence is not proof that a claim is false. One difference on DeepSeek: when its answer carries no citation, the first three results of the search it ran are listed as the sources, so those pages were searched but not necessarily cited.
 - **Where the search runs.** The answer provider's own search if it has a verified one; otherwise OpenAI web search if an OpenAI key is entered; otherwise nowhere, and Setup says "Web and news checks are off for this provider".
-- **On the phone:** verdict, "latest news", "via *provider*" and clickable source chips with site and date.
+- **On the phone:** verdict, "latest news" and clickable source chips with site and date. "via *provider*" is shown when a non-OpenAI answer provider is selected (with OpenAI answers, the default, checks always run on OpenAI and carry no label).
 - **On the glasses:** a `CHECK` / `FACT CHECK` pop-up; a news check ends with one line for its newest dated source, in the form `Src: site · date · +n`.
 
 Searches cost money at the provider (per search, per token, or both).
@@ -161,7 +161,7 @@ Helix can quote your own material in answers, with the source kept.
 - **OpenAI knowledge base (opt-in).** Saved sessions are synced to a vector store in your own OpenAI project and searched per answer, with a fallback to the phone lookup.
 - **Notes.** Import several Markdown or text files at once, paste text, or export your vault as Markdown.
 - **Omi.** Import Omi conversations manually, or turn on automatic import (off by default; it runs while Helix is open).
-- **PDFs.** Knowledge → Transfers → **PDF → Helix** takes up to 20 PDFs per batch (30 MB each), with a progress row per file and Cancel.
+- **PDFs.** Knowledge → Transfers → **PDF → Helix** takes up to 20 PDFs per batch (30 MB each), with a progress row per file and Cancel. Up to 400,000 characters of text are kept per PDF, and the parsed text shares the 5 MiB phone archive with all your saved sessions, so a batch of large PDFs may not all fit: a PDF that does not fit is reported as failed, nothing of it is kept, and an earlier copy of the same file stays.
 
 Two ways to read a PDF:
 
@@ -181,7 +181,7 @@ The on-phone parser is [pdf.js](https://mozilla.github.io/pdf.js/), loaded only 
 
 - **Keys are runtime input on the phone.** They are never read from build-time variables and never bundled into the package.
 - **Held in memory by default.** "Save API keys on this phone" stores them in the Even app's plugin storage, which is ordinary local storage, not an encrypted vault.
-- **One key, one destination.** A provider's key joins a session only when that provider is selected, and is sent only to that provider's fixed URL.
+- **One key, one destination.** Every key is sent only to its own provider's fixed URL. A DeepSeek, Qwen, Zhipu or Moonshot key joins a session only when that provider is selected for answers. An OpenAI key, once entered, is available to every session for the OpenAI-only features (web-search fallback, knowledge base, OpenAI transcription), and still goes only to OpenAI.
 - **Where your conversation goes.** Audio goes to the transcription provider you select. Transcript text and questions go to the answer provider. Short candidate claims go to the search provider when fact checks are on. A PDF goes to OpenAI only if you choose the OpenAI parser.
 - **What stays on the phone.** Saved sessions, notes and parsed PDF text, unless you export them, send them to Omi, or sync them to your own OpenAI vector store.
 - **Diagnostics** contain lifecycle events, control names and timings. No keys, no transcripts.
@@ -302,7 +302,7 @@ This is a small project and there is real, well-scoped work open. None of the it
 - **Localise the phone UI** (it is English only; Simplified Chinese is the obvious first language).
 - **More providers.** Doubao and SiliconFlow were left out because their parameters could not be verified from documentation; the mainland Moonshot host is not included either.
 - **OCR for the on-phone PDF parser**, so scanned PDFs do not need an upload.
-- **DOM tests for the Setup screen.** The plugin's tests run in a Node environment, so the provider and model picker rebuild is only tested through its pure helpers.
+- **DOM tests for the Setup screen.** The plugin's tests run in a Node environment, so the provider and model picker rebuild is only tested through its pure helpers, and the 0.13 Setup controls (answer length, news search, the provider key fields, the always-on switch) are checked by markup and config round-trip tests, not by driving the form in a DOM (jsdom or happy-dom).
 - **A second device adapter** on top of `packages/conversation-sdk`.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first. `main` is protected, so changes land through pull requests that pass the gate. Say what you verified and where: unit test, simulator, or real glasses.

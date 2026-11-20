@@ -173,7 +173,7 @@ export function cleanTranscript(entries: readonly HistoryEntry[]): TranscriptLin
     } else if (entry.kind === "question") {
       const label = (entry.speaker ?? "").trim();
       if (/^local context$/iu.test(label) || /^whole conversation$/iu.test(label)) {
-        lines.push({ speaker: "You", text: /^local/iu.test(label) ? "asked Helix about the last minute" : "asked Helix about the whole conversation", kind: "request", entryIds: [entry.id] });
+        lines.push({ speaker: "You", text: /^local/iu.test(label) ? "asked Helix about the last few sentences" : "asked Helix about the whole conversation", kind: "request", entryIds: [entry.id] });
         continue;
       }
       const text = cleanLineText(raw);
@@ -250,7 +250,7 @@ export function sessionCues(entries: readonly HistoryEntry[]): SessionCue[] {
   for (const entry of entries) {
     if (entry.kind === "question") {
       const label = (entry.speaker ?? "").trim();
-      question = /^local context$/iu.test(label) ? "You asked about the last minute" : /^whole conversation$/iu.test(label) ? "You asked about the whole conversation" : cleanLineText(entry.text ?? "") || undefined;
+      question = /^local context$/iu.test(label) ? "You asked about the last few sentences" : /^whole conversation$/iu.test(label) ? "You asked about the whole conversation" : cleanLineText(entry.text ?? "") || undefined;
     } else if (entry.kind === "answer") {
       const text = cleanLineText(entry.text ?? "");
       if (text) cues.push({ kind: "answer", text, ...(question ? { question } : {}) });

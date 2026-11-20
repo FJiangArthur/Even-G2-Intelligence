@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { NO_WEB_SEARCH_MESSAGE, WebFactChecker, isTimeSensitive, verifyClaim, type FactCheckResult } from "../src/fact-check.js";
 import { ANSWER_LENGTHS, answerLengthProfile, answerLengthTokens, answerSentenceLimit, cleanAnswerLength } from "../src/answer-length.js";
 import { ConversationCopilot, copilotInstructions } from "../src/copilot.js";
+import { ContextInsightAnalyzer, insightInstructions, type ContextInsight } from "../src/context-insights.js";
 import { resolveSearchRoute } from "../src/provider-registry.js";
 import { DirectConversationTransport, type DirectConversationOptions } from "../src/direct-transport.js";
 import { HelixConversationClient } from "../src/client.js";
@@ -39,6 +40,41 @@ describe("answer length profiles", () => {
     expect(copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS, answerLength: "standard" })).toBe(standard);
     expect(copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS, answerLength: "brief" })).toContain("(one short sentence, speech language)");
     expect(copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS, answerLength: "detailed" })).toContain("(two to four sentences, speech language)");
+  });
+});
+
+describe("answer length in the auto-explain-terms lane", () => {
+  const insightReply = (explanation: string) => new Response(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: JSON.stringify({ term: "RAG", explanation }) })}\n\ndata: {"type":"response.completed"}\n\n`);
+  async function explain(length: AnswerLength | undefined | (() => never), explanation: string) {
+    const results: ContextInsight[] = [];
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => insightReply(explanation));
+    const analyzer = new ContextInsightAnalyzer({ fetch: fetcher, key: "fixture", sessionId: "s", profile: "openai-responses", model: "gpt-4o-mini", enabled: () => true, onResult: r => results.push(r),
+      ...(length ? { length: typeof length === "function" ? length : () => length } : {}) });
+    analyzer.submit("t1", "We discussed RAG.");
+    await settle();
+    analyzer.cancel();
+    return { results, instructions: sent(fetcher).instructions as string };
+  }
+  it("keeps the pre-0.13 prompt and 500-character limit when unset or Standard", async () => {
+    const standard = insightInstructions();
+    expect(standard).toContain("Explain directly in the speech language, preserve ambiguity, at most 80 characters for term and 500 for explanation.");
+    expect(insightInstructions("standard")).toBe(standard);
+    expect((await explain(undefined, "x".repeat(500))).instructions).toBe(standard);
+    expect((await explain("standard", "x".repeat(500))).results).toHaveLength(1);
+    expect((await explain("standard", "x".repeat(501))).results).toHaveLength(0);
+  });
+  it("shortens the explanation for Brief and lengthens it for Detailed, in the prompt and in the accepted size", async () => {
+    const brief = await explain("brief", "x".repeat(201));
+    expect(brief.instructions).toContain(`in ${answerLengthProfile("brief").conceptSentences}, preserve ambiguity, at most 80 characters for term and 200 for explanation`);
+    expect(brief.results).toHaveLength(0);
+    expect((await explain("brief", "Retrieval augmented generation.")).results).toHaveLength(1);
+    const detailed = await explain("detailed", "x".repeat(900));
+    expect(detailed.instructions).toContain(`in ${answerLengthProfile("detailed").conceptSentences}, preserve ambiguity, at most 80 characters for term and 900 for explanation`);
+    expect(detailed.results).toHaveLength(1);
+    expect((await explain("detailed", "x".repeat(901))).results).toHaveLength(0);
+  });
+  it("falls back to Standard when the host callback throws", async () => {
+    expect((await explain(() => { throw new Error("host"); }, "Retrieval augmented generation.")).instructions).toBe(insightInstructions());
   });
 });
 

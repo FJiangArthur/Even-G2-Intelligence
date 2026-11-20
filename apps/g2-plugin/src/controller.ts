@@ -370,10 +370,9 @@ export class G2ConversationController {
         onStatus: status => { this.pdfFiles = status; this.emitHistory(); },
         save: async ({ session, entries }) => {
           await this.archiveQueue;
-          // Re-adding the same PDF replaces it; otherwise passages of the old, longer version would stay.
-          if (this.history.getSession(session.id)) await this.history.deleteSession(session.id);
-          await this.history.upsertSession(session);
-          await this.history.upsertEntries(entries);
+          // One all-or-nothing save. Re-adding the same PDF replaces it (passages of an old, longer version
+          // must not stay); when the save fails (archive full) no empty document is left and the old copy stays.
+          await this.history.replaceSession(session, entries);
         },
       });
     } finally {

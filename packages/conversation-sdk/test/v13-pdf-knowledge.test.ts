@@ -150,6 +150,28 @@ describe("v0.13 multi-PDF ingestion", () => {
     expect(s.listSessions().map(session => session.title)).toEqual(["b"]);
   });
 
+  it("replaceSession stores a document in one save: a re-import replaces every passage, a failed save changes nothing", async () => {
+    let fail = false; const writes: string[] = [];
+    const s = new LocalHistoryStore({ getLocalStorage: async () => "", setLocalStorage: async key => { if (fail) throw new Error("storage refused"); writes.push(key); return true; } });
+    await s.load();
+    const first = pdfToSession({ name: "Vendor.pdf", size: 10 }, { pages: [{ page: 1, text: "Lead time is twelve weeks." }, { page: 2, text: "Budget is sixty thousand." }] }, { parser: "local" });
+    await s.replaceSession(first.session, first.entries);
+    expect(s.getEntries(first.session.id).map(entry => entry.text)).toEqual(["Lead time is twelve weeks.", "Budget is sixty thousand."]);
+    // A shorter version of the same file: the stale second passage goes.
+    const shorter = pdfToSession({ name: "Vendor.pdf", size: 10 }, { pages: [{ page: 1, text: "Lead time is ten weeks." }] }, { parser: "local" });
+    await s.replaceSession(shorter.session, shorter.entries);
+    expect(s.getEntries(first.session.id).map(entry => entry.text)).toEqual(["Lead time is ten weeks."]);
+    expect(s.search("budget sixty")).toEqual([]);
+    // Failed save: the stored copy is untouched and a new document leaves nothing behind.
+    fail = true;
+    await expect(s.replaceSession(first.session, first.entries)).rejects.toThrow(/Could not save local history/u);
+    const other = pdfToSession({ name: "Other.pdf", size: 11 }, { pages: [{ page: 1, text: "Calibration drift." }] }, { parser: "local" });
+    await expect(s.replaceSession(other.session, other.entries)).rejects.toThrow(/Could not save local history/u);
+    expect(s.listSessions().map(session => session.id)).toEqual([first.session.id]);
+    expect(s.getEntries(first.session.id).map(entry => entry.text)).toEqual(["Lead time is ten weeks."]);
+    await expect(s.replaceSession(other.session, [{ ...other.entries[0]!, sessionId: "elsewhere" }])).rejects.toThrow(/without their session/u);
+  });
+
   it("OpenAI parser: a rejected PDF fails alone; a key or billing error stops the rest with the reason and keeps what was saved", async () => {
     const s = await store(); let n = 0;
     const api = fakeOpenAI(() => ++n === 2 ? new Response("{}", { status: 400 }) : modelText(`=== Page 1 ===\nDocument ${n} mentions the Orin lead time.`));

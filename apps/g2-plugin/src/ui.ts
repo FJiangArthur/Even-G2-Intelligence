@@ -74,7 +74,7 @@ export function gestureHelpLines(value: unknown = (glassesHud as unknown as Reco
   else if (Array.isArray(value)) lines = value.map(row).filter((line): line is string => Boolean(line));
   else if (value && typeof value === "object") lines = Object.entries(value as Record<string, unknown>).map(([key, action]) => `${key}: ${String(action)}`);
   return lines.length ? lines.slice(0, 12) : [
-    "Press: select or ask about the last minute",
+    "Press: select or ask about the last few sentences (on the blank ambient display a tap with nothing showing asks too; every ask is a billed request)",
     "Double press: open the glasses menu (whole-conversation answer is there)",
     "Swipe up/down: switch views or scroll",
     "Hold: talk, release to submit",
@@ -1678,7 +1678,7 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
             </section>
 
             <section class="config-group" aria-labelledby="copilot-title">
-              <div class="config-group-heading"><h3 id="copilot-title">Copilot</h3><p>Runs in the background. Results appear on the glasses HUD (swipe to Q&amp;A, Concepts, Summary, Checks) and in these tabs.</p></div>
+              <div class="config-group-heading"><h3 id="copilot-title">Copilot</h3><p>Runs in the background. Results appear in these tabs and on the glasses: as pop-ups on the default ambient display, and in the HUD views (Q&amp;A, Concepts, Summary, Checks) once the HUD is woken with a double-tap or set to always show.</p></div>
               <div class="explanation-settings">
                 <label class="toggle" for="auto-explain-terms"><input id="auto-explain-terms" type="checkbox"><span>Explain technical terms automatically</span></label>
                 <p class="field-note">Uses your selected answer model and incurs provider charges. AI-generated explanations are not web-verified.</p>
@@ -1691,7 +1691,7 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                 ${toggle("copilot-conflicts", "Flag conflicting statements")}
                 ${toggle("copilot-suggestions", "Suggest questions")}
                 ${toggle("copilot-implicit-asks", "Answer things people mention", "Lead times, prices, design choices")}
-                ${toggle("copilot-web-grounding", "Use web search", "$10 per 1,000 searches plus tokens")}
+                ${toggle("copilot-web-grounding", "Use web search", "Billed by the search provider; see the note below")}
                 ${toggle("news-search", "Prefer latest news in fact checks", "Recent reporting first, with dated sources. Applies to Live web fact check and Verify")}
                 ${toggle("copilot-claims", "Find claims to verify", "Checks tab and the glasses Verify action")}
                 ${toggle("copilot-people", "Track people", "People tab; saved with each session")}
@@ -1756,7 +1756,7 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                 <label for="soniox-api-key">Soniox API key
                   <input id="soniox-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
                 </label>
-                <label for="omi-api-key">Omi API key (explicit import only)
+                <label for="omi-api-key">Omi API key (import and automatic import)
                   <input id="omi-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
                 </label>
                 <label for="deepseek-api-key">DeepSeek API key
@@ -1790,7 +1790,7 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
             </section>
 
             <section class="config-group" aria-labelledby="prompt-title">
-              <div class="config-group-heading"><h3 id="prompt-title">Response guidance</h3><p>Your phone applies these instructions directly to GPT responses.</p></div>
+              <div class="config-group-heading"><h3 id="prompt-title">Response guidance</h3><p>Your phone applies these instructions directly to model responses.</p></div>
               <label for="instructions">Instructions
                 <textarea id="instructions" rows="4" maxlength="8000"></textarea>
               </label>

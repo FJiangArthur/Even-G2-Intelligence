@@ -209,7 +209,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
       const runtime: Runtime = { config, credentials, stt, answer, model, provider, answerKey, abort: new AbortController(), chunks: [], samples: 0, speech: false, sequence: 0, committed: 0, queue: Promise.resolve(), transcript: new TranscriptContext(), manualHistory: [], answerEpoch: 0, manualActive: false, pending: 0, blocked: false, notes: [], roles: new SpeakerRoleTally() };
       this.runtime = runtime;
       const insights = this.options.insights;
-      if (insights) runtime.insights = new ContextInsightAnalyzer({ fetch: this.fetcher, key: answerKey, sessionId: config.sessionId, profile: answer, model, ...(chat ? { provider } : {}), onUsage: usage => this.usage(runtime, usage),
+      if (insights) runtime.insights = new ContextInsightAnalyzer({ fetch: this.fetcher, key: answerKey, sessionId: config.sessionId, profile: answer, model, ...(chat ? { provider } : {}), onUsage: usage => this.usage(runtime, usage), length: () => this.answerLength(),
         enabled: () => this.runtime === runtime && !runtime.abort.signal.aborted && !runtime.blocked && insights.enabled(),
         onResult: result => { if (this.runtime === runtime && !runtime.abort.signal.aborted && !runtime.manualActive) insights.onResult(result); },
       });

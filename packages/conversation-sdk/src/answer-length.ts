@@ -54,7 +54,7 @@ const PROFILES: Readonly<Record<AnswerLength, AnswerLengthProfile>> = Object.fre
     conceptSentences: "one or two sentences",
   }),
   detailed: Object.freeze({
-    id: "detailed", label: "Detailed", blurb: "At least 6 sentences with reasons, numbers or steps. Slower and costs more; the glasses page long answers.",
+    id: "detailed", label: "Detailed", blurb: "Up to 6 sentences or more (the sentence limit is raised to at least 6), with reasons, numbers or steps. Slower and costs more; the glasses page long answers.",
     style: "Give a fuller answer: the direct answer first, then the key reasons, numbers, steps or trade-offs that support it.",
     answerTokens: 1200, answerReasoningTokens: 3000,
     lookupSentences: 5, proposeSentences: 6, lookupTokens: 800, lookupReasoningTokens: 3000, lookupChars: 2400,

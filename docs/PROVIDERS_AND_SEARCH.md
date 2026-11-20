@@ -50,10 +50,12 @@ Verify action for a single claim. New: Setup → Copilot → "Prefer latest news
   With the Zhipu search such a claim uses `search_recency_filter: "oneMonth"` and widens once if nothing is found.
 - Sources carry `publishedAt` when known. `dateSource: "search"` is the search engine's date (DeepSeek, Zhipu);
   `dateSource: "model"` is the date the model reported for a page it really cited (OpenAI has no date field).
-  A verdict without a real source is still returned as "uncertain".
+  A verdict without a real source is still returned as "uncertain". DeepSeek exception: when its answer has no citation annotations,
+  the first three results of the search it ran are attached as sources (searched, not necessarily cited).
 - Where the search runs: the answer provider's own verified search; otherwise OpenAI web search when an OpenAI key
   is entered; otherwise nowhere. Setup shows which one applies, including "Web and news checks are off for this provider".
-- Phone: Checks cards show the verdict, "latest news", "via <provider>" and clickable, dated source chips.
+- Phone: Checks cards show the verdict, "latest news" and clickable, dated source chips. "via <provider>" appears only when a
+  non-OpenAI answer provider is selected (a search route exists); the default OpenAI path sets no `via`.
 - Glasses (ambient display): the verdict pops up as `CHECK` / `FACT CHECK`; a news-biased check reads `news check` and ends with one `Src: site · date · +n` line for the newest dated source. Answer length "Detailed" lets a pop-up cue use up to 6 pages instead of 3; answers always page in full.
   Glasses: unchanged lanes (a contradicted, sourced check appears as a correction).
 
@@ -65,11 +67,12 @@ Search cost: OpenAI bills per search plus tokens; DeepSeek counts results as inp
 
 | | Brief | Standard | Detailed |
 |---|---|---|---|
-| Live answer sentences | at most 2 | "Max answer sentences" (3) | at least 6 |
+| Live answer sentences | at most 2 | "Max answer sentences" (3) | limit raised to at least 6 (still "at most N") |
 | Live answer output tokens (plain / reasoning model) | 300 / 1500 | 600 / 2000 | 1200 / 3000 |
 | Copilot lookup / proposal sentences | 2 / 2 | 3 / 4 | 5 / 6 |
 | Web-check verdict | one short sentence | one or two sentences | three or four sentences |
 | Concept explanation | one short sentence | one or two sentences | two to four sentences |
+| Auto-explained term (max characters) | one short sentence (200) | unchanged prompt (500) | two to four sentences (900) |
 
 Standard sends exactly the prompts and limits used before the setting existed.
 

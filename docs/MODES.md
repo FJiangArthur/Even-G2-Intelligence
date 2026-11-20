@@ -23,7 +23,7 @@ Everything here is taken from `packages/conversation-sdk/src/modes.ts` (`MODE_PR
 | **Negotiation** | Offers, numbers and concessions on the table | `DEAL` | `ASK` | Yes | Deception or pressure tactics |
 | **Learning** | Lectures and walkthroughs: concepts, study notes, smart questions | `LEARN` | `ASK` | Yes | Conflicts, claims, people tracking |
 | **Social** | Casual talk: easy follow-ups and quick look-ups | `SOCIAL` | `TALK` | No | Conflicts, claims |
-| **Quiet** | Captions and a running summary only | `QUIET` | `ASK THEM` | No | Suggestions, concept cards, conflicts, claims, people, anything proactive |
+| **Quiet** | Captions and a running summary only (phone and woken HUD) | `QUIET` | `ASK THEM` | No | Suggestions, concept cards, conflicts, claims, people, anything proactive |
 
 The order above is the order of the picker on the phone and on the glasses.
 
@@ -430,7 +430,7 @@ Customise it with your own voice, for example more playful or more reserved.
 
 **Choose it when** you want a record and a recap but no prompts – a talk you are attending, a sensitive meeting, or any time the HUD should stay calm.
 
-**What it shows.** Live captions and a summary focused on decisions, numbers, dates and open issues. Help is still one gesture away: ask from the menu (**Answer**) or hold to talk, and Helix answers that request.
+**What it shows.** Live captions and a summary focused on decisions, numbers, dates and open issues, on the phone and in the woken HUD (with the default ambient display the lens stays blank, with no caption, until you wake the HUD). Help is still one gesture away: ask from the menu (**Answer**) or hold to talk, and Helix answers that request.
 
 **What it does not do.**
 

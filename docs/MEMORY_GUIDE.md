@@ -1,12 +1,12 @@
 # History, Omi import and fact checking
 
-Release target: 0.6.0. See MEMORY_FACTS_QA.md for actual validation/upload status.
+Describes 0.13. See MEMORY_FACTS_QA.md for the validation status recorded for earlier releases.
 
 ## Import Omi records
 
 Omi integration imports conversations and their transcript passages into this phone's Helix history. It does not search Omi while generating answers, and it does not automatically upload Helix notes to Omi. Import is manual unless you turn on automatic import (below).
 
-Use an Omi **Developer API Key** with conversation-read access, obtained in the Omi app's **Settings → Developer → Create Key**, not a key from its MCP settings. Enter it in the masked Omi key field, choose the desired date range in History, and use the explicit import action. You can cancel an import. Previously saved pages remain available after a cancellation or network failure; retrying upserts matching records instead of duplicating them. The imported count means conversations processed in that run, including records already present.
+Use an Omi **Developer API Key** with conversation-read access, obtained in the Omi app's **Settings → Developer → Create Key**, not a key from its MCP settings. Enter it in the masked Omi key field in Setup → API keys, choose the date range in **Knowledge → Transfers → Omi → Helix**, and tap **Import from Omi**. You can cancel an import. Previously saved pages remain available after a cancellation or network failure; retrying upserts matching records instead of duplicating them. The imported count means conversations processed in that run, including records already present.
 
 No key is stored inside the history archive. The separate save-API-keys option is an explicit opt-in to ordinary Even App local storage, not a documented encrypted vault.
 
@@ -42,7 +42,7 @@ Before 0.13 the app clicked a hidden download link and always reported "Prepared
 
 ## PDF documents (0.13)
 
-**Knowledge → Transfers → PDF → Helix** adds PDFs to the knowledge base: up to 20 per batch, 30 MB each, at most 400,000 characters of text kept per PDF. Each PDF has its own progress row; one failing does not affect the others, and **Cancel** keeps what was already added. Adding the same file again replaces it.
+**Knowledge → Transfers → PDF → Helix** adds PDFs to the knowledge base: up to 20 per batch, 30 MB each, at most 400,000 characters of text kept per PDF. The parsed text is stored in the phone archive, which holds 5 MiB for all sessions together, so a batch of large PDFs may not all fit (400,000 Chinese characters alone are about 1.2 MB). A PDF that does not fit is reported as failed with the storage-limit message; it is saved all-or-nothing, so no empty document is left and an earlier copy of the same file stays as it was. Each PDF has its own progress row; one failing does not affect the others, and **Cancel** keeps what was already added. Adding the same file again replaces it.
 
 Choose how the PDFs are read:
 
@@ -77,23 +77,32 @@ Deleting the currently active session stops saving that connection's history unt
 
 ## Enable live web fact checking
 
-Live web fact checking is separate from local memory and starts OFF. Enabling it sends short candidate public factual claims from committed speech directly to OpenAI's Responses web-search tool using your runtime OpenAI key. Provider search and model charges apply. No Helix gateway or third-party search proxy is introduced.
+Live web fact checking is separate from local memory and starts OFF (Knowledge → Memory → **Live web fact check**; **Verify** checks a single claim). Enabling it sends short candidate public factual claims from committed speech to a web search chosen by your answer provider:
 
-Search runs in the background and does not hold up streamed answers. Its results distinguish supported, contradicted, uncertain and unavailable. A confident correction requires completed web search and usable source citations. Open those links on the phone to inspect the evidence. Lack of evidence or a failed request is not proof that a claim is false.
+- **OpenAI answers (default):** OpenAI's Responses web-search tool, with your OpenAI key.
+- **DeepSeek answers:** DeepSeek's own web search, with your DeepSeek key.
+- **Zhipu GLM (China) answers:** the Zhipu Web Search API, then GLM judges only those results, with your Zhipu key.
+- **Other providers (Qwen, Kimi, Zhipu international):** OpenAI web search when an OpenAI key is entered; otherwise checks are off and Setup says so.
+
+Provider search and model charges apply. Requests go from the phone straight to that provider; no Helix gateway or third-party search proxy is involved. With **Prefer latest news in fact checks** on (the default) the check carries today's date and prefers recent, dated reporting. Details: [PROVIDERS_AND_SEARCH.md](PROVIDERS_AND_SEARCH.md).
+
+Search runs in the background and does not hold up streamed answers. Its results distinguish supported, contradicted, uncertain and unavailable. A verdict requires a completed web search and usable sources (on DeepSeek, when the answer carries no citation, the first results of the search it ran are listed). Open those links on the phone to inspect the evidence. Lack of evidence or a failed request is not proof that a claim is false.
 
 Only relevant candidate claims are checked; this is not a guarantee that every utterance is verified. A short cooldown and one active search bound load. Disabling the toggle cancels in-flight checking and suppresses late results. A sourced correction cannot overwrite a newer explicit answer on the glasses.
 
 ## Stream and glasses behavior
 
-Answers update from provider deltas; they do not wait for the complete response. Provider/network latency and the physical glasses bridge remain separate factors. Transcript updates and source details stay on the phone. Glasses use the full 576 × 288 native text region, paginate long output and hide after reading. Sourced corrections and automatic explanations can temporarily use the idle display, without interrupting answers.
+Answers update from provider deltas; they do not wait for the complete response. Provider/network latency and the physical glasses bridge remain separate factors. Transcript updates and source details stay on the phone.
 
-Single press asks using recent context; double press asks using the captured session context. Both can use relevant local history when enabled, and a later press replaces earlier answer work. Hold/release remains push-to-talk.
+Since 0.13 the glasses display is **ambient** by default: during a conversation the lens is blank. An answer pops up, pages by itself and disappears when it has been read; lookups, term explanations and fact verdicts pop up as short cues and disappear too. Cues wait while an answer is showing. **Double-tap** wakes the full HUD with its menu; double-tap on the menu, or 20 seconds without a gesture, blanks it again. Setup → G2 controls → **Always show the glasses HUD** keeps the full HUD on instead. Details: [PIXEL_GESTURES.md](PIXEL_GESTURES.md).
+
+Gestures: **tap** pages or closes what is showing; with nothing showing it asks about the last few sentences of the conversation (a billed request). **Double-tap** opens the menu; the whole-conversation answer is the menu item **Answer all**. **Hold / release** is push-to-talk. Requested answers can use relevant local history when enabled, and a later request replaces earlier answer work.
 
 ## Explanations and shortcuts
 
-Automatic term explanations start ON. Final live speech can trigger a separate model request using the selected answer model and runtime OpenAI key; provider charges apply. The phone labels these cards AI-generated and not web-verified. Expand Explanation, open Original transcript, or Dismiss. New cards preserve typing focus. Explanations are live feed cards, not a new durable archive type; their source transcript is saved through normal history.
+Automatic term explanations start ON. Final live speech can trigger a separate model request using the selected answer provider, its model and its key (OpenAI, DeepSeek, Qwen, Zhipu or Kimi); provider charges apply. Setup → **Answer length** sizes the explanation (Brief: one short sentence; Detailed: two to four sentences). The phone labels these cards AI-generated and not web-verified. Expand Explanation, open Original transcript, or Dismiss. New cards preserve typing focus. Explanations are live feed cards, not a new durable archive type; their source transcript is saved through normal history.
 
-An idle glasses explanation hides after eight seconds. Busy answers have priority and a skipped cue is not replayed afterward. Turning automatic explanations OFF cancels pending analysis and suppresses late cards. Manual questions cancel earlier analysis; pending manual answers take priority over newly finalized speech analysis.
+On the glasses an explanation is a cue: on the ambient display it pops up and disappears after it has been read. Answers have priority; a cue that waited too long (45 seconds) is dropped, not replayed. Turning automatic explanations OFF cancels pending analysis and suppresses late cards. Manual questions cancel earlier analysis; pending manual answers take priority over newly finalized speech analysis.
 
 Use the native OS tap-then-hold menu or the phone Shortcuts button for Explain term, Local answer, Global answer, Dismiss cue, and Pause / resume. No custom tap-and-hold recognizer is added. The inspected public Even SDK has no QuickList writer; QuickList export is unsupported and the fallback/destination choice remains pending. No extra service has been added.
 
