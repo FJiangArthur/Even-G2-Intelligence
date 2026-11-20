@@ -1361,6 +1361,7 @@ export class GlassesHud implements GlassesSurface {
       if (item.action === "claims" && this.claimList().length) return { ...item, label: `Claims · ${this.claimList().length}` };
       if (item.action === "concepts" && this.conceptList().length) return { ...item, label: `Concepts · ${this.conceptList().length}` };
       if (item.action === "ask-them") return { ...item, label: sentenceCase(this.askLabel()) };
+      if (item.action === "summary" && this.noteTaking()) return { ...item, label: "To-do" }; // Notes mode: the SUMMARY view is the TO-DO view
       return item;
     }).slice(0, HUD_MENU_LIST.maxItems).map(item => ({ ...item, label: item.label.slice(0, HUD_MENU_LIST.maxChars) }));
   }

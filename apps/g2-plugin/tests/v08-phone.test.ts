@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { HistoryEntry, HistorySession, QuestionDetectedEvent, Speaker, TranscriptFinalEvent, TranscriptPartialEvent } from "@helix/conversation-sdk";
 import { ConversationPresentation, feedBlocks, paragraphText, speakerName, type FeedItem } from "../src/presentation";
-import { cleanLineText, cleanTranscript, historySpeaker, joinConcept, sessionCard, sessionKnowledge, sessionTitle, splitConcept, transcriptText } from "../src/history-panel";
+import { cleanLineText, cleanTranscript, historySpeaker, joinConcept, sessionCard, sessionDayKey, sessionKnowledge, sessionTitle, splitConcept, transcriptText } from "../src/history-panel";
 import { knowledgeMapSvg, omiExportSummary, sourceOverview, zipFiles } from "../src/knowledge-panel";
 import { askAboutPrompt, mergePeople } from "../src/people-panel";
 import { defaultTabForHudView, shouldFollowHud } from "../src/tabs";
@@ -173,8 +173,11 @@ describe("v0.8 History cleanup", () => {
     expect(splitConcept(joinConcept("NVMe ring buffer", "Overwrites the oldest data."))).toEqual({ term: "NVMe ring buffer", explanation: "Overwrites the oldest data." });
     const card = sessionCard(session({ people: [{ name: "Priya" }, { name: "Kan" }] }), entries.filter(item => item.speaker !== "Omi summary"));
     expect(card).toMatchObject({ source: "helix", duration: "9 min", people: ["Priya", "Kan"], lines: 2, answers: 1 });
-    expect(card.title).toMatch(/^Helix session · /u);
-    expect(card.summary).toBe("Them: We're moving to CDTF for the mapping head. See for details. You: What's the lead time on Thor?");
+    // v0.13: a placeholder title becomes a title derived on the phone (topic words), never the first utterance;
+    // the summary line says it is not an AI summary; the counts say what they count.
+    expect(card.title).toBe("About CDTF");
+    expect(card.summary).toBe("Not summarised yet · mentions CDTF. Opens with “We're moving to CDTF for the mapping head.”");
+    expect(card).toMatchObject({ origin: "fallback", counts: "2 speaker turns · 1 Helix answer", day: sessionDayKey("2026-11-08T20:00:00.000Z") });
     expect(sessionTitle(session({ title: "Kickoff https://x.io/a" }))).toBe("Kickoff");
     // Omi overviews stand in for a missing summary.
     expect(sessionKnowledge(session({ source: "omi" }), entries).summary).toEqual(["Vendor overview that must not appear as a line."]);

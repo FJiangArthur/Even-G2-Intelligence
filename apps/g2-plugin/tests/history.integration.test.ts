@@ -153,7 +153,7 @@ describe("phone local history integration", () => {
     });
     await f.controller.initialize(); await f.controller.connect(form);
     expect(options.insights?.enabled()).toBe(true);
-    const sessionId = f.controller.listHistorySessions()[0]!.id;
+    const sessionId = f.controller.liveSessionId()!; // v0.13: no history record until something is said
     const insight = { id: "i", sessionId, transcriptId: "t", term: "RAG", explanation: "Retrieval.", createdAt: new Date().toISOString() };
     options.insights!.onResult(insight);
     expect(f.presentation.snapshot().feed.some(item => item.kind === "insight")).toBe(true);
@@ -435,7 +435,8 @@ describe("phone local history integration", () => {
     await Promise.resolve(); expect(reconnected).toBe(false);
     expect(f.presentation.snapshot().glasses.answer).toBeUndefined();
     release(); await reconnect;
-    await vi.waitFor(() => expect(f.controller.listHistorySessions()).toHaveLength(2));
+    // v0.13: the reconnected session has said nothing yet, so it has no history record.
+    await vi.waitFor(() => expect(f.controller.listHistorySessions()).toHaveLength(1));
     const sessions = f.controller.listHistorySessions().map(session => f.controller.openHistorySession(session.id)!);
     expect(sessions.filter(record => record.entries.length > 0)).toHaveLength(1);
     const old = sessions.find(record => record.entries.length > 0)!;

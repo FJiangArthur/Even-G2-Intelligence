@@ -101,7 +101,7 @@ describe("v0.11 history: AI cues, mindmap, generated summary", () => {
     const fetcher = async (_url: string, init?: RequestInit) => { bodies.push(String(init?.body));
       return Response.json({ output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify({ summary: ["A", " "], keyFacts: ["$25k"], concepts: [{ term: "CDTF", explanation: "Framework." }] }) }] }] }); };
     const digest = await summarizeSession(fetcher, "k", "gpt-6-luna", { title: "T", lines: [{ speaker: "Them", text: "Budget is 25k." }] });
-    expect(digest).toEqual({ summary: ["A"], keyFacts: ["$25k"], concepts: [{ term: "CDTF", explanation: "Framework." }] });
+    expect(digest).toEqual({ title: "", overview: "", summary: ["A"], keyFacts: ["$25k"], concepts: [{ term: "CDTF", explanation: "Framework." }] }); // v0.13: + title/overview
     expect(bodies).toHaveLength(1); expect(bodies[0]).toContain("Them: Budget is 25k.");
     await expect(summarizeSession(fetcher, "", "m", { title: "T", lines: [] })).rejects.toThrow(/OpenAI key/u);
     await expect(summarizeSession(fetcher, "k", "m", { title: "T", lines: [] })).rejects.toThrow(/no transcript/u);

@@ -1,5 +1,6 @@
 import type { ConversationTransport, GatewayEventListener, TransportState, TransportStateListener } from "./transport.js";
 import { searchOpenAIKnowledge } from "./openai-knowledge.js";
+import { summarizeSession, type SessionDigest } from "./session-digest.js";
 import { HELIX_PROTOCOL_VERSION, normalizeSessionConfig, normalizeSessionStartCredentials, type AudioFrame, type AudioFrameCommand, type ClientCommand, type ConversationContext, type GatewayEvent, type NormalizedSessionConfig, type SessionStartCredentials, type Speaker, type ResponseTrigger } from "./types.js";
 import { extractQuestions, questionKindFor } from "./questions.js";
 import { SpeakerRoleTally } from "./speaker-attribution.js";
@@ -151,6 +152,13 @@ export class DirectConversationTransport implements ConversationTransport, Copil
     const expired = new Promise<undefined>(resolve => abort.signal.addEventListener("abort", () => resolve(undefined), { once: true }));
     try { const ids = await Promise.race([listAccessibleModels(this.fetcher, key, abort.signal), expired]); return ids?.length ? ids : undefined; }
     catch { return undefined; } finally { clearTimeout(timer); }
+  }
+  /**
+   * v0.13 post-conversation summary: one digest call (title, overview, summary, key facts, concepts)
+   * with this transport's fetch. Independent of the session state, so the host can run it after stop.
+   */
+  summarizeSession(key: string, model: string, session: Parameters<typeof summarizeSession>[3], options: Parameters<typeof summarizeSession>[4] = {}): Promise<SessionDigest> {
+    return summarizeSession(this.fetcher, key, model, session, options);
   }
   async connect(): Promise<void> { this.setState("open"); }
   async disconnect(): Promise<void> {

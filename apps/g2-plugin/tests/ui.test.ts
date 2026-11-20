@@ -5,6 +5,9 @@ import {
   answerMetaLine,
   answerModelOptionsMarkup,
   companionMarkup,
+  FEED_FOLLOW_SLACK_PX,
+  feedFollowDelta,
+  panelScrollTop,
   gestureHelpLines,
   mascotStateFor,
   retrievalNote,
@@ -136,7 +139,13 @@ describe("companion UI structure", () => {
     expect(knowledgeSource).toContain("Live web fact check");
     expect(knowledgeSource).toContain("Search incurs provider charges");
     expect(knowledgeSource).toContain('this.local.id = "use-local-memory"; this.web.id = "live-web-fact-check"');
-    expect(historySource).toContain("window.confirm");
+    // v0.13: removal is confirmed in the page (a native dialog can block the Even WebView), and the same
+    // memory switch is offered in History as "Let the knowledge base read history".
+    expect(historySource).not.toMatch(/window\.confirm\(|\balert\(|\bprompt\(/u);
+    expect(historySource).toContain('role", "alertdialog"');
+    expect(historySource).toContain("Let the knowledge base read history");
+    expect(historySource).toContain("controller.setLocalMemoryEnabled(this.knowledgeToggle.checked)");
+    expect(historySource).not.toMatch(/Clear history|Delete all/iu);
     expect(historySource).toContain("if (signature === this.detailSignature) return");
     expect(historySource).toContain("this.selectedEntry = entryId");
     expect(styles).toMatch(/\.history-detail \.is-selected\s*\{[^}]*background: var\(--support-tint\)/su);
@@ -196,7 +205,50 @@ describe("v0.7 tabbed pixel HUD", () => {
       expect(markup).toContain(`id="${id}"`);
     }
     expect(markup.indexOf('id="connect-button"')).toBeLessThan(markup.indexOf('role="tablist"'));
-    expect(styles).toMatch(/\.shell\s*\{[^}]*height:\s*100dvh/su);
+    expect(styles).toMatch(/\.shell\s*\{[^}]*min-height:\s*100dvh/su);
+  });
+
+  it("v0.13: the document is the only vertical scroller (no fixed-height shell, no scrolling tab panel)", () => {
+    const rules = [...styles.replace(/\/\*[\s\S]*?\*\//gu, "").matchAll(/([^{}@;]+)\{([^{}]*)\}/gu)].map(match => ({ selector: match[1]!.trim(), body: match[2]! }));
+    // Cascade for one plain selector, in source order: the last height and vertical overflow win.
+    const effective = (selector: string) => {
+      let height = "auto", overflowY = "visible";
+      for (const rule of rules) {
+        if (!rule.selector.split(",").map(item => item.trim()).includes(selector)) continue;
+        for (const declaration of rule.body.split(";")) {
+          const [property, value] = declaration.split(":").map(part => part.trim());
+          if (!property || !value) continue;
+          if (property === "height") height = value;
+          if (property === "overflow-y") overflowY = value;
+          if (property === "overflow") overflowY = value.split(/\s+/u).at(-1)!;
+        }
+      }
+      return { height, overflowY };
+    };
+    // Nothing between the document and the tab content is height-limited or scrolls on its own.
+    for (const selector of ["html", "body", "#app", ".shell", ".panels", ".tabpanel", ".conversation-card", ".conversation-feed", ".history-panel", ".history-detail", ".session-list"]) {
+      expect(effective(selector), selector).toEqual({ height: selector === "html" ? "100%" : "auto", overflowY: "visible" });
+    }
+    expect(styles).toMatch(/html, body, #app \{ margin: 0; min-height: 100%; \}/u);
+    // The tab bar sticks under the floating resume banner; the composer sticks to the bottom of the page.
+    expect(styles).toMatch(/\.tabbar-wrap \{ position: sticky; top: var\(--banner-h, 0px\);/u);
+    expect(styles).toMatch(/\.composer \{ position: sticky; bottom: 0;/u);
+    // The scroll code drives the document, not an inner element.
+    expect(uiSource).toContain("doc?.scrollingElement");
+    expect(uiSource).not.toMatch(/scroller\(\)[^\n]*querySelector<HTMLElement>\("\.shell"\)/u);
+  });
+
+  it("v0.13: follows new messages only when the end of the feed is in view, and aligns a new tab under the stuck tab bar", () => {
+    // End of feed visible above the composer: no scroll needed. Pushed below it: scroll by the overflow.
+    expect(feedFollowDelta({ endBottom: 500, viewportHeight: 844, composerHeight: 120 })).toBeLessThanOrEqual(0);
+    expect(feedFollowDelta({ endBottom: 760, viewportHeight: 844, composerHeight: 120 })).toBe(44);
+    // The reader scrolled up (end far below the fold) or nothing is laid out: do not follow.
+    expect(feedFollowDelta({ endBottom: 2400, viewportHeight: 844, composerHeight: 120 })).toBeGreaterThan(FEED_FOLLOW_SLACK_PX);
+    expect(feedFollowDelta({ endBottom: undefined, viewportHeight: 844, composerHeight: 120 })).toBe(Number.POSITIVE_INFINITY);
+    // Tab bar not stuck (panels start right under it): the header stays where it is.
+    expect(panelScrollTop({ scrollTop: 120, panelsTop: 362, pinnedBottom: 362 })).toBeUndefined();
+    // Scrolled 900px into a long panel: the next panel starts at its top, right under the stuck bar.
+    expect(panelScrollTop({ scrollTop: 1200, panelsTop: -838, pinnedBottom: 62 })).toBe(300);
   });
 
   it("lists current and legacy answer models, a custom id option, the copilot model and the transcription catalog", () => {

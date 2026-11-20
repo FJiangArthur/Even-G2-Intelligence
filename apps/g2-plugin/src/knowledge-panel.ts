@@ -9,7 +9,7 @@ import {
 } from "@helix/conversation-sdk";
 import type { G2ConversationController, HistoryState } from "./controller";
 import {
-  SOURCE_ICON, SOURCE_LABEL, cleanLineText, copyToClipboard, sessionKnowledge, sessionSource, sessionTitle,
+  SOURCE_ICON, SOURCE_LABEL, cleanLineText, confirmBar, copyToClipboard, sessionKnowledge, sessionSource, sessionTitle,
 } from "./history-panel";
 import { icon, type IconName } from "./pixel-art";
 import { PDF_LIMITS, type PdfFileStatus, type PdfInput, type PdfParser } from "@helix/conversation-sdk";
@@ -276,7 +276,7 @@ export class KnowledgePanel {
     this.local.type = this.web.type = "checkbox";
     this.local.id = "use-local-memory"; this.web.id = "live-web-fact-check";
     const localLabel = el("label", "toggle"); localLabel.htmlFor = this.local.id;
-    localLabel.append(this.local, this.toggleText("Use saved knowledge in answers", "Answers may cite earlier sessions from all three sources"));
+    localLabel.append(this.local, this.toggleText("Use saved knowledge in answers", "Answers may cite earlier sessions from all three sources and the PDFs you added. Off: nothing saved is read or synced"));
     const webLabel = el("label", "toggle"); webLabel.htmlFor = this.web.id;
     webLabel.append(this.web, this.toggleText("Live web fact check", "Short claims are checked as you talk"));
     const disclosure = el("p", "field-note", "When enabled, short speech claims are sent to the web search of your answer provider (OpenAI by default; see Setup → Copilot). Search incurs provider charges. Checks may take time and do not verify every utterance. Imported summaries and AI answers are never used as memory evidence.");
@@ -439,7 +439,7 @@ export class KnowledgePanel {
     const to = el("span", "source-badge badge-helix"); to.append(iconSpan(SOURCE_ICON.helix, "badge-icon"), SOURCE_LABEL.helix);
     head.append(from, arrow, to); head.setAttribute("aria-label", "PDF documents to Helix");
     const megabytes = Math.round(PDF_LIMITS.maxBytes / 1024 / 1024);
-    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. The parsed text is stored with your history, which holds 5 MiB in total, so several large PDFs may not all fit; one that does not fit is reported as failed and nothing of it is kept. They are listed under Obsidian with the tag “pdf”.`);
+    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. The parsed text is stored with your history, which holds 5 MiB in total, so several large PDFs may not all fit; one that does not fit is reported as failed and nothing of it is kept. They are stored under Obsidian with the tag “pdf” and listed in History under Documents, where you can open or remove them. “Use saved knowledge in answers” must be on for answers to read them.`);
     const box = el("fieldset", "toggle-group pdf-parser"); box.append(el("legend", "", "Read the PDFs"));
     const local = el("input"), openai = el("input");
     const option = (input: HTMLInputElement, value: PdfParser, title: string, note: string) => {
@@ -464,7 +464,7 @@ export class KnowledgePanel {
         extractLocal: async (data, extract) => (await import("./pdf-local")).extractPdfText(data, extract) })
         .then(files => {
           const added = files.filter(file => file.state === "done").length, failed = files.length - added;
-          this.say(this.pdfStatus, `Added ${added} of ${files.length} PDF${files.length === 1 ? "" : "s"}.${failed ? ` ${failed} not added (see below).` : ""}${added ? " Ask about them, or find them in History." : ""}`);
+          this.say(this.pdfStatus, `Added ${added} of ${files.length} PDF${files.length === 1 ? "" : "s"}.${failed ? ` ${failed} not added (see below).` : ""}${added ? " Ask about them, or find them in History under Documents." : ""}`);
         })
         .catch(error => this.say(this.pdfStatus, error instanceof Error ? error.message : String(error)))
         .finally(done);
@@ -575,15 +575,18 @@ export class KnowledgePanel {
     const run = (work: Promise<unknown>) => { void work.catch(() => undefined); }; // the controller puts the outcome in the status line
     this.kbSync.addEventListener("click", () => run(this.controller.syncOpenAIKnowledge(key())));
     this.kbStop.addEventListener("click", () => this.controller.cancelKnowledgeSync());
+    // v0.13: confirmed in the page, like removing a session (a native confirm dialog can block the Even WebView).
+    const confirmSlot = el("div", "history-confirm-slot"); confirmSlot.id = "knowledge-delete-confirm";
     this.kbDelete.addEventListener("click", () => {
-      if (window.confirm("Delete the Helix knowledge base from your OpenAI project? The sessions stay on this phone. This cannot be undone.")) run(this.controller.deleteOpenAIKnowledge(key()));
+      confirmSlot.replaceChildren(confirmBar("Delete the Helix knowledge base from your OpenAI project? The sessions stay on this phone. This cannot be undone.",
+        "Delete from OpenAI", () => { confirmSlot.replaceChildren(); run(this.controller.deleteOpenAIKnowledge(key())); }, () => { confirmSlot.replaceChildren(); this.kbDelete.focus({ preventScroll: true }); }));
     });
     const actions = el("div", "provider-key-actions"); actions.append(this.kbSync, this.kbStop, this.kbDelete);
     box.append(
       option(this.kbLocal, "local", "On this phone", "Keyword search over saved sessions. Nothing leaves the phone for the lookup."),
       option(this.kbOpenai, "openai", "OpenAI knowledge base", "Semantic search in a vector store in your own OpenAI project. Adds one request per answer; falls back to the phone if it is slow."),
-      actions, this.kbStatus,
-      el("p", "field-note", "Sync uploads your saved sessions (transcripts, answers, summaries) as files to your OpenAI project with the key from Setup. OpenAI stores them until you delete them; the first 1 GB of vector storage is free, then about $0.10 per GB per day. Both options need “Use saved knowledge in answers” on."),
+      actions, confirmSlot, this.kbStatus,
+      el("p", "field-note", "Sync uploads your saved sessions (transcripts, answers, summaries) as files to your OpenAI project with the key from Setup. OpenAI stores them until you delete them; the first 1 GB of vector storage is free, then about $0.10 per GB per day. Both options need “Use saved knowledge in answers” on (the same switch as History → “Let the knowledge base read history”)."),
     );
     return box;
   }
@@ -595,7 +598,7 @@ export class KnowledgePanel {
     const when = kb.syncedAt ? new Date(kb.syncedAt).toLocaleString() : "";
     this.kbStatus.textContent = kb.syncing ? `Syncing ${kb.syncing.done} of ${kb.syncing.total}…${kb.syncing.failed ? ` ${kb.syncing.failed} failed` : ""}`
       : kb.notice ? kb.notice
-      : kb.hasStore ? `${kb.synced} session${kb.synced === 1 ? "" : "s"} in OpenAI${kb.pending ? ` · ${kb.pending} new or changed, not synced yet` : " · up to date"}${when ? ` · last sync ${when}` : ""}`
+      : kb.hasStore ? `${kb.synced} session${kb.synced === 1 ? "" : "s"} in OpenAI${kb.pending ? ` · ${kb.pending} new or changed, not synced yet` : kb.removals ? "" : " · up to date"}${kb.removals ? ` · ${kb.removals} removed on this phone, still in OpenAI until you sync` : ""}${when ? ` · last sync ${when}` : ""}`
       : kb.source === "openai" ? "Nothing is in OpenAI yet: answers use the phone until you sync." : "";
   }
 
@@ -640,7 +643,8 @@ export class KnowledgePanel {
       card.setAttribute("aria-label", `${SOURCE_LABEL[item.source]} context: ${item.sessions} sessions, ${item.entries} lines. ${SOURCE_COPY[item.source]}.`);
       return card;
     }));
-    this.mapNode.innerHTML = knowledgeMapSvg({ stats: this.controller.knowledgeStats(), sessions, people });
+    // v0.13: the map shows the titles History shows (never a placeholder or the first utterance).
+    this.mapNode.innerHTML = knowledgeMapSvg({ stats: this.controller.knowledgeStats(), sessions: sessions.map(session => ({ ...session, title: this.controller.historyTitle(session) })), people });
     this.mapNode.prepend(...[pixelLegend()]);
   }
 }

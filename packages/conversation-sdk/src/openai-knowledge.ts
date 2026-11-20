@@ -142,6 +142,20 @@ export async function deleteOpenAIKnowledge(fetcher: DirectFetch, key: string, s
   }
 }
 
+/**
+ * v0.13: removes one document's uploaded file now (a session deleted in History) and returns the state
+ * without it. A file OpenAI no longer has counts as removed. Throws when OpenAI could not confirm the
+ * removal, so the caller keeps the document in its state and the next sync removes it as stale.
+ */
+export async function removeOpenAIKnowledgeDocument(fetcher: DirectFetch, key: string, state: OpenAIKnowledgeState, documentId: string, signal?: AbortSignal): Promise<OpenAIKnowledgeState> {
+  const item = state.files[documentId];
+  if (!item) return state;
+  const response = await fetcher(`${OPENAI_BASE}/files/${encodeURIComponent(item.fileId)}`, { method: "DELETE", headers: headers(requireKey(key), false), redirect: "error", credentials: "omit", cache: "no-store", ...(signal ? { signal } : {}) });
+  if (!response.ok && response.status !== 404) throw new DirectProviderError("provider-response", `OpenAI knowledge: could not remove the session (HTTP ${response.status}).`, response.status >= 500);
+  const { [documentId]: _removed, ...files } = state.files;
+  return { ...state, files };
+}
+
 /** Semantic + keyword search over the store. Throws on provider errors and aborts. */
 export async function searchOpenAIKnowledge(fetcher: DirectFetch, key: string, vectorStoreId: string, query: string,
   options: { limit?: number; signal?: AbortSignal } = {}): Promise<KnowledgeHit[]> {
