@@ -37,6 +37,7 @@ import {
 import { markdownSession, omiExportSummary, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile } from "./knowledge-panel"; // phone agent
 import { joinConcept } from "./history-panel";
 import { firstAccessibleModel } from "@helix/conversation-sdk";
+import { DEFAULT_COPILOT_MODEL, answerProviderInfo, directEndpoint, providerModel, testProviderKey, type ProviderKeyTestResult } from "@helix/conversation-sdk";
 import { RehearsalPlayer, rehearsalScript, type RehearsalResult } from "./rehearsal";
 import {
   pcmS16LeBytesToSamples,
@@ -439,7 +440,8 @@ export class G2ConversationController {
         this.memoryByQuestion.set(questionId ?? "", items);
         this.presentation.setMemorySources(items, questionId);
       },
-      factCheck: { enabled: () => this.webCheckEnabled, onResult: result => this.handleFactCheck(result) },
+      factCheck: { enabled: () => this.webCheckEnabled, onResult: result => this.handleFactCheck(result), news: () => this.config.newsSearch !== false },
+      answerLength: () => this.config.answerLength,
       insights: { enabled: () => this.autoExplainEnabled, onResult: result => this.handleInsight(result) },
       // v0.10: modes switch live (phone chips or the glasses menu) without reconnecting.
       mode: () => this.config.conversationMode,
@@ -450,7 +452,21 @@ export class G2ConversationController {
     this.transport = transport;
     // Respect the selection when the project can call it; otherwise switch visibly
     // (never silently) to the best accessible model and save that choice.
-    const accessible = providerCredentials?.openai ? await this.accessibleModels(providerCredentials.openai, transport, 1500) : undefined;
+    // The OpenAI model-list check only applies when OpenAI answers; a direct provider (DeepSeek, Qwen, GLM, Kimi)
+    // must never be "switched" to an OpenAI model. A model id from another provider's catalog is replaced visibly.
+    const directProvider = answerProviderInfo(config.answerProvider);
+    const direct = directProvider !== undefined && directProvider.api !== "openai";
+    if (direct) {
+      const model = providerModel(directProvider, config.model, "answer"), copilotModel = providerModel(directProvider, config.copilotModel, "copilot");
+      if (model !== config.model || copilotModel !== config.copilotModel) {
+        const changes = [model !== config.model ? `answers ${config.model} → ${model}` : "", copilotModel !== config.copilotModel ? `copilot ${config.copilotModel} → ${copilotModel}` : ""].filter(Boolean).join(", ");
+        this.presentation.notice(`model-provider-${session.id}`, "Model switched", `${directProvider.label} can't run the selected model. Using ${changes}. Change it in Setup.`);
+        config = { ...config, model, copilotModel };
+        this.config = config;
+        void this.saveSettings({ ...form, model, copilotModel }).catch(() => undefined);
+      }
+    }
+    const accessible = !direct && providerCredentials?.openai ? await this.accessibleModels(providerCredentials.openai, transport, 1500) : undefined;
     if (accessible) {
       const has = new Set(accessible);
       const model = has.has(config.model) ? config.model : firstAccessibleModel("answer", accessible) ?? config.model;
@@ -491,13 +507,9 @@ export class G2ConversationController {
     try {
       await client.start({
         sessionId: session.id,
-        endpoint: {
-          id: "openai-direct",
-          url: "https://api.openai.com/v1/responses",
-          provider: "openai",
-          // Never substitute a different model: the selected id is sent as-is.
-          model: config.model,
-        },
+        // Provenance of the selected provider (OpenAI: id "openai-direct", .../v1/responses, provider "openai").
+        // Never substitute a different model: the selected id is sent as-is.
+        endpoint: directEndpoint(config.answerProvider, config.model),
         prompt: {
           id: config.promptId,
           version: config.promptVersion,
@@ -808,7 +820,9 @@ export class G2ConversationController {
     if (!record) throw new Error("This session is no longer on this phone.");
     const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
     const lines = record.entries.filter(entry => entry.kind === "transcript" && entry.text.trim()).map(entry => ({ speaker: entry.speaker?.trim() || "Speaker", text: entry.text }));
-    const digest = await summarizeSession(fetcher, key, this.config.copilotModel, { title: record.session.title, lines }, { onUsage: usage => this.presentation.applyUsage(usage) });
+    // The session digest is an OpenAI Responses call with the OpenAI key; a direct provider's copilot model cannot run it.
+    const digestModel = answerProviderInfo(this.config.answerProvider)?.api === "chat" ? DEFAULT_COPILOT_MODEL : this.config.copilotModel;
+    const digest = await summarizeSession(fetcher, key, digestModel, { title: record.session.title, lines }, { onUsage: usage => this.presentation.applyUsage(usage) });
     await this.history.updateSessionKnowledge(sessionId, { summary: digest.summary, keyFacts: digest.keyFacts,
       ...(digest.concepts.length ? { concepts: digest.concepts.map(concept => joinConcept(concept.term, concept.explanation)) } : {}) });
     this.emitHistory();
@@ -831,6 +845,13 @@ export class G2ConversationController {
     if (this.client || !this.resumeHandler) return;
     this.presentation.setInteraction("CONNECTING");
     await this.resumeHandler({ connected: true, listening: true, at: Date.now() });
+  }
+  /** Setup → Test provider key: one tiny completion against the selected direct provider (DeepSeek, Qwen, GLM, Kimi). */
+  public async testProviderKey(providerId: string, key: string, model: string): Promise<ProviderKeyTestResult> {
+    const provider = answerProviderInfo(providerId);
+    if (!provider || provider.api === "openai") return { status: "error", message: "Select DeepSeek, Qwen, Zhipu GLM or Moonshot Kimi as the answer provider first.", model };
+    const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
+    return testProviderKey(fetcher, provider, key, providerModel(provider, model, "answer"));
   }
   /** Test seam for testKey; production uses the global fetch. */
   public keyTestFetch?: (url: string, init?: RequestInit) => Promise<Response>;

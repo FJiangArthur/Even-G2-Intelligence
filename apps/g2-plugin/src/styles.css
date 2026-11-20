@@ -1019,3 +1019,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .status-listening::before { animation-iteration-count: 4; }
 .mic-state[data-state="streaming"] .eq i { animation-iteration-count: 12; }
 .seg-live::after { animation-iteration-count: 8; }
+
+/* News search: publication date on a source chip. */
+.source-date { opacity: 0.75; white-space: nowrap; }

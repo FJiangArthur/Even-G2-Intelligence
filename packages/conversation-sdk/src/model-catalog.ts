@@ -1,4 +1,5 @@
 import type { AnswerModelInfo, ReasoningEffort, TranscriptionModelInfo, UsageKind, UsageRecord } from "./copilot-types.js";
+import { PROVIDER_ANSWER_MODELS } from "./provider-registry.js";
 
 /**
  * Prices: USD per 1M tokens, OpenAI pricing page (developers.openai.com/api/docs/pricing),
@@ -63,7 +64,9 @@ export const TRANSCRIPTION_CATALOG: readonly TranscriptionModelInfo[] = Object.f
 /** $10 per 1k web_search calls; search content tokens bill at model rates (already in usage). */
 export const WEB_SEARCH_USD_PER_CALL = 0.01;
 
-const BY_ID = new Map(ANSWER_MODELS.map(model => [model.id, model]));
+// OpenAI ids win; DeepSeek / Qwen / GLM / Kimi ids (provider-registry.ts) resolve for context windows and cost.
+const BY_ID = new Map([...PROVIDER_ANSWER_MODELS, ...ANSWER_MODELS].map(model => [model.id, model]));
+const PROVIDER_MODEL_IDS = new Set(PROVIDER_ANSWER_MODELS.map(model => model.id));
 
 /** Exact id first, then dated snapshot prefix (e.g. gpt-4.1-mini-2025-04-14). */
 export function answerModelInfo(id: string): AnswerModelInfo | undefined {
@@ -104,7 +107,8 @@ export function estimateCostUsd(model: string, usage: RawUsage): number | undefi
   // Reasoning tokens are already included in output_tokens by the provider.
   const output = usage.outputTokens ?? 0;
   const tokens = ((input - cached) * info.price.input + cached * info.price.cachedInput + output * info.price.output) / 1_000_000;
-  return round(tokens + (usage.webSearchCalls ?? 0) * WEB_SEARCH_USD_PER_CALL);
+  // The per-call search fee is OpenAI's; DeepSeek does not bill searches separately.
+  return round(tokens + (PROVIDER_MODEL_IDS.has(info.id) ? 0 : (usage.webSearchCalls ?? 0) * WEB_SEARCH_USD_PER_CALL));
 }
 
 export function usageRecord(kind: UsageKind, model: string, usage: RawUsage, measured: boolean, relatedId?: string): UsageRecord {

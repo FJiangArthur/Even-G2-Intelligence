@@ -5,6 +5,7 @@
  * protocol GatewayEvent union, so legacy protocol validation stays unchanged.
  */
 import type { Speaker } from "./types.js";
+import type { AnswerLength } from "./answer-length.js";
 
 export type ReasoningEffort = "none" | "low" | "medium" | "high";
 
@@ -70,7 +71,15 @@ export interface AnswerTiming {
   readonly endToEndMs: number;
 }
 
-export interface Citation { readonly url: string; readonly title: string }
+export interface Citation {
+  readonly url: string; readonly title: string;
+  /** Publication date "YYYY-MM-DD" when known. */
+  readonly publishedAt?: string;
+  /** search = date from the provider's search results; model = date the model reported for a page it cited. */
+  readonly dateSource?: "search" | "model";
+  /** Site / publisher name when the search engine returned one. */
+  readonly site?: string;
+}
 
 export interface AnswerMeta {
   readonly answerId: string;
@@ -141,6 +150,10 @@ export interface VerificationResult {
   readonly sources: readonly Citation[];
   readonly checkedAt: string;
   readonly requestedBy: "user" | "auto";
+  /** "news" when the check was biased to recent reporting (time-sensitive claim). */
+  readonly recency?: "news" | "general";
+  /** Provider whose search produced the sources, e.g. "OpenAI", "DeepSeek". */
+  readonly via?: string;
 }
 
 /**
@@ -191,6 +204,10 @@ export interface CopilotSettings {
   readonly people?: boolean;
   /** v0.10 conversation mode (modeProfile id): steers suggestions, summary focus and tone. */
   readonly mode?: string;
+  /** Answer length for lookups, proposals, verdicts and concept explanations (absent = standard). */
+  readonly answerLength?: AnswerLength;
+  /** Bias web checks to recent news and ask for dated sources (absent = off, the pre-setting behaviour). */
+  readonly newsSearch?: boolean;
 }
 
 export const DEFAULT_COPILOT_SETTINGS: CopilotSettings = Object.freeze({

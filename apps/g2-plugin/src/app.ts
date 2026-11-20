@@ -140,6 +140,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
     onClearProviderKeys: () => clearPersistedProviderCredentials(bridge),
     onSettingsChange: form => controller.saveSettings(form),
     onTestKey: (key, model) => controller.testKey(key, model),
+    onTestProviderKey: (provider, key, model) => controller.testProviderKey(provider, key, model),
     onVerify: (target, id) => controller.verify(target, id),
     onVerifyClaim: id => controller.verifyClaim(id), // phone agent: Checks → Claims → Verify
     onRunCopilot: () => controller.runCopilot(),

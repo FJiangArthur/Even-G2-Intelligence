@@ -1,8 +1,16 @@
 import { clearDiagnostics, diagnosticsReport, previousPageExit } from "./diagnostics";
 import {
   ANSWER_MODELS,
+  ANSWER_LENGTHS,
+  ANSWER_PROVIDER_CATALOG,
+  PROVIDER_ANSWER_MODELS,
   DEFAULT_ANSWER_MODEL,
   DEFAULT_COPILOT_MODEL,
+  answerLengthProfile,
+  answerProviderInfo,
+  providerLimitations,
+  providerModel,
+  searchAvailability,
   MODE_PROFILES,
   PICKER_MODES,
   TRANSCRIPTION_CATALOG,
@@ -10,6 +18,7 @@ import {
   formatMs,
   formatUsd,
   type AnswerMeta,
+  type AnswerModelInfo,
   type Citation,
   type CopilotClaim,
   type HudMirror,
@@ -112,6 +121,8 @@ export interface CompanionUiActions {
   readonly onRunCopilot?: () => void | Promise<void>;
   /** Setup → Test key. Resolves to a short human-readable verdict. */
   readonly onTestKey?: (key: string, model: string) => Promise<{ readonly status: string; readonly message: string }>;
+  /** Setup → Test provider key (DeepSeek, Qwen, Zhipu GLM, Moonshot Kimi): provider profile id, its key, the selected model. */
+  readonly onTestProviderKey?: (provider: string, key: string, model: string) => Promise<{ readonly status: string; readonly message: string }>;
   /** Called when the wearer opens a tab that has unseen items; wire to presentation.markSeen. */
   readonly onTabSeen?: (tab: CompanionTab) => void;
   /** The wearer tapped a phone tab; the integrator moves the glasses HUD to the matching view. */
@@ -287,6 +298,7 @@ export class CompanionUi {
         void Promise.resolve(actions.onModeChange(mode)).catch(() => undefined);
         return; // the controller saves the mode with its presets
       }
+      if (target?.id === "answer-provider") this.syncProviderModels();
       if (target?.id === "answer-model") this.syncCustomModel(true);
       this.updateProfileSummary();
       this.updateModelNotes();
@@ -316,6 +328,22 @@ export class CompanionUi {
       } finally { button.disabled = false; }
     };
     this.button("test-openai-key").addEventListener("click", () => { void testKey(); });
+    const testProviderKey = async () => {
+      const provider = answerProviderInfo(this.select("answer-provider").value), status = this.element("provider-key-test-status");
+      if (!provider || provider.api === "openai") { status.dataset.state = "error"; status.textContent = "Pick DeepSeek, Qwen, Zhipu GLM or Moonshot Kimi under Models → Answer provider, then test its key here."; return; }
+      const key = this.input(`${provider.credential}-api-key`).value.trim();
+      if (!key) { status.dataset.state = "error"; status.textContent = `Enter a ${provider.label} API key first.`; return; }
+      if (!actions.onTestProviderKey) return;
+      const button = this.button("test-provider-key");
+      button.disabled = true; status.dataset.state = "testing"; status.textContent = `Testing ${provider.label} key…`;
+      try {
+        const result = await actions.onTestProviderKey(provider.id, key, this.readSettings().model);
+        status.dataset.state = result.status === "ok" ? "ok" : "error"; status.textContent = result.message;
+      } catch (error) {
+        status.dataset.state = "error"; status.textContent = error instanceof Error ? error.message : String(error);
+      } finally { button.disabled = false; }
+    };
+    this.button("test-provider-key").addEventListener("click", () => { void testProviderKey(); });
     const showDiagnostics = () => { const log = this.element("diagnostics-log"); log.hidden = false; log.textContent = diagnosticsReport(); };
     // v0.9.1: say at a glance whether the phone killed the previous page (iOS memory pressure).
     const lastExit = previousPageExit(), exitNote = this.root.querySelector<HTMLElement>("#diagnostics-last-exit");
@@ -598,7 +626,7 @@ export class CompanionUi {
   }
 
   public clearProviderKeys(preserveImportKey = false): void {
-    for (const id of ["openai-api-key", "deepgram-api-key", "soniox-api-key", "omi-api-key"]) {
+    for (const id of ["openai-api-key", "deepgram-api-key", "soniox-api-key", "omi-api-key", "deepseek-api-key", "dashscope-api-key", "zhipu-api-key", "moonshot-api-key"]) {
       if (preserveImportKey && id === "omi-api-key") continue;
       this.input(id).value = "";
     }
@@ -620,6 +648,12 @@ export class CompanionUi {
       sonioxApiKey: this.input("soniox-api-key").value,
       omiApiKey: this.input("omi-api-key").value,
       saveApiKeysOnPhone: this.input("save-api-keys").checked,
+      deepseekApiKey: this.input("deepseek-api-key").value,
+      dashscopeApiKey: this.input("dashscope-api-key").value,
+      zhipuApiKey: this.input("zhipu-api-key").value,
+      moonshotApiKey: this.input("moonshot-api-key").value,
+      answerLength: this.select("answer-length").value as NonNullable<SessionFormState["answerLength"]>,
+      newsSearch: this.input("news-search").checked,
       ...this.sessionIdentity,
       model: this.selectedAnswerModel(),
       instructions: this.textarea("instructions").value.trim(),
@@ -637,7 +671,7 @@ export class CompanionUi {
       useLocalMemory: this.root.querySelector<HTMLInputElement>("#use-local-memory")?.checked ?? this.memoryDefaults.useLocalMemory,
       liveWebFactCheck: this.root.querySelector<HTMLInputElement>("#live-web-fact-check")?.checked ?? this.memoryDefaults.liveWebFactCheck,
       autoExplainTerms: this.input("auto-explain-terms").checked,
-      copilotModel: this.select("copilot-model").value || DEFAULT_COPILOT_MODEL,
+      copilotModel: this.select("copilot-model").value || modelForProvider(this.select("answer-provider").value, undefined, "copilot"),
       copilotSummarize: this.input("copilot-summarize").checked,
       copilotConcepts: this.input("copilot-concepts").checked,
       copilotConflicts: this.input("copilot-conflicts").checked,
@@ -651,7 +685,7 @@ export class CompanionUi {
 
   /** The settings-persistence payload: identical to readForm but never carries keys. */
   public readSettings(): SessionFormState {
-    return { ...this.readForm(), openaiApiKey: "", deepgramApiKey: "", sonioxApiKey: "", omiApiKey: "", accessToken: "" };
+    return { ...this.readForm(), openaiApiKey: "", deepgramApiKey: "", sonioxApiKey: "", omiApiKey: "", deepseekApiKey: "", dashscopeApiKey: "", zhipuApiKey: "", moonshotApiKey: "", accessToken: "" };
   }
 
   private scheduleSettingsSave(): void {
@@ -680,6 +714,8 @@ export class CompanionUi {
 
   /** Marks catalog models the key's project cannot call, and reflects a fallback selection. */
   public setModelAccess(accessible: readonly string[], selected?: { readonly model: string; readonly copilotModel: string }): void {
+    // The OpenAI model list says nothing about another provider's models.
+    if ((this.select("answer-model").dataset.family ?? "openai") !== "openai") return;
     const ids = new Set(accessible);
     for (const id of ["answer-model", "copilot-model"]) {
       for (const option of this.select(id).options) {
@@ -722,16 +758,12 @@ export class CompanionUi {
 
   private writeConfig(config: PluginConfig): void {
     this.input("auto-explain-terms").checked = config.autoExplainTerms;
-    const known = ANSWER_MODELS.some(model => model.id === config.model);
-    this.select("answer-model").value = known ? config.model : CUSTOM_MODEL;
-    this.input("answer-model-custom").value = known ? "" : config.model;
-    this.syncCustomModel(false);
-    const copilot = this.select("copilot-model");
-    if (![...copilot.options].some(option => option.value === config.copilotModel)) {
-      const option = document.createElement("option"); option.value = config.copilotModel; option.textContent = `${config.copilotModel} (saved)`;
-      copilot.append(option);
-    }
-    copilot.value = config.copilotModel;
+    // Provider first: it decides which models the two pickers offer.
+    this.select("answer-provider").value = config.answerProvider;
+    if (this.select("answer-provider").value !== config.answerProvider) this.select("answer-provider").value = "openai-responses";
+    this.syncProviderModels(config.model, config.copilotModel);
+    this.select("answer-length").value = answerLengthProfile(config.answerLength).id;
+    this.input("news-search").checked = config.newsSearch !== false;
     this.textarea("instructions").value = config.instructions;
     this.input("locale").value = config.locale;
     this.input("sentence-limit").value = String(config.maxResponseSentences);
@@ -740,7 +772,6 @@ export class CompanionUi {
     this.select("response-strategy").value = config.responseStrategy;
     this.select("transcription-provider").value = config.transcriptionProvider;
     if (this.select("transcription-provider").value !== config.transcriptionProvider) this.select("transcription-provider").value = DEFAULT_TRANSCRIPTION_PROVIDER;
-    this.select("answer-provider").value = config.answerProvider;
     this.input("auto-question").checked = config.autoQuestion;
     this.input("auto-answer").checked = config.autoAnswer;
     this.input("auto-notes").checked = config.autoNotes;
@@ -755,9 +786,36 @@ export class CompanionUi {
   }
 
   private selectedAnswerModel(): string {
-    const value = this.select("answer-model").value;
-    if (value !== CUSTOM_MODEL) return value || DEFAULT_ANSWER_MODEL;
-    return this.input("answer-model-custom").value.trim() || DEFAULT_ANSWER_MODEL;
+    const value = this.select("answer-model").value, fallback = modelForProvider(this.select("answer-provider").value, undefined, "answer");
+    if (value !== CUSTOM_MODEL) return value || fallback;
+    return this.input("answer-model-custom").value.trim() || fallback;
+  }
+
+  /**
+   * Shows the selected answer provider's models in the answer and copilot pickers. A selection that
+   * belongs to another provider is replaced by this provider's default; custom ids are kept.
+   */
+  private syncProviderModels(model?: string, copilotModel?: string): void {
+    const providerId = this.select("answer-provider").value, provider = answerProviderInfo(providerId);
+    const family = !provider || provider.api === "openai" ? "openai" : provider.id;
+    const answer = this.select("answer-model"), copilot = this.select("copilot-model");
+    const wantedModel = model ?? this.selectedAnswerModel(), wantedCopilot = copilotModel ?? copilot.value;
+    if ((answer.dataset.family ?? "openai") !== family) {
+      answer.innerHTML = providerModelOptionsMarkup(providerId, "answer");
+      copilot.innerHTML = providerModelOptionsMarkup(providerId, "copilot");
+    }
+    answer.dataset.family = copilot.dataset.family = family;
+    const selected = modelForProvider(providerId, wantedModel, "answer");
+    const known = providerModels(providerId).some(item => item.id === selected);
+    answer.value = known ? selected : CUSTOM_MODEL;
+    this.input("answer-model-custom").value = known ? "" : selected;
+    this.syncCustomModel(false);
+    const selectedCopilot = modelForProvider(providerId, wantedCopilot, "copilot");
+    if (![...copilot.options].some(option => option.value === selectedCopilot)) {
+      const option = document.createElement("option"); option.value = selectedCopilot; option.textContent = `${selectedCopilot} (saved)`;
+      copilot.append(option);
+    }
+    copilot.value = selectedCopilot;
   }
 
   private syncCustomModel(focus: boolean): void {
@@ -772,8 +830,13 @@ export class CompanionUi {
     this.input("deepgram-api-key").value = state.credentials.deepgram ?? "";
     this.input("soniox-api-key").value = state.credentials.soniox ?? "";
     this.input("omi-api-key").value = state.credentials.omi ?? "";
+    this.input("deepseek-api-key").value = state.credentials.deepseek ?? "";
+    this.input("dashscope-api-key").value = state.credentials.dashscope ?? "";
+    this.input("zhipu-api-key").value = state.credentials.zhipu ?? "";
+    this.input("moonshot-api-key").value = state.credentials.moonshot ?? "";
     this.input("save-api-keys").checked = state.saveApiKeysOnPhone;
     if (state.warning !== undefined) this.setProviderKeyNotice(state.warning, true);
+    this.updateModelNotes(); // search availability depends on which keys are present
   }
 
   private updateProfileSummary(): void {
@@ -787,14 +850,25 @@ export class CompanionUi {
   }
 
   private updateModelNotes(): void {
-    const model = ANSWER_MODELS.find(item => item.id === this.selectedAnswerModel());
+    const providerId = this.select("answer-provider").value, direct = answerProviderInfo(providerId)?.api === "chat";
+    const model = providerModels(providerId).find(item => item.id === this.selectedAnswerModel());
     this.element("answer-model-note").textContent = model
-      ? `${model.price ? `$${model.price.input} in · $${model.price.output} out per 1M tokens` : "No published price: cost shows as n/a"}${model.reasoning ? " · reasoning model" : ""}${model.responsesOnly ? " · Responses API" : ""}`
+      ? `${model.price ? `$${model.price.input} in · $${model.price.output} out per 1M tokens${direct ? " (peak list price)" : ""}` : direct ? "price n/a: no USD list price verified, cost shows as n/a" : "No published price: cost shows as n/a"}${model.reasoning ? " · reasoning model" : ""}${model.responsesOnly ? " · Responses API" : ""}`
       : "Custom id: sent as-is. Cost shows as n/a unless the id matches a known model.";
+    // Which keys are entered decides where fact checks can search; say it plainly, including "nowhere".
+    const has = { openai: this.hasKey("openai-api-key"), deepseek: this.hasKey("deepseek-api-key"), dashscope: this.hasKey("dashscope-api-key"), zhipu: this.hasKey("zhipu-api-key"), moonshot: this.hasKey("moonshot-api-key") };
+    const search = searchAvailability(providerId, has);
+    const searchNote = this.element("search-provider-note");
+    searchNote.textContent = search.message; searchNote.classList.toggle("is-warning", !search.available);
+    const limits = providerLimitations(providerId, has), providerNote = this.element("answer-provider-note");
+    providerNote.textContent = limits.join(" "); providerNote.hidden = limits.length === 0;
+    this.element("answer-length-note").textContent = answerLengthProfile(this.select("answer-length").value).blurb;
     const stt = transcriptionCatalog().find(item => item.profileId === this.select("transcription-provider").value);
     this.element("transcription-note").textContent = stt ? transcriptionNote(stt) : "";
     this.element("transcription-note").classList.toggle("is-warning", Boolean(stt?.deprecated));
   }
+
+  private hasKey(id: string): boolean { return this.input(id).value.trim().length > 0; }
 
   private openKeys(): void {
     this.selectTab("setup");
@@ -1274,8 +1348,8 @@ export class CompanionUi {
       nodes.push(list);
     }
     const checks = [
-      ...snapshot.verifications.filter(item => !claims.some(claim => claim.id === item.id)).map(item => ({ id: item.id, title: item.target, status: item.status, summary: item.summary, sources: item.sources, at: item.checkedAt, by: item.requestedBy === "user" ? "You asked" : "Auto" })),
-      ...snapshot.factChecks.map(item => ({ id: item.id, title: item.claim, status: item.status, summary: item.summary, sources: item.sources, at: item.checkedAt, by: "Live web check" })),
+      ...snapshot.verifications.filter(item => !claims.some(claim => claim.id === item.id)).map(item => ({ id: item.id, title: item.target, status: item.status, summary: item.summary, sources: item.sources, at: item.checkedAt, by: item.requestedBy === "user" ? "You asked" : "Auto", recency: item.recency, via: item.via })),
+      ...snapshot.factChecks.map(item => ({ id: item.id, title: item.claim, status: item.status, summary: item.summary, sources: item.sources, at: item.checkedAt, by: "Live web check", recency: item.recency, via: item.via })),
     ].sort((a, b) => b.at.localeCompare(a.at));
     if (checks.length) {
       nodes.push(el("h3", "section-label", "Verification"));
@@ -1288,7 +1362,7 @@ export class CompanionUi {
         card.append(head, el("p", "card-body", check.summary || "No summary returned."));
         const sources = sourceList(check.sources);
         if (sources) card.append(sources);
-        card.append(el("p", "panel-meta", `${check.by} · ${formatClock(check.at)}`));
+        card.append(el("p", "panel-meta", `${check.by}${check.recency === "news" ? " · latest news" : ""}${check.via ? ` · via ${check.via}` : ""} · ${formatClock(check.at)}`));
         list.append(card);
       }
       nodes.push(list);
@@ -1372,6 +1446,33 @@ export function answerModelOptionsMarkup(): string {
   const group = (tier: "current" | "legacy", label: string) => `<optgroup label="${label}">${ANSWER_MODELS.filter(model => model.tier === tier)
     .map(model => `<option value="${model.id}">${escapeHtml(model.label)}</option>`).join("")}</optgroup>`;
   return `${group("current", "Current")}${group("legacy", "Legacy")}<option value="${CUSTOM_MODEL}">Custom model id…</option>`;
+}
+
+/** Catalog models of an answer provider: OpenAI's catalog, or the direct provider's own list. */
+function providerModels(providerId: string): readonly AnswerModelInfo[] {
+  const provider = answerProviderInfo(providerId);
+  return provider && provider.api !== "openai" ? provider.models : ANSWER_MODELS;
+}
+
+/** The model id a provider's picker should show for a wanted id (another provider's id becomes this provider's default). */
+export function modelForProvider(providerId: string, wanted: string | undefined, kind: "answer" | "copilot"): string {
+  const provider = answerProviderInfo(providerId);
+  if (provider && provider.api !== "openai") return providerModel(provider, wanted, kind);
+  const fallback = kind === "answer" ? DEFAULT_ANSWER_MODEL : DEFAULT_COPILOT_MODEL;
+  return wanted && !PROVIDER_ANSWER_MODELS.some(item => item.id === wanted) ? wanted : fallback;
+}
+
+export function providerModelOptionsMarkup(providerId: string, kind: "answer" | "copilot"): string {
+  const provider = answerProviderInfo(providerId);
+  if (!provider || provider.api === "openai") return kind === "answer" ? answerModelOptionsMarkup() : copilotModelOptionsMarkup();
+  const options = provider.models.map(model => `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label)}${kind === "copilot" && model.id === provider.defaultCopilotModel ? " · default" : ""}</option>`).join("");
+  return kind === "answer" ? `${options}<option value="${CUSTOM_MODEL}">Custom model id…</option>` : options;
+}
+
+/** Direct providers for the Answer provider picker, after the two OpenAI APIs. */
+function directProviderOptionsMarkup(): string {
+  return `<optgroup label="Direct providers · Chat Completions">${ANSWER_PROVIDER_CATALOG.filter(provider => provider.api === "chat")
+    .map(provider => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.title)}</option>`).join("")}</optgroup>`;
 }
 
 function copilotModelOptionsMarkup(): string {
@@ -1565,13 +1666,15 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
               <label for="copilot-model">Copilot model (summary, concepts, lookups)
                 <select id="copilot-model">${copilotModelOptionsMarkup()}</select>
               </label>
-              <label for="answer-provider">Answer API
+              <label for="answer-provider">Answer provider
                 <select id="answer-provider">
                   <option value="openai-responses">OpenAI Responses</option>
                   <option value="openai-compatible">OpenAI Chat Completions</option>
+                  ${directProviderOptionsMarkup()}
                 </select>
               </label>
-              <p class="field-note">Audio goes directly from your phone to the selected provider. It is cloud transcription, not offline speech recognition. The same OpenAI key powers answers.</p>
+              <p id="answer-provider-note" class="field-note" hidden></p>
+              <p class="field-note">Audio goes directly from your phone to the selected provider. It is cloud transcription, not offline speech recognition. OpenAI answers use the same OpenAI key; DeepSeek, Qwen, Zhipu GLM and Moonshot Kimi answers and copilot use that provider's own key (API keys below), sent only to that provider.</p>
             </section>
 
             <section class="config-group" aria-labelledby="copilot-title">
@@ -1589,9 +1692,11 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                 ${toggle("copilot-suggestions", "Suggest questions")}
                 ${toggle("copilot-implicit-asks", "Answer things people mention", "Lead times, prices, design choices")}
                 ${toggle("copilot-web-grounding", "Use web search", "$10 per 1,000 searches plus tokens")}
+                ${toggle("news-search", "Prefer latest news in fact checks", "Recent reporting first, with dated sources. Applies to Live web fact check and Verify")}
                 ${toggle("copilot-claims", "Find claims to verify", "Checks tab and the glasses Verify action")}
                 ${toggle("copilot-people", "Track people", "People tab; saved with each session")}
               </fieldset>
+              <p id="search-provider-note" class="field-note" role="status"></p>
             </section>
 
             <section class="config-group" aria-labelledby="experience-title">
@@ -1609,7 +1714,13 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                     <option value="both">Both</option>
                   </select>
                 </label>
+                <label for="answer-length">Answer length
+                  <select id="answer-length">
+                    ${ANSWER_LENGTHS.map(id => `<option value="${id}"${id === "standard" ? " selected" : ""}>${answerLengthProfile(id).label}</option>`).join("")}
+                  </select>
+                </label>
               </div>
+              <p id="answer-length-note" class="field-note">${answerLengthProfile("standard").blurb}</p>
               <div class="mode-prompt" data-no-persist>
                 <label for="mode-prompt">System prompt for this mode</label>
                 <textarea id="mode-prompt" rows="5" maxlength="4000" spellcheck="true"></textarea>
@@ -1648,6 +1759,22 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                 <label for="omi-api-key">Omi API key (explicit import only)
                   <input id="omi-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
                 </label>
+                <label for="deepseek-api-key">DeepSeek API key
+                  <input id="deepseek-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
+                </label>
+                <label for="dashscope-api-key">Alibaba Qwen (Model Studio / DashScope) API key
+                  <input id="dashscope-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
+                </label>
+                <label for="zhipu-api-key">Zhipu GLM (bigmodel.cn or Z.ai) API key
+                  <input id="zhipu-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
+                </label>
+                <label for="moonshot-api-key">Moonshot Kimi API key
+                  <input id="moonshot-api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="8192" />
+                </label>
+                <div class="key-test-row">
+                  <button id="test-provider-key" class="button button-secondary button-small" type="button">Test provider key</button>
+                  <p id="provider-key-test-status" class="field-note key-test-status" role="status" aria-live="polite" data-state="idle">Qwen and Zhipu keys are region-bound: pick the matching China or International provider. Test sends one tiny request to the selected answer provider.</p>
+                </div>
               </div>
               <label class="toggle credential-save-toggle">
                 <input id="save-api-keys" type="checkbox" />

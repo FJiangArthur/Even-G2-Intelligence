@@ -6,9 +6,24 @@ export function safeSourceUrl(value: string): string | undefined {
   if (/[\u0000- \u007f]/u.test(value)) return;
   try { const url = new URL(value); if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password && url.hostname) return url.href; } catch { /* untrusted source */ }
 }
-export function sourceLink(source: { url: string; title: string }): HTMLAnchorElement | undefined {
+/** "2026-11-17" -> "17 Nov 2026" for a source chip; undefined for anything that is not a plain date. */
+export function sourceDateLabel(publishedAt: string | undefined): string | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(publishedAt ?? "");
+  if (!match) return;
+  const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(match[2]) - 1];
+  return month ? `${Number(match[3])} ${month} ${match[1]}` : undefined;
+}
+export function sourceLink(source: { url: string; title: string; publishedAt?: string; dateSource?: string; site?: string }): HTMLAnchorElement | undefined {
   const href = safeSourceUrl(source.url); if (!href) return;
   const link = document.createElement("a"); link.href = href; link.textContent = source.title || href;
+  // News search: show when the page was published, and say where that date came from.
+  const date = sourceDateLabel(source.publishedAt);
+  if (date) {
+    const stamp = document.createElement("span"); stamp.className = "source-date";
+    stamp.textContent = ` · ${source.site ? `${source.site} · ` : ""}${date}`;
+    stamp.title = source.dateSource === "model" ? "Date reported by the model for this page" : "Publication date from the search results";
+    link.append(stamp);
+  }
   link.target = "_blank"; link.rel = "noopener noreferrer"; return link;
 }
 export function memoryEntryIds(entry: HistoryEntry): string[] {

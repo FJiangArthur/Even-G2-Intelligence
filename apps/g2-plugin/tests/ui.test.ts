@@ -219,7 +219,7 @@ describe("v0.7 tabbed pixel HUD", () => {
   });
 
   it("never sends API keys through the debounced settings path", () => {
-    expect(uiSource).toMatch(/readSettings\(\): SessionFormState \{\s*return \{ \.\.\.this\.readForm\(\), openaiApiKey: "", deepgramApiKey: "", sonioxApiKey: "", omiApiKey: "", accessToken: "" \};/u);
+    expect(uiSource).toMatch(/readSettings\(\): SessionFormState \{\s*return \{ \.\.\.this\.readForm\(\), openaiApiKey: "", deepgramApiKey: "", sonioxApiKey: "", omiApiKey: "", deepseekApiKey: "", dashscopeApiKey: "", zhipuApiKey: "", moonshotApiKey: "", accessToken: "" \};/u);
     expect(uiSource).toContain("save(this.readSettings())");
     expect(markup).toMatch(/class="config-group provider-key-group"[^>]*data-no-persist/u);
   });
