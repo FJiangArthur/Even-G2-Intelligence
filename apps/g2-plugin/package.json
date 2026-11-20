@@ -13,7 +13,8 @@
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "0.0.14",
-    "@helix/conversation-sdk": "0.7.0"
+    "@helix/conversation-sdk": "0.7.0",
+    "pdfjs-dist": "4.10.38"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "0.1.14",

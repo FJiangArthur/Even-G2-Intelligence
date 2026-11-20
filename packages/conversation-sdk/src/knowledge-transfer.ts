@@ -6,6 +6,7 @@
 import type { DirectFetch } from "./direct-providers.js";
 import { stripCitationMarkers } from "./direct-providers.js";
 import type { HistoryEntry, HistorySession, SessionPerson } from "./local-history.js";
+import { MAX_TODOS, parseTodoLine, todoLine, type TodoItem } from "./todo-list.js";
 
 export interface SessionWithEntries { readonly session: HistorySession; readonly entries: readonly HistoryEntry[] }
 export interface MarkdownSession { session: HistorySession; entries: HistoryEntry[]; /** Original Helix session id when the note was exported by Helix. */ helixSessionId?: string }
@@ -13,7 +14,7 @@ export interface VaultFile { path: string; content: string }
 export interface MarkdownImportOptions { /** Fallback timestamp when the note has no date (default: now). */ now?: string }
 
 const MAX_MARKDOWN_CHARS = 2_000_000, MAX_ENTRY_CHARS = 4000, MAX_ENTRIES = 5000, MAX_ITEMS = 20, MAX_ITEM_CHARS = 500;
-const SECTION = { summary: "Summary", keyFacts: "Key facts", people: "People", concepts: "Concepts", diagram: "Diagram", transcript: "Transcript" } as const;
+const SECTION = { summary: "Summary", keyFacts: "Key facts", people: "People", concepts: "Concepts", diagram: "Diagram", transcript: "Transcript", todos: "To-dos", notes: "Notes" } as const;
 const HELIX_SPEAKER = "Helix";
 
 /* ------------------------------------------------------------------ text hygiene */
@@ -117,6 +118,11 @@ export function sessionToMarkdown(session: HistorySession, entries: readonly His
   if (summary.length) body.push(`## ${SECTION.summary}`, ...list(summary), "");
   const facts = (session.keyFacts ?? []).map(cleanLine).filter(Boolean);
   if (facts.length) body.push(`## ${SECTION.keyFacts}`, ...list(facts), "");
+  // Notes mode: to-dos as task checkboxes (Obsidian tasks), then the running notes.
+  const todos = session.todos ?? [];
+  if (todos.length) body.push(`## ${SECTION.todos}`, ...todos.map(item => `- [${item.done ? "x" : " "}] ${safeMd(cleanLine(todoLine(item)))}`), "");
+  const notes = (session.notes ?? []).map(note => cleanLine(note.text)).filter(Boolean);
+  if (notes.length) body.push(`## ${SECTION.notes}`, ...list(notes), "");
   if (people.length) body.push(`## ${SECTION.people}`, ...people.map(p => `- **${speakerLabel(p.name) || "Unknown"}**${p.role ? ` — ${cleanLine(p.role)}` : ""}`), "");
   const concepts = (session.concepts ?? []).map(cleanLine).filter(Boolean);
   if (concepts.length) body.push(`## ${SECTION.concepts}`, ...list(concepts), "");
@@ -245,7 +251,7 @@ function parsePerson(text: string): SessionPerson | undefined {
 }
 const SECTION_KEYS: Readonly<Record<string, keyof typeof SECTION>> = {
   summary: "summary", overview: "summary", keyfacts: "keyFacts", facts: "keyFacts", people: "people", participants: "people",
-  concepts: "concepts", diagram: "diagram", transcript: "transcript",
+  concepts: "concepts", diagram: "diagram", transcript: "transcript", todos: "todos", todo: "todos", actionitems: "todos",
 };
 type Draft = { kind: HistoryEntry["kind"]; text: string; speaker?: string; origin: string; section?: string };
 
@@ -265,7 +271,7 @@ export function markdownToSession(markdown: string, fileName: string, options: M
     if (end > 0) { front = parseFrontmatter(lines.slice(1, end)); lines = lines.slice(end + 1); }
   }
   const tags = new Set<string>(), summary: string[] = [], keyFacts: string[] = [], concepts: string[] = [], people: SessionPerson[] = [];
-  const drafts: Draft[] = [];
+  const drafts: Draft[] = [], todos: TodoItem[] = [];
   let h1: string | undefined, section: keyof typeof SECTION | undefined, heading: string | undefined;
   let paragraph: string[] = [], fence: { marker: string; mermaid: boolean; lines: string[] } | undefined;
   const add = (draft: Draft) => { if (draft.text && drafts.length < MAX_ENTRIES) drafts.push(draft); };
@@ -336,6 +342,12 @@ export function markdownToSession(markdown: string, fileName: string, options: M
     if (bullet) {
       flush();
       if (section === "people") { const person = parsePerson(bullet[1]!); if (person) people.push(person); continue; }
+      if (section === "todos") {
+        // Task checkboxes written by sessionToMarkdown (or by hand) come back as the session's to-do list.
+        const fields = parseTodoLine(plain(bullet[1]!, tags));
+        if (fields.text && todos.length < MAX_TODOS) todos.push({ id: `todo-${todos.length + 1}`, ...fields, done: /^\s*(?:[-*+]|\d+[.)])\s+\[[xX]\]/u.test(line), origin: "user", createdAt: "", updatedAt: "" });
+        continue;
+      }
       const text = plain(bullet[1]!, tags);
       if (!knowledge(text)) note(text, "obsidian-bullet");
       continue;
@@ -368,6 +380,7 @@ export function markdownToSession(markdown: string, fileName: string, options: M
   if (byName.size) session.people = [...byName.values()].slice(0, MAX_ITEMS);
   if (concepts.length) session.concepts = items(concepts);
   if (cleanTags.length) session.tags = cleanTags;
+  if (todos.length) session.todos = todos.map(item => ({ ...item, createdAt: startedAt, updatedAt }));
   const base = Date.parse(startedAt);
   const entries: HistoryEntry[] = drafts.map((draft, index) => ({
     id: `${sessionId}:${index}`, sessionId, kind: draft.kind, text: draft.text,

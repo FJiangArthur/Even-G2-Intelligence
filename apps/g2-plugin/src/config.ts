@@ -2,8 +2,12 @@ import {
   CONVERSATION_MODES as SDK_CONVERSATION_MODES,
   DEFAULT_ANSWER_MODEL,
   DEFAULT_COPILOT_SETTINGS,
+  DEFAULT_ANSWER_LENGTH,
+  answerProviderInfo,
+  cleanAnswerLength,
   modeProfile,
   normalizeSessionStartCredentials,
+  type AnswerLength,
   type CopilotSettings,
   type SessionStartCredentials,
 } from "@helix/conversation-sdk";
@@ -40,6 +44,13 @@ export const ANSWER_PROVIDERS = [
   "mock",
   "openai-responses",
   "openai-compatible",
+  // Direct Chat Completions providers (SDK provider-registry.ts): own key field, fixed base URL.
+  "deepseek",
+  "qwen",
+  "qwen-intl",
+  "zhipu",
+  "zai",
+  "moonshot",
 ] as const;
 export type AnswerProviderProfile = typeof ANSWER_PROVIDERS[number];
 
@@ -78,6 +89,10 @@ export interface PluginConfig {
   readonly copilotPeople?: boolean;
   /** v0.11: the user's edited system prompt per mode (absent = the built-in prompt). */
   readonly modePrompts?: Readonly<Record<string, string>>;
+  /** Answer length: brief | standard | detailed. Optional so older literals stay valid; absent = standard. */
+  readonly answerLength?: AnswerLength;
+  /** Fact checks prefer the latest news and show dated sources. Absent = on. */
+  readonly newsSearch?: boolean;
 }
 
 export interface SessionFormState extends PluginConfig {
@@ -87,6 +102,12 @@ export interface SessionFormState extends PluginConfig {
   readonly sonioxApiKey: string;
   readonly omiApiKey: string;
   readonly saveApiKeysOnPhone: boolean;
+  /** Keys of the direct Chat Completions providers. Optional so older form literals stay valid. */
+  readonly deepseekApiKey?: string;
+  /** Alibaba Cloud Model Studio (DashScope) key for Qwen; region-bound. */
+  readonly dashscopeApiKey?: string;
+  readonly zhipuApiKey?: string;
+  readonly moonshotApiKey?: string;
 }
 
 export interface ProviderCredentialLoadResult {
@@ -137,6 +158,8 @@ export const DEFAULT_CONFIG: PluginConfig = Object.freeze({
   copilotWebGrounding: DEFAULT_COPILOT_SETTINGS.webGrounding,
   copilotClaims: true,
   copilotPeople: true,
+  answerLength: DEFAULT_ANSWER_LENGTH,
+  newsSearch: true,
 });
 
 /** Contract shape consumed by the SDK copilot lane. */
@@ -180,6 +203,9 @@ export function copilotSettingsFromConfig(config: PluginConfig): CopilotSettings
     // v0.8 lanes default on in the SDK; only an explicit opt-out is sent.
     ...(config.copilotClaims === false ? { claims: false } : {}),
     ...(config.copilotPeople === false ? { people: false } : {}),
+    // Standard length and the default mode-independent prompts send nothing extra.
+    ...(cleanAnswerLength(config.answerLength) === DEFAULT_ANSWER_LENGTH ? {} : { answerLength: cleanAnswerLength(config.answerLength) }),
+    ...(config.newsSearch === false ? {} : { newsSearch: true }),
   };
 }
 
@@ -303,6 +329,8 @@ export function normalizePluginConfig(value: unknown): PluginConfig {
     copilotWebGrounding: cleanBoolean(candidate.copilotWebGrounding, DEFAULT_CONFIG.copilotWebGrounding),
     copilotClaims: cleanBoolean(candidate.copilotClaims, true),
     copilotPeople: cleanBoolean(candidate.copilotPeople, true),
+    answerLength: cleanAnswerLength(candidate.answerLength),
+    newsSearch: cleanBoolean(candidate.newsSearch, true),
     ...(cleanModePrompts(candidate.modePrompts) ? { modePrompts: cleanModePrompts(candidate.modePrompts)! } : {}),
   };
 }
@@ -349,6 +377,10 @@ export function providerCredentialsFromForm(form: SessionFormState): SessionStar
     deepgram: form.deepgramApiKey,
     soniox: form.sonioxApiKey,
     omi: form.omiApiKey,
+    ...(form.deepseekApiKey === undefined ? {} : { deepseek: form.deepseekApiKey }),
+    ...(form.dashscopeApiKey === undefined ? {} : { dashscope: form.dashscopeApiKey }),
+    ...(form.zhipuApiKey === undefined ? {} : { zhipu: form.zhipuApiKey }),
+    ...(form.moonshotApiKey === undefined ? {} : { moonshot: form.moonshotApiKey }),
   });
 }
 
@@ -372,6 +404,9 @@ export function providerCredentialsForSession(form: SessionFormState): SessionSt
     form.answerProvider !== "mock"
     && available.openai !== undefined
   ) selected.openai = available.openai;
+  // A direct provider's key joins the session only when that provider is selected for answers.
+  const answer = answerProviderInfo(form.answerProvider);
+  if (answer && answer.api !== "openai" && available[answer.credential] !== undefined) selected[answer.credential] = available[answer.credential]!;
   return normalizeSessionStartCredentials(selected);
 }
 

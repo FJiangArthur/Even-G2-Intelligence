@@ -17,6 +17,8 @@ There is no Helix server. `DirectConversationTransport` is an in-process adapter
 
 ## Providers
 
+> The table below is the v0.5 state. Since 0.13 answers can also come from DeepSeek, Qwen, Zhipu GLM and Moonshot Kimi, and the OpenAI transcription options have changed. The current lists are in [PROVIDERS_AND_SEARCH.md](PROVIDERS_AND_SEARCH.md) and the [README](../README.md#providers). The glasses presentation described under "Runtime and safety" is also historical: see [PIXEL_GESTURES.md](PIXEL_GESTURES.md).
+
 | Purpose | Profile / model | Direct destination |
 | --- | --- | --- |
 | Whisper transcription (default) | openai-whisper / whisper-1 | OpenAI HTTPS audio/transcriptions |

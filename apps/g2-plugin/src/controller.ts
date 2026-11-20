@@ -37,6 +37,7 @@ import {
 import { markdownSession, omiExportSummary, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile } from "./knowledge-panel"; // phone agent
 import { joinConcept } from "./history-panel";
 import { firstAccessibleModel } from "@helix/conversation-sdk";
+import { DEFAULT_COPILOT_MODEL, answerProviderInfo, directEndpoint, providerModel, testProviderKey, type ProviderKeyTestResult } from "@helix/conversation-sdk";
 import { RehearsalPlayer, rehearsalScript, type RehearsalResult } from "./rehearsal";
 import {
   pcmS16LeBytesToSamples,
@@ -61,8 +62,11 @@ import {
   type ConversationMode,
 } from "./config";
 import { modeProfile, summarizeSession } from "@helix/conversation-sdk";
+import { SessionNotebook, applyTodoOp, type SessionNotebookData, type TodoOp } from "@helix/conversation-sdk";
 import { EMPTY_OPENAI_KNOWLEDGE, cleanOpenAIKnowledgeState, deleteOpenAIKnowledge, syncOpenAIKnowledge, type KnowledgeDocument, type KnowledgeSyncProgress, type OpenAIKnowledgeState } from "@helix/conversation-sdk";
+import { MIN_RECAP_TRANSCRIPT_CHARS, SESSION_DIGEST_ENDPOINT, SESSION_DIGEST_PROMPT_VERSION, fallbackSessionRecap, isAutoSessionTitle, removeOpenAIKnowledgeDocument, sessionHasContent, sessionRecap, spokenChars, type SessionDigest, type UsageRecord } from "@helix/conversation-sdk";
 import type { ShortcutActionId } from "./shortcut-actions";
+import { ingestPdfs, type PdfDocumentText, type PdfFileStatus, type PdfInput, type PdfParser } from "@helix/conversation-sdk"; // v0.13 knowledge I/O
 
 /** Where answers look up saved knowledge: on this phone (BM25) or in the user's OpenAI vector store. */
 export type KnowledgeSource = "local" | "openai";
@@ -71,13 +75,42 @@ export interface KnowledgeBaseView {
   readonly source: KnowledgeSource;
   /** Sessions currently in the OpenAI store / sessions saved on this phone that are not in it or changed since. */
   readonly synced: number; readonly pending: number;
+  /** v0.13: sessions removed on this phone whose file is still in the OpenAI store (removed there by the next sync). */
+  readonly removals: number;
   readonly hasStore: boolean; readonly syncedAt?: string;
   readonly syncing?: KnowledgeSyncProgress;
   readonly notice?: string;
 }
 export const OPENAI_KNOWLEDGE_STORAGE_KEY = "helix.openai.knowledge.v1";
+// ---- v0.13 knowledge I/O: Omi auto-import and PDF ingestion ----
+/** Holds the switch and the last outcome only. Never a key and never conversation text. */
+export const OMI_AUTO_IMPORT_STORAGE_KEY = "helix.omi.auto-import.v1";
+/** Gap between automatic Omi imports while the app is open, and before a retry after a failure. */
+export const OMI_AUTO_IMPORT_INTERVAL_MS = 30 * 60_000;
+export const OMI_AUTO_IMPORT_RETRY_MS = 5 * 60_000;
+/** The first automatic import reads this many days back; later ones start a day before the last success. */
+export const OMI_AUTO_IMPORT_FIRST_DAYS = 14;
+export type AutoImportReason = "startup" | "interval" | "resume" | "enabled" | "manual";
+export type AutoImportOutcome = "disabled" | "not-ready" | "no-key" | "busy" | "not-due" | "imported" | "failed";
+export interface AutoImportView {
+  readonly enabled: boolean; readonly running: boolean;
+  readonly lastAttemptAt?: string; readonly lastSuccessAt?: string; readonly lastImported?: number;
+  /** Why the last attempt did not import (missing key, Omi error, storage full). */
+  readonly lastError?: string;
+}
+export interface PdfImportView { readonly running: boolean; readonly parser?: PdfParser; readonly files: readonly PdfFileStatus[] }
+export interface PdfImportRequest {
+  readonly parser: PdfParser;
+  /** OpenAI key from Setup (in memory). Needed for the OpenAI parser; also used to sync the result to the OpenAI knowledge base when that is selected. */
+  readonly openaiKey?: string;
+  /** On-phone text extractor (pdf-local.ts, lazy-loaded by the panel). Needed for the local parser. */
+  readonly extractLocal?: (data: Uint8Array, options: { signal?: AbortSignal; maxPages: number }) => Promise<PdfDocumentText>;
+}
+// ---- end v0.13 knowledge I/O ----
 export interface HistoryState {
   readonly knowledge: KnowledgeBaseView;
+  readonly autoImport: AutoImportView;
+  readonly pdfImport: PdfImportView;
   readonly sessions: HistorySession[];
   readonly status: string;
   readonly importing: boolean;
@@ -96,7 +129,17 @@ export interface G2BridgePort extends GlassesRenderBridge, LocalConfigStore {
 
 /** v0.8 lifecycle: survives a WebView reclaim (Even docs: localStorage survives). Never holds keys. */
 export const LIFECYCLE_STORAGE_KEY = "helix.lifecycle.v1";
-export interface LifecycleFlag { readonly connected: boolean; readonly listening: boolean; readonly at: number }
+export interface LifecycleFlag {
+  readonly connected: boolean; readonly listening: boolean; readonly at: number;
+  /** v0.13: history record of the interrupted session, so tap-to-resume continues it instead of starting another. */
+  readonly sessionId?: string;
+}
+/** v0.13: a resume within this long of the interrupted session's last saved line continues that session in History. */
+export const RESUME_SAME_SESSION_MS = 30 * 60 * 1000;
+/** What History removal reports back to the panel. */
+export interface HistoryRemoval { readonly removed: number; readonly failed: number; readonly pendingInOpenAI: number; readonly message: string }
+/** One model call over a saved transcript (the transport's own fetch, or the Setup key path). */
+type DigestRunner = (session: { title: string; lines: readonly { speaker: string; text: string }[] }) => Promise<SessionDigest>;
 export const RESUME_PROMPT = "Session paused while Helix was in the background · tap to resume";
 export const CONNECT_PROMPT = "Helix is not connected · tap to connect";
 /** A flag older than this is not offered for resume. */
@@ -153,6 +196,18 @@ export class G2ConversationController {
   private manualRevision = 0;
   private readonly transcriptRevisions = new Map<string, number>();
   private readonly memoryByQuestion = new Map<string, RetrievedMemory[]>();
+  // ---- v0.13 post-conversation summary ----
+  /** OpenAI key of the live session (memory only), for the summary written when it ends. */
+  private sessionKey?: string;
+  /** The live session once its history record has been issued (it is saved with its first content). */
+  private recordedSessionId?: string;
+  /** Sessions whose summary call is in flight. */
+  private readonly recapJobs = new Map<string, Promise<void>>();
+  /** Sessions merged into another this run (interrupted + resumed): old id -> the record that now holds it. */
+  private readonly mergedInto = new Map<string, string>();
+  /** False: sessions end with the on-phone fallback title only (no model call). */
+  public summarizeOnEnd = true;
+  // ---- end post-conversation summary ----
   private rehearsal?: RehearsalPlayer;
   private modelAccess?: { key: string; ids: Promise<string[] | undefined> };
   private readonly modelAccessListeners = new Set<(access: { accessible: string[]; model: string; copilotModel: string }) => void>();
@@ -173,7 +228,7 @@ export class G2ConversationController {
   ) { this.history = new LocalHistoryStore(bridge); }
 
   public historySnapshot(): HistoryState {
-    return { knowledge: this.knowledgeBase(), sessions: this.history.listSessions(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
+    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), sessions: this.history.listSessions(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
       useLocalMemory: this.localMemoryEnabled, liveWebFactCheck: this.webCheckEnabled, autoExplainTerms: this.autoExplainEnabled };
   }
   public subscribeHistory(listener: (state: HistoryState) => void): () => void {
@@ -193,6 +248,51 @@ export class G2ConversationController {
     const id = this.history.sessionIdOfEntry(entryId);
     return id ? this.history.getSession(id) : undefined;
   }
+  // ---- v0.13 history: content, recap and removal ----
+  /** False for a Helix record with nothing in it (kept out of the list; pruned on load). */
+  public historySessionHasContent(session: HistorySession): boolean {
+    return session.source !== "helix" || sessionHasContent(session, this.history.entryCount(session.id));
+  }
+  /** True while the post-conversation summary of this session is being written. */
+  public sessionSummaryPending(id: string): boolean { return this.recapJobs.has(id); }
+  /** Resolves when no post-conversation summary is running (tests, and before the page goes away). */
+  public async recapSettled(): Promise<void> { while (this.recapJobs.size) await Promise.all([...this.recapJobs.values()]); }
+  /**
+   * Removes sessions everywhere they are kept: the history index and every shard chunk (so local
+   * retrieval, People and the knowledge map no longer see them) and, when a session was synced, its
+   * file in the OpenAI knowledge base. `key` is the OpenAI key from Setup; without it, or when OpenAI
+   * cannot be reached, the file stays listed as pending removal and the next Sync removes it.
+   * Caller confirms the user-triggered removal before calling this API.
+   */
+  public async removeHistorySessions(ids: readonly string[], key = ""): Promise<HistoryRemoval> {
+    let removed = 0, failed = 0;
+    const gone: string[] = [];
+    for (const id of new Set(ids)) {
+      try { await this.deleteHistorySession(id); removed++; gone.push(id); } catch { failed++; }
+    }
+    const pendingInOpenAI = await this.forgetOpenAIKnowledge(gone, key);
+    const message = `${removed === 1 ? "Session" : `${removed} sessions`} removed from this phone and local retrieval.`
+      + (failed ? ` ${failed} could not be removed.` : "")
+      + (pendingInOpenAI ? ` ${pendingInOpenAI === 1 ? "It is" : `${pendingInOpenAI} are`} still in your OpenAI knowledge base until the next Sync (Knowledge tab).` : "");
+    if (removed || failed) this.setHistoryStatus(message);
+    return { removed, failed, pendingInOpenAI, message };
+  }
+  /** Removes the uploaded files of deleted sessions now when a key is at hand; returns how many are left for the next sync. */
+  private async forgetOpenAIKnowledge(ids: readonly string[], key: string): Promise<number> {
+    const synced = ids.filter(id => this.openaiKnowledge.files[id]);
+    if (!synced.length) return 0;
+    let left = synced.length;
+    if (key.trim() && !this.knowledgeSync) {
+      const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
+      for (const id of synced) {
+        try { this.openaiKnowledge = await removeOpenAIKnowledgeDocument(fetcher, key, this.openaiKnowledge, id); left--; } catch { /* stays pending: the next sync removes it */ }
+      }
+      await this.saveKnowledge();
+    }
+    this.emitHistory();
+    return left;
+  }
+  // ---- end v0.13 history ----
   /** Caller confirms user-triggered deletion before calling this API. */
   public async deleteHistorySession(id: string): Promise<void> {
     const pending = this.historyDeletions.get(id);
@@ -227,16 +327,139 @@ export class G2ConversationController {
     const completion = (async () => {
       try {
         await archives;
-        const result = await importOmiConversations({ ...request, store: this.history, signal: abort.signal,
+        // v0.13 skipInvalid: one conversation Helix cannot read is counted and skipped instead of failing every import.
+        const result = await importOmiConversations({ skipInvalid: true, ...request, store: this.history, signal: abort.signal,
           onProgress: progress => this.setHistoryStatus(`Imported ${progress.imported} conversations · ${progress.pages} pages`) });
-        this.setHistoryStatus(`Import complete: ${result.imported} conversations processed. Repeated imports update existing records.`);
-      } catch (error) { this.setHistoryStatus(errorMessage(error)); }
+        this.lastOmiImport = { ok: true, imported: result.imported, skipped: result.skipped ?? 0 };
+        this.setHistoryStatus(`Import complete: ${result.imported} conversations processed${result.skipped ? ` · ${result.skipped} skipped (Omi returned them in a form Helix cannot read)` : ""}. Repeated imports update existing records.`);
+      } catch (error) { this.lastOmiImport = { ok: false, message: errorMessage(error) }; this.setHistoryStatus(errorMessage(error)); }
       finally { this.importAbort = undefined; this.importCompletion = undefined; this.bulkHistoryWrites--; this.syncHistoryWriteDelay(); this.emitHistory(); }
     })();
     this.importCompletion = completion;
     await completion;
   }
   public cancelImport(): void { this.importAbort?.abort(); }
+
+  // ---- v0.13 Omi auto-import ----
+  /** Outcome of the most recent importOmi() run (it reports through the status line and never throws). */
+  private lastOmiImport?: { ok: true; imported: number; skipped: number } | { ok: false; message: string };
+  private autoImport: { enabled: boolean; lastAttemptAt?: string; lastSuccessAt?: string; lastImported?: number; lastError?: string } = { enabled: false };
+  private autoImportRunning = false;
+  private autoImportKey?: () => string;
+  private autoImportTimer?: ReturnType<typeof setInterval>;
+  private autoImportWrite: Promise<void> = Promise.resolve();
+  /** Test hook: the fetch used by automatic Omi imports. */
+  public omiImportFetch?: (url: string, init?: RequestInit) => Promise<Response>;
+  public autoImportView(): AutoImportView { return { ...this.autoImport, running: this.autoImportRunning }; }
+  private saveAutoImport(): Promise<void> {
+    const value = JSON.stringify(this.autoImport);
+    this.autoImportWrite = this.autoImportWrite.then(async () => { try { await this.bridge.setLocalStorage(OMI_AUTO_IMPORT_STORAGE_KEY, value); } catch { /* best effort: the switch still applies until the app closes */ } });
+    return this.autoImportWrite;
+  }
+  /**
+   * Gives the controller the Omi key source (the Setup field) and starts the schedule: one check now,
+   * then one a minute, each of which imports only when the switch is on and an import is due.
+   * Called by the Knowledge panel; without it nothing runs automatically.
+   */
+  public configureAutoImport(key: () => string, checkEveryMs = 60_000): void {
+    this.autoImportKey = key;
+    if (this.autoImportTimer !== undefined) clearInterval(this.autoImportTimer);
+    this.autoImportTimer = setInterval(() => { void this.maybeAutoImport("interval"); }, checkEveryMs);
+    void this.maybeAutoImport("startup");
+  }
+  public async setAutoImportEnabled(enabled: boolean): Promise<AutoImportOutcome> {
+    const { lastError: _cleared, ...kept } = this.autoImport;
+    this.autoImport = { ...kept, enabled };
+    this.emitHistory();
+    await this.saveAutoImport();
+    return enabled ? this.maybeAutoImport("enabled") : "disabled";
+  }
+  /**
+   * Runs an Omi import when the switch is on, the app is ready, a key is present, no import is
+   * running and one is due ("enabled" and "manual" skip the due check). Incremental: from a day
+   * before the last success, or OMI_AUTO_IMPORT_FIRST_DAYS back the first time. Never throws; the
+   * outcome is stored (without the key) and shown in the Knowledge tab.
+   */
+  public async maybeAutoImport(reason: AutoImportReason, now = Date.now()): Promise<AutoImportOutcome> {
+    if (!this.autoImport.enabled) return "disabled";
+    if (!this.initialized || !this.autoImportKey || this.disposed || this.exiting) return "not-ready";
+    if (this.autoImportRunning || this.importAbort) return "busy";
+    const last = Date.parse(this.autoImport.lastAttemptAt ?? ""), failed = !!this.autoImport.lastError;
+    if (reason !== "enabled" && reason !== "manual" && Number.isFinite(last) && now - last < (failed ? OMI_AUTO_IMPORT_RETRY_MS : OMI_AUTO_IMPORT_INTERVAL_MS)) return "not-due";
+    const key = (this.autoImportKey?.() ?? "").trim();
+    if (!key) {
+      // Not counted as an attempt: the next check imports as soon as a key is there.
+      const message = "Auto-import is on, but there is no Omi key. Enter your Omi developer key in Setup → API keys, and turn on “Save API keys on this phone” so it is still there after a restart.";
+      if (this.autoImport.lastError !== message) { this.autoImport = { ...this.autoImport, lastError: message }; this.emitHistory(); await this.saveAutoImport(); }
+      return "no-key";
+    }
+    this.autoImportRunning = true;
+    const since = Date.parse(this.autoImport.lastSuccessAt ?? "");
+    const startDate = new Date(Number.isFinite(since) ? since - 24 * 60 * 60_000 : now - OMI_AUTO_IMPORT_FIRST_DAYS * 24 * 60 * 60_000).toISOString();
+    this.lastOmiImport = undefined;
+    try {
+      await this.importOmi({ key, startDate, ...(this.omiImportFetch ? { fetch: this.omiImportFetch } : {}) });
+    } catch (error) { this.lastOmiImport = { ok: false, message: errorMessage(error) }; }
+    const result = this.lastOmiImport as { ok: true; imported: number; skipped: number } | { ok: false; message: string } | undefined;
+    const at = new Date(now).toISOString();
+    const { lastError: _cleared, ...kept } = this.autoImport;
+    this.autoImport = result?.ok ? { ...kept, lastAttemptAt: at, lastSuccessAt: at, lastImported: result.imported }
+      : { ...kept, lastAttemptAt: at, lastError: result?.message ?? "The Omi import did not finish." };
+    this.autoImportRunning = false;
+    this.emitHistory();
+    await this.saveAutoImport();
+    return result?.ok ? "imported" : "failed";
+  }
+  // ---- end v0.13 Omi auto-import ----
+
+  // ---- v0.13 PDF ingestion ----
+  private pdfImport: { abort: AbortController; parser: PdfParser } | undefined;
+  private pdfFiles: readonly PdfFileStatus[] = [];
+  public pdfImportView(): PdfImportView { return { running: !!this.pdfImport, ...(this.pdfImport ? { parser: this.pdfImport.parser } : {}), files: this.pdfFiles }; }
+  public cancelPdfImport(): void { this.pdfImport?.abort.abort(); }
+  /**
+   * Parses PDFs (on this phone, or in the user's OpenAI project) and saves each as a knowledge
+   * session that on-phone retrieval searches. One failing file never loses the others. When the
+   * OpenAI knowledge base is selected and already created, the new documents are synced to it too.
+   */
+  public async importPdfs(inputs: readonly PdfInput[], request: PdfImportRequest): Promise<PdfFileStatus[]> {
+    if (this.disposed || this.exiting) throw new Error("Helix has exited.");
+    if (this.pdfImport) throw new Error("PDFs are already being added. Wait for them to finish or cancel first.");
+    if (!inputs.length) return [];
+    const key = (request.openaiKey ?? "").trim();
+    if (request.parser === "openai" && !key) throw new Error("The OpenAI parser needs your OpenAI API key. Enter it in Setup → API keys, or choose “On this phone”.");
+    const run = { abort: new AbortController(), parser: request.parser };
+    this.pdfImport = run; this.pdfFiles = inputs.map(input => ({ name: input.name, state: "queued" as const })); this.emitHistory();
+    const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
+    this.bulkHistoryWrites++; this.syncHistoryWriteDelay();
+    let files: PdfFileStatus[] = [];
+    try {
+      files = await ingestPdfs(inputs, {
+        parser: request.parser, signal: run.abort.signal,
+        ...(request.extractLocal ? { extractLocal: request.extractLocal } : {}),
+        ...(request.parser === "openai" ? { openai: { fetch: fetcher, key, model: answerProviderInfo(this.config.answerProvider)?.api === "chat" ? DEFAULT_COPILOT_MODEL : this.config.copilotModel } } : {}),
+        onStatus: status => { this.pdfFiles = status; this.emitHistory(); },
+        save: async ({ session, entries }) => {
+          await this.archiveQueue;
+          // One all-or-nothing save. Re-adding the same PDF replaces it (passages of an old, longer version
+          // must not stay); when the save fails (archive full) no empty document is left and the old copy stays.
+          await this.history.replaceSession(session, entries);
+        },
+      });
+    } finally {
+      this.bulkHistoryWrites--; this.syncHistoryWriteDelay();
+      this.pdfImport = undefined;
+      if (files.length) this.pdfFiles = files;
+      const done = files.filter(file => file.state === "done").length, failed = files.filter(file => file.state === "failed").length, cancelled = files.filter(file => file.state === "cancelled").length;
+      this.setHistoryStatus(`Added ${done} of ${inputs.length} PDF${inputs.length === 1 ? "" : "s"} to the knowledge base${failed ? ` · ${failed} failed` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}.`);
+    }
+    // The OpenAI knowledge base, when in use, gets the new documents too (same Files API the user already opted into).
+    if (files.some(file => file.state === "done") && key && this.knowledgeSource === "openai" && this.openaiKnowledge.vectorStoreId && !this.knowledgeSync) {
+      await this.syncOpenAIKnowledge(key).catch(() => undefined); // the outcome is in the knowledge base status line
+    }
+    return files;
+  }
+  // ---- end v0.13 PDF ingestion ----
   public setLocalMemoryEnabled(enabled: boolean): Promise<void> {
     this.localMemoryEnabled = enabled; return this.saveMemorySettings();
   }
@@ -254,20 +477,37 @@ export class G2ConversationController {
   /** Saved sessions as knowledge documents (the live session is still changing and is left out). */
   private knowledgeDocuments(): KnowledgeDocument[] {
     const live = this.session?.id;
-    return this.history.listSessions().filter(session => session.id !== live).map(session => ({
-      id: session.id, stamp: `${this.history.entryCount(session.id)}|${session.updatedAt}`, title: session.title, date: session.startedAt,
+    return this.history.listSessions().filter(session => session.id !== live).map(session => this.titled(session)).map(session => ({
+      id: session.id, stamp: this.knowledgeStamp(session), title: session.title, date: session.startedAt,
       markdown: knowledgeText(toSessionMarkdown(session, this.history.getEntries(session.id)), session),
     }));
   }
+  /**
+   * Change stamp of a session's uploaded file. To-dos and notes are edited after a session ended
+   * without touching its lines or updatedAt, so they are part of the stamp: an edit in History marks
+   * the session as changed for the next Sync. Sessions without a notebook keep the v0.12 stamp.
+   */
+  private knowledgeStamp(session: HistorySession): string {
+    const base = `${this.history.entryCount(session.id)}|${session.updatedAt}`;
+    if (!session.todos?.length && !session.notes?.length) return base;
+    let hash = 0x811c9dc5;
+    for (const char of JSON.stringify([session.todos ?? [], session.notes ?? []])) hash = Math.imul(hash ^ char.codePointAt(0)!, 0x01000193) >>> 0;
+    return `${base}|n${hash.toString(36)}`;
+  }
   public knowledgeBase(): KnowledgeBaseView {
     const files = this.openaiKnowledge.files, live = this.session?.id;
-    let pending = 0;
+    let pending = 0, removals = 0;
     // Only worth an archive pass when the OpenAI store is in use.
-    if (this.knowledgeSource === "openai" || this.openaiKnowledge.vectorStoreId) for (const session of this.history.listSessions()) {
-      if (session.id === live) continue;
-      if (files[session.id]?.stamp !== `${this.history.entryCount(session.id)}|${session.updatedAt}`) pending++;
+    if (this.knowledgeSource === "openai" || this.openaiKnowledge.vectorStoreId) {
+      const saved = new Set<string>();
+      for (const session of this.history.listSessions()) {
+        saved.add(session.id);
+        if (session.id === live) continue;
+        if (files[session.id]?.stamp !== this.knowledgeStamp(session)) pending++;
+      }
+      for (const id of Object.keys(files)) if (!saved.has(id)) removals++;
     }
-    return { source: this.knowledgeSource, synced: Object.keys(files).length, pending, hasStore: !!this.openaiKnowledge.vectorStoreId,
+    return { source: this.knowledgeSource, synced: Object.keys(files).length, pending, removals, hasStore: !!this.openaiKnowledge.vectorStoreId,
       ...(this.openaiKnowledge.syncedAt ? { syncedAt: this.openaiKnowledge.syncedAt } : {}),
       ...(this.knowledgeSync ? { syncing: this.knowledgeSync.progress } : {}), ...(this.knowledgeNotice ? { notice: this.knowledgeNotice } : {}) };
   }
@@ -291,6 +531,12 @@ export class G2ConversationController {
   /** Uploads new and changed sessions to the OpenAI vector store and removes deleted ones. User-triggered only. */
   public async syncOpenAIKnowledge(key: string): Promise<KnowledgeSyncProgress> {
     if (this.knowledgeSync) throw new Error("A knowledge sync is already running.");
+    // v0.13: with the History switch off, saved sessions are not read for answers and not uploaded either.
+    if (!this.localMemoryEnabled) {
+      this.knowledgeNotice = "The knowledge base may not read history. Turn on “Let the knowledge base read history” in History, then sync.";
+      this.emitHistory();
+      throw new Error(this.knowledgeNotice);
+    }
     const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
     const sync = { abort: new AbortController(), progress: { done: 0, total: 0, uploaded: 0, removed: 0, failed: 0 } };
     this.knowledgeSync = sync; this.knowledgeNotice = undefined; this.emitHistory();
@@ -383,7 +629,14 @@ export class G2ConversationController {
       this.openaiKnowledge = cleanOpenAIKnowledgeState(saved.state);
       this.knowledgeSource = saved.source === "openai" ? "openai" : "local";
     } catch { /* no knowledge base yet */ }
-    try { await this.history.load(); this.setHistoryStatus("History is saved only on this phone."); }
+    try { // v0.13 Omi auto-import switch and last outcome
+      const saved = JSON.parse(await this.bridge.getLocalStorage(OMI_AUTO_IMPORT_STORAGE_KEY) || "{}") as Record<string, unknown>;
+      const text = (value: unknown) => typeof value === "string" && value.length <= 600 ? value : undefined;
+      const lastAttemptAt = text(saved.lastAttemptAt), lastSuccessAt = text(saved.lastSuccessAt), lastError = text(saved.lastError);
+      this.autoImport = { enabled: saved.enabled === true, ...(lastAttemptAt ? { lastAttemptAt } : {}), ...(lastSuccessAt ? { lastSuccessAt } : {}), ...(lastError ? { lastError } : {}),
+        ...(typeof saved.lastImported === "number" && Number.isSafeInteger(saved.lastImported) ? { lastImported: saved.lastImported } : {}) };
+    } catch { /* auto-import stays off */ }
+    try { await this.history.load(); await this.tidyHistory(); this.setHistoryStatus("History is saved only on this phone."); }
     catch (error) { this.setHistoryStatus(errorMessage(error)); }
     this.presentation.setStatus("starting");
     this.unsubscribePresentation = this.presentation.subscribe((snapshot) => {
@@ -399,6 +652,7 @@ export class G2ConversationController {
     this.unsubscribeHub = this.bridge.onEvenHubEvent(this.handleEvenHubEvent);
     this.initialized = true;
     this.presentation.setStatus("ready");
+    void this.maybeAutoImport("startup"); // v0.13: no-op unless the Omi auto-import switch is on
     await this.offerResume();
   }
 
@@ -417,13 +671,21 @@ export class G2ConversationController {
     this.presentation.setStatus("connecting");
 
     const now = new Date().toISOString();
-    const session: HistorySession = { id: createId("session"), source: "helix", title: `Helix · ${now}`, startedAt: now, updatedAt: now };
+    // v0.13: tap-to-resume shortly after an interruption continues the interrupted session in History
+    // (the two records are merged when this one ends); anything else starts a new one.
+    const continues = this.resumeTarget(this.resumeFlag?.sessionId, Date.parse(now));
+    const session: HistorySession = { id: createId("session"), source: "helix", title: `Helix · ${now}`, startedAt: now, updatedAt: now, ...(continues ? { continues } : {}) };
     this.session = session;
     this.archiveSessionId = session.id;
+    this.startNotebook(session.id, continues ? this.resumeFlag?.sessionId : undefined, continues);
+    this.sessionKey = providerCredentials?.openai;
+    this.recordedSessionId = undefined;
     this.transcriptRevisions.clear();
     this.memoryByQuestion.clear();
     this.manualRevision = 0;
-    this.enqueueArchive(async () => { await this.history.upsertSession(session); });
+    // v0.13: no history record until something is said or answered (archiveEvent / flushSessionKnowledge
+    // save it with the first line). Connecting, resuming and reconnecting used to leave an empty
+    // "<1 min · 0 · 0" session behind each time.
     const transport = this.transportFactory({
       retrieveMemory: (query, sessionId) => this.localMemoryEnabled ? this.history.retrieve(query, { excludeSessionId: sessionId }) : [],
       retrieveMemoryWithStats: (query, sessionId) => this.localMemoryEnabled
@@ -439,7 +701,8 @@ export class G2ConversationController {
         this.memoryByQuestion.set(questionId ?? "", items);
         this.presentation.setMemorySources(items, questionId);
       },
-      factCheck: { enabled: () => this.webCheckEnabled, onResult: result => this.handleFactCheck(result) },
+      factCheck: { enabled: () => this.webCheckEnabled, onResult: result => this.handleFactCheck(result), news: () => this.config.newsSearch !== false },
+      answerLength: () => this.config.answerLength,
       insights: { enabled: () => this.autoExplainEnabled, onResult: result => this.handleInsight(result) },
       // v0.10: modes switch live (phone chips or the glasses menu) without reconnecting.
       mode: () => this.config.conversationMode,
@@ -450,7 +713,21 @@ export class G2ConversationController {
     this.transport = transport;
     // Respect the selection when the project can call it; otherwise switch visibly
     // (never silently) to the best accessible model and save that choice.
-    const accessible = providerCredentials?.openai ? await this.accessibleModels(providerCredentials.openai, transport, 1500) : undefined;
+    // The OpenAI model-list check only applies when OpenAI answers; a direct provider (DeepSeek, Qwen, GLM, Kimi)
+    // must never be "switched" to an OpenAI model. A model id from another provider's catalog is replaced visibly.
+    const directProvider = answerProviderInfo(config.answerProvider);
+    const direct = directProvider !== undefined && directProvider.api !== "openai";
+    if (direct) {
+      const model = providerModel(directProvider, config.model, "answer"), copilotModel = providerModel(directProvider, config.copilotModel, "copilot");
+      if (model !== config.model || copilotModel !== config.copilotModel) {
+        const changes = [model !== config.model ? `answers ${config.model} → ${model}` : "", copilotModel !== config.copilotModel ? `copilot ${config.copilotModel} → ${copilotModel}` : ""].filter(Boolean).join(", ");
+        this.presentation.notice(`model-provider-${session.id}`, "Model switched", `${directProvider.label} can't run the selected model. Using ${changes}. Change it in Setup.`);
+        config = { ...config, model, copilotModel };
+        this.config = config;
+        void this.saveSettings({ ...form, model, copilotModel }).catch(() => undefined);
+      }
+    }
+    const accessible = !direct && providerCredentials?.openai ? await this.accessibleModels(providerCredentials.openai, transport, 1500) : undefined;
     if (accessible) {
       const has = new Set(accessible);
       const model = has.has(config.model) ? config.model : firstAccessibleModel("answer", accessible) ?? config.model;
@@ -485,19 +762,15 @@ export class G2ConversationController {
       onListenerError: (error) => this.handleError(error),
     });
     this.client = client;
-    this.unsubscribeClientEvent = client.subscribe((event) => { this.presentation.apply(event); this.archiveEvent(event); });
+    this.unsubscribeClientEvent = client.subscribe((event) => { this.presentation.apply(event); this.archiveEvent(event); this.notebookTranscript(event); });
     this.unsubscribeClientState = client.subscribeState(this.handleClientState);
 
     try {
       await client.start({
         sessionId: session.id,
-        endpoint: {
-          id: "openai-direct",
-          url: "https://api.openai.com/v1/responses",
-          provider: "openai",
-          // Never substitute a different model: the selected id is sent as-is.
-          model: config.model,
-        },
+        // Provenance of the selected provider (OpenAI: id "openai-direct", .../v1/responses, provider "openai").
+        // Never substitute a different model: the selected id is sent as-is.
+        endpoint: directEndpoint(config.answerProvider, config.model),
         prompt: {
           id: config.promptId,
           version: config.promptVersion,
@@ -804,15 +1077,127 @@ export class G2ConversationController {
    * is stored as that session's summary, key facts and concepts.
    */
   public async generateSessionKnowledge(sessionId: string, key: string): Promise<void> {
+    if (!this.history.getSession(sessionId)) throw new Error("This session is no longer on this phone.");
+    const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
+    const model = this.digestModel();
+    await this.writeRecap(sessionId, model, session => summarizeSession(fetcher, key, model, session, { onUsage: usage => this.presentation.applyUsage(usage) }));
+  }
+
+  // ---- v0.13 post-conversation summary (title + overview + summary, with provenance) ----
+  /**
+   * One model call over a saved session's transcript; stores the title, the one-to-two sentence
+   * overview, the summary bullets, key facts and concepts, and who wrote them (model, prompt version,
+   * endpoint, latency, time). Rejects when the call fails: the stored fallback then stays.
+   */
+  private async writeRecap(sessionId: string, model: string, run: DigestRunner): Promise<void> {
     const record = this.openHistorySession(sessionId);
     if (!record) throw new Error("This session is no longer on this phone.");
-    const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
     const lines = record.entries.filter(entry => entry.kind === "transcript" && entry.text.trim()).map(entry => ({ speaker: entry.speaker?.trim() || "Speaker", text: entry.text }));
-    const digest = await summarizeSession(fetcher, key, this.config.copilotModel, { title: record.session.title, lines }, { onUsage: usage => this.presentation.applyUsage(usage) });
+    const started = Date.now();
+    // Only a real title is a hint: not the live placeholder, a first utterance, or the on-phone fallback.
+    const hint = record.session.recap?.origin === "fallback" || isAutoSessionTitle(record.session, record.entries) ? "" : record.session.title;
+    const digest = await run({ title: hint, lines });
+    const latencyMs = Date.now() - started, generatedAt = new Date().toISOString();
+    if (this.historyDeletions.has(sessionId) || !this.history.getSession(sessionId)) return;
+    const concepts = new Map((record.session.concepts ?? []).map(item => [item.split(/\s*(?::|—|–| - )\s+/u)[0]!.trim().toLowerCase(), item]));
+    for (const concept of digest.concepts) if (!concepts.has(concept.term.toLowerCase())) concepts.set(concept.term.toLowerCase(), joinConcept(concept.term, concept.explanation));
     await this.history.updateSessionKnowledge(sessionId, { summary: digest.summary, keyFacts: digest.keyFacts,
-      ...(digest.concepts.length ? { concepts: digest.concepts.map(concept => joinConcept(concept.term, concept.explanation)) } : {}) });
+      ...(concepts.size ? { concepts: [...concepts.values()].slice(-20) } : {}) });
+    const latest = this.openHistorySession(sessionId);
+    if (!latest) return;
+    await this.history.updateSessionRecap(sessionId, {
+      // Only a Helix conversation is titled by the summary; an imported note, Omi conversation or PDF keeps the title it came with.
+      ...(latest.session.source === "helix" ? { title: digest.title || fallbackSessionRecap(latest.session, latest.entries).title } : {}),
+      overview: digest.overview || digest.summary.slice(0, 2).join(" "),
+      recap: { origin: "model", generatedAt, model, provider: "openai", endpoint: SESSION_DIGEST_ENDPOINT, promptVersion: SESSION_DIGEST_PROMPT_VERSION, latencyMs },
+    });
+    this.titles.delete(sessionId);
     this.emitHistory();
   }
+  /**
+   * A session ended (Stop, disconnect, reconnect, exit). Local part, awaited: fold a resumed session
+   * into the one it continues, record the end time and a title derived on the phone. Then, not
+   * awaited: one summary call with the session's own key and the selected copilot model, which
+   * replaces that fallback; without a key, with too little speech, or when the call fails, the
+   * fallback stays (History → open the session → Generate summary retries).
+   */
+  private async finalizeSession(ended: HistorySession, run?: { model: string; digest: DigestRunner }): Promise<void> {
+    let id = ended.id;
+    try {
+      const saved = this.history.getSession(id);
+      if (!saved) return; // nothing was said or answered: no record and no summary call
+      if (saved.continues) id = await this.mergeContinuation(saved) ?? id;
+      const record = this.openHistorySession(id);
+      if (!record) return;
+      const endedAt = new Date().toISOString();
+      await this.history.updateSessionRecap(id, { endedAt, ...(record.session.recap ? {} : {
+        title: fallbackSessionRecap(record.session, record.entries).title, recap: { origin: "fallback" as const, generatedAt: endedAt } }) });
+      this.titles.delete(id);
+      this.emitHistory();
+      if (!run || !this.summarizeOnEnd || spokenChars(record.entries) < MIN_RECAP_TRANSCRIPT_CHARS) return;
+    } catch (error) { this.setHistoryStatus(errorMessage(error)); return; }
+    const job = this.writeRecap(id, run.model, run.digest).catch(() => undefined) // the fallback recap stays
+      .finally(() => { if (this.recapJobs.get(id) === job) this.recapJobs.delete(id); if (!this.disposed) this.emitHistory(); });
+    this.recapJobs.set(id, job);
+    this.emitHistory();
+  }
+  /** The session digest is an OpenAI Responses call with the OpenAI key; a direct provider's copilot model cannot run it. */
+  private digestModel(): string {
+    return answerProviderInfo(this.config.answerProvider)?.api === "chat" ? DEFAULT_COPILOT_MODEL : this.config.copilotModel;
+  }
+  /** The summary call for a session that is ending, bound to its transport (its fetch) and its key. */
+  private sessionDigestRunner(): { model: string; digest: DigestRunner } | undefined {
+    const key = this.sessionKey?.trim(), model = this.digestModel();
+    const transport = this.transport as (ConversationTransport & { summarizeSession?: (key: string, model: string, session: Parameters<DigestRunner>[0], options?: { onUsage?: (usage: UsageRecord) => void }) => Promise<SessionDigest> }) | undefined;
+    if (!key || !model || typeof transport?.summarizeSession !== "function") return undefined;
+    return { model, digest: session => transport.summarizeSession!(key, model, session, { onUsage: usage => { if (!this.disposed) this.presentation.applyUsage(usage); } }) };
+  }
+  /** The record a resume should continue: the interrupted session (or what it was merged into), if recent. */
+  private resumeTarget(sessionId: string | undefined, now: number): string | undefined {
+    if (!sessionId) return undefined;
+    const id = this.mergedInto.get(sessionId) ?? sessionId, session = this.history.getSession(id);
+    if (!session || session.source !== "helix") return undefined;
+    return now - Date.parse(session.updatedAt) <= RESUME_SAME_SESSION_MS ? session.continues ?? id : undefined;
+  }
+  /** Moves a resumed session's lines into the session it continues. Returns the surviving id. */
+  private async mergeContinuation(session: HistorySession): Promise<string | undefined> {
+    const target = session.continues ? this.mergedInto.get(session.continues) ?? session.continues : undefined;
+    if (!target || target === session.id || this.history.getSession(target)?.source !== "helix") return undefined;
+    // Oldest part first: an earlier part that was itself interrupted (and so never merged) goes in
+    // before this one, so the later notebook state and line order win.
+    const earlier = this.history.listSessions().filter(other => other.id !== session.id && other.id !== target && other.continues
+      && (this.mergedInto.get(other.continues) ?? other.continues) === target && Date.parse(other.startedAt) < Date.parse(session.startedAt))
+      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+    for (const part of earlier) {
+      try { await this.history.mergeSession(part.id, target); this.mergedInto.set(part.id, target); this.titles.delete(part.id); } catch { /* stays a separate record */ }
+    }
+    try { await this.history.mergeSession(session.id, target); } catch { return undefined; }
+    this.mergedInto.set(session.id, target); this.titles.delete(target); this.titles.delete(session.id);
+    return target;
+  }
+  /**
+   * Startup clean-up of what earlier versions left behind: Helix records with nothing in them (one was
+   * saved at every Connect / resume) are pruned, and a resumed session that was itself interrupted is
+   * folded into the session it continues. Imported title-only records and unreadable shards are kept.
+   */
+  private async tidyHistory(): Promise<void> {
+    try {
+      const empty = this.history.emptySessionIds("helix");
+      if (empty.length) await this.history.deleteSessions(empty);
+      const resumed = this.history.listSessions().filter(session => session.continues).sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+      for (const session of resumed) await this.mergeContinuation(session);
+    } catch { /* history stays as stored */ }
+  }
+  private readonly titles = new Map<string, { stamp: string; title: string }>();
+  /** Title to show for a session anywhere on the phone (generated, imported, or the on-phone fallback). Cached per change. */
+  public historyTitle(session: HistorySession): string {
+    const stamp = `${this.history.entryCount(session.id)}|${session.title}|${session.recap?.generatedAt ?? ""}|${session.summary?.[0] ?? ""}`, cached = this.titles.get(session.id);
+    if (cached?.stamp === stamp) return cached.title;
+    const title = sessionRecap(session, session.recap ? [] : this.history.getEntries(session.id)).title;
+    this.titles.set(session.id, { stamp, title });
+    return title;
+  }
+  // ---- end post-conversation summary ----
   /** v0.11: edit (or reset with "") the system prompt of one mode; applies to the next answer. */
   public setModePrompt(mode: ConversationMode, prompt: string): Promise<void> {
     const prompts = { ...this.config.modePrompts };
@@ -831,6 +1216,13 @@ export class G2ConversationController {
     if (this.client || !this.resumeHandler) return;
     this.presentation.setInteraction("CONNECTING");
     await this.resumeHandler({ connected: true, listening: true, at: Date.now() });
+  }
+  /** Setup → Test provider key: one tiny completion against the selected direct provider (DeepSeek, Qwen, GLM, Kimi). */
+  public async testProviderKey(providerId: string, key: string, model: string): Promise<ProviderKeyTestResult> {
+    const provider = answerProviderInfo(providerId);
+    if (!provider || provider.api === "openai") return { status: "error", message: "Select DeepSeek, Qwen, Zhipu GLM or Moonshot Kimi as the answer provider first.", model };
+    const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
+    return testProviderKey(fetcher, provider, key, providerModel(provider, model, "answer"));
   }
   /** Test seam for testKey; production uses the global fetch. */
   public keyTestFetch?: (url: string, init?: RequestInit) => Promise<Response>;
@@ -854,6 +1246,8 @@ export class G2ConversationController {
       onClaim: claim => { if (live()) this.presentation.applyClaim(claim); },
       // v0.8 People (phone agent): live People tab + persisted session people.
       onPerson: person => { if (live()) { this.presentation.applyPerson(person); this.noteSessionPerson(sessionId, person); } },
+      // Notes mode: the copilot edits the session notebook (to-do operations, running notes).
+      notebook: () => live() ? this.notebook : undefined,
     };
   }
 
@@ -896,6 +1290,7 @@ export class G2ConversationController {
   /** Queues summary/keyFacts/people/concepts into the session's history record (after its upsert). */
   public flushSessionKnowledge(): void {
     if (this.knowledgeTimer !== undefined) { clearTimeout(this.knowledgeTimer); this.knowledgeTimer = undefined; }
+    this.flushNotebook();
     for (const [sessionId, draft] of this.knowledgeDrafts) {
       if (this.historyDeletions.has(sessionId)) { this.knowledgeDrafts.delete(sessionId); continue; }
       const patch: SessionKnowledge = {
@@ -909,9 +1304,16 @@ export class G2ConversationController {
       if (!Object.keys(patch).length) continue;
       // The live record may still be in the store's pending (coalesced) write, where the update is validated.
       const live = this.archiveSessionId === sessionId;
+      // v0.13: the record is saved with its first content. Knowledge can be that first content (a
+      // rehearsal, or speech the copilot summarised before a line was archived), so save it here too.
+      const record = live && this.session?.id === sessionId && Object.values(patch).some(value => Array.isArray(value) && value.length) ? this.session : undefined;
+      if (record) this.recordedSessionId = sessionId;
+      const recorded = this.recordedSessionId === sessionId;
       this.enqueueArchive(async () => {
-        if (this.historyDeletions.has(sessionId) || (!live && !this.history.listSessions().some(session => session.id === sessionId))) return;
-        await this.history.updateSessionKnowledge(sessionId, patch);
+        if (this.historyDeletions.has(sessionId)) return;
+        if (!record && !(live ? recorded : this.history.getSession(sessionId))) return;
+        // Issued together: both land in the same (coalesced) write, the record first.
+        await Promise.all([record ? this.history.upsertSession(record) : undefined, this.history.updateSessionKnowledge(sessionId, patch)]);
       });
     }
   }
@@ -933,13 +1335,18 @@ export class G2ConversationController {
   }
   public sessionMarkdown(id: string): string | undefined {
     const record = this.openHistorySession(id);
-    return record ? toSessionMarkdown(record.session, record.entries) : undefined;
+    return record ? toSessionMarkdown(this.titled(record.session), record.entries) : undefined;
+  }
+  /** The session with the title History shows (exports and the knowledge base never carry a placeholder title). */
+  private titled(session: HistorySession): HistorySession {
+    const title = this.historyTitle(session);
+    return title === session.title ? session : { ...session, title };
   }
   /** Obsidian vault bundle: one note per session (all sessions, or `ids`). */
   public vaultFiles(ids?: readonly string[]): MarkdownFile[] {
     const wanted = ids ? new Set(ids) : undefined;
     const sessions = this.history.listSessions().filter(session => !wanted || wanted.has(session.id));
-    return sessions.length ? toVaultFiles(sessions.map(session => ({ session, entries: this.history.getEntries(session.id) }))) : [];
+    return sessions.length ? toVaultFiles(sessions.map(session => ({ session: this.titled(session), entries: this.history.getEntries(session.id) }))) : [];
   }
   /** Obsidian -> Helix: parse .md notes and store them as source "obsidian" sessions. */
   public async importMarkdownFiles(files: readonly { name: string; text: string }[]): Promise<{ imported: number; sessionIds: string[]; failed: { name: string; error: string }[] }> {
@@ -949,6 +1356,8 @@ export class G2ConversationController {
     for (const file of files.slice(0, 200)) {
       try { parsed.push(markdownSession(file.name, file.text)); } catch (error) { failed.push({ name: file.name, error: errorMessage(error) }); }
     }
+    // v0.13: files past the batch limit are reported, not silently dropped.
+    for (const file of files.slice(200)) failed.push({ name: file.name, error: "Only 200 notes can be imported at once. Import this one in the next batch." });
     const sessionIds: string[] = [];
     await this.archiveQueue;
     this.bulkHistoryWrites++; this.syncHistoryWriteDelay();
@@ -998,8 +1407,11 @@ export class G2ConversationController {
     this.rehearsal?.stop();
     this.cancelInsights();
     this.cancelFactChecks();
+    // v0.13: what ended, and the summary call bound to its transport and key (both are released below).
+    const ended = this.session, digest = ended ? this.sessionDigestRunner() : undefined;
     this.session = undefined;
     this.archiveSessionId = undefined;
+    this.sessionKey = undefined;
     this.cancelClick();
     this.presentation.setStatus("stopped");
     this.holding = false;
@@ -1009,6 +1421,7 @@ export class G2ConversationController {
     if (hadClient) this.clearLifecycle(); // a user disconnect is not an interrupted session
     await this.archiveQueue;
     this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined); // failures are reported in history status
+    if (ended) await this.finalizeSession(ended, digest);
     if (this.initialized && !this.disposed) this.presentation.setStatus("ready");
   }
 
@@ -1018,9 +1431,12 @@ export class G2ConversationController {
     this.disposed = true;
     this.cancelInsights();
     this.cancelImport();
+    this.cancelPdfImport(); if (this.autoImportTimer !== undefined) { clearInterval(this.autoImportTimer); this.autoImportTimer = undefined; } // v0.13
     this.cancelFactChecks();
+    const ended = this.session, digest = ended ? this.sessionDigestRunner() : undefined;
     this.session = undefined;
     this.archiveSessionId = undefined;
+    this.sessionKey = undefined;
     this.cancelClick();
     this.presentation.setStatus("exited");
     this.unsubscribeHub?.();
@@ -1035,6 +1451,8 @@ export class G2ConversationController {
       await this.releaseClient("shutdown");
       await this.archiveQueue;
       this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined);
+      // The page may be going away: the on-phone title is saved first; the summary call may not finish.
+      if (ended) await this.finalizeSession(ended, digest);
       this.historyListeners.clear();
     } finally {
       this.holding = false;
@@ -1135,6 +1553,68 @@ export class G2ConversationController {
   }
   // ---- end v0.10 modes ----
 
+  // ---- Notes mode: session notebook (to-do list + running notes) ----
+  private notebook?: SessionNotebook;
+  private readonly notebookDrafts = new Map<string, SessionNotebookData>();
+  /** One notebook per live session; every change reaches the phone, the glasses (confirmation) and the session's history record. */
+  private startNotebook(sessionId: string, interruptedId?: string, continuesId?: string): void {
+    this.notebookDrafts.delete(sessionId);
+    // A resumed session continues the notebook of the conversation it belongs to: the interrupted part's
+    // lists when it had any (it started from the earlier ones), else those of the session it continues.
+    const interrupted = interruptedId ? this.history.getSession(interruptedId) : undefined, root = continuesId ? this.history.getSession(continuesId) : undefined;
+    const todos = interrupted?.todos ?? root?.todos ?? [], notes = interrupted?.notes ?? root?.notes ?? [];
+    if (todos.length || notes.length) this.presentation.applyNotebook(todos, notes);
+    this.notebook = new SessionNotebook({ todos, notes, onChange: event => {
+      if (this.session?.id !== sessionId || this.disposed) return;
+      this.presentation.applyNotebook(event.todos, event.notes, this.exiting ? undefined : event.confirmation);
+      this.notebookDrafts.set(sessionId, { todos: [...event.todos], notes: [...event.notes] });
+      this.scheduleKnowledgeFlush();
+    } });
+  }
+  /** Spoken to-do commands ("add a to-do ...", "mark the vendor call done") while Notes mode is on. */
+  private notebookTranscript(event: GatewayEvent): void {
+    if (event.type !== "transcript.final" || !this.notebook || event.sessionId !== this.session?.id) return;
+    if (modeProfile(this.config.conversationMode).presets.noteTaking !== true) return;
+    try { this.notebook.handleTranscript(event.transcriptId, event.text, event.context.speaker); } catch (error) { console.warn("Helix to-do command failed", error); }
+  }
+  /** Queues the notebook into the session's history record (same queue and debounce as session knowledge). */
+  private flushNotebook(): void {
+    for (const [sessionId, patch] of this.notebookDrafts) {
+      this.notebookDrafts.delete(sessionId);
+      if (this.historyDeletions.has(sessionId)) continue;
+      const live = this.archiveSessionId === sessionId;
+      // v0.13: the record is saved with its first content, and a to-do or note can be that first content
+      // (added on the phone, or captured before any line was archived): save the record here too. A
+      // resumed session that emptied the lists it started from is saved as well, so the merge sees it.
+      const record = live && this.session?.id === sessionId && (patch.todos?.length || patch.notes?.length || this.session.continues) ? this.session : undefined;
+      if (record) this.recordedSessionId = sessionId;
+      const recorded = this.recordedSessionId === sessionId;
+      this.enqueueArchive(async () => {
+        if (this.historyDeletions.has(sessionId)) return;
+        if (!record && !(live ? recorded : this.history.getSession(sessionId))) return;
+        // Issued together: both land in the same (coalesced) write, the record first.
+        await Promise.all([record ? this.history.upsertSession(record) : undefined, this.history.updateSessionNotebook(sessionId, patch)]);
+      });
+    }
+  }
+  /**
+   * Phone edit of a to-do list (add / update / complete / remove / move): the live session's notebook,
+   * or a saved session in History. Resolves false when nothing changed.
+   */
+  public async editTodo(op: TodoOp, sessionId?: string): Promise<boolean> {
+    const id = sessionId ?? this.session?.id;
+    if (!id) return false;
+    if (this.session?.id === id && this.notebook) return this.notebook.apply(op, { origin: "user" }) !== undefined;
+    const saved = this.history.getSession(id);
+    if (!saved) return false;
+    const result = applyTodoOp(saved.todos ?? [], op, { origin: "user" });
+    if (!result.change) return false;
+    await this.history.updateSessionNotebook(id, { todos: result.list });
+    this.emitHistory();
+    return true;
+  }
+  // ---- end Notes mode ----
+
   /** Phone -> glasses: move the HUD to `view` (e.g. when a phone tab is tapped). */
   public setHudView(view: HudView): void {
     if (this.disposed || this.exiting) return;
@@ -1204,7 +1684,7 @@ export class G2ConversationController {
       const raw = await this.bridge.getLocalStorage(LIFECYCLE_STORAGE_KEY);
       const parsed = raw ? JSON.parse(raw) as Partial<LifecycleFlag> : undefined;
       if (parsed?.connected && typeof parsed.at === "number" && Date.now() - parsed.at < LIFECYCLE_MAX_AGE_MS) {
-        flag = { connected: true, listening: !!parsed.listening, at: parsed.at };
+        flag = { connected: true, listening: !!parsed.listening, at: parsed.at, ...(typeof parsed.sessionId === "string" && parsed.sessionId ? { sessionId: parsed.sessionId } : {}) };
       }
     } catch { /* unreadable flag: no prompt */ }
     if (!flag || this.client) return;
@@ -1215,7 +1695,7 @@ export class G2ConversationController {
   private persistLifecycle(): void {
     const connected = this.client?.state === "active";
     if (!connected) return;
-    this.writeLifecycle(JSON.stringify({ connected: true, listening: this.micOn, at: Date.now() }));
+    this.writeLifecycle(JSON.stringify({ connected: true, listening: this.micOn, at: Date.now(), ...(this.session ? { sessionId: this.session.continues ?? this.session.id } : {}) }));
   }
 
   private clearLifecycle(): void { this.writeLifecycle(""); }
@@ -1340,9 +1820,10 @@ export class G2ConversationController {
       metadata: { model: event.context.endpoint.model, provider: event.context.endpoint.provider, endpoint: event.context.endpoint.url,
         promptVersion: event.context.prompt.version, latencyMs: String(event.context.latencyMs.totalMs),
         ...(memory?.length ? { memoryEntryIds: JSON.stringify(memory.map(item => item.entry.id)) } : {}) } };
+    // v0.13: the title stays the placeholder while live (History shows a derived one); the real title is
+    // written from the summary when the session ends, never from the first thing that was said.
     const updated = { ...session, updatedAt: event.occurredAt };
-    if (session.title.startsWith("Helix ·") && kind === "transcript") updated.title = event.text.slice(0, 100);
-    this.session = updated;
+    this.session = updated; this.recordedSessionId = session.id;
     this.enqueueArchive(() => Promise.all([this.history.upsertSession(updated), this.history.upsertEntries([entry])]));
   }
   private handleFactCheck(result: FactCheckResult): void {
@@ -1352,7 +1833,7 @@ export class G2ConversationController {
     this.presentation.applyFactCheck(result, !this.holding && claimRevision !== undefined && claimRevision >= this.manualRevision);
     if (this.archiveSessionId !== session.id || this.historyDeletions.has(session.id)) return;
     const updated = { ...session, updatedAt: result.checkedAt };
-    this.session = updated;
+    this.session = updated; this.recordedSessionId = session.id;
     this.enqueueArchive(() => Promise.all([this.history.upsertSession(updated),
       this.history.upsertEntries([{ id: `${session.id}:${result.id}`, sessionId: session.id, kind: "fact-check",
         text: `${result.claim}\n${result.summary}`, occurredAt: this.uniqueEntryTime(result.checkedAt), sources: result.sources,

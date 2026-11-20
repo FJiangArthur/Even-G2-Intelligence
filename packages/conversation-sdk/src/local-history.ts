@@ -1,4 +1,5 @@
 import type { KnowledgeSource } from "./copilot-types.js";
+import { MAX_SESSION_NOTES, MAX_TODOS, cleanSessionNotes, cleanTodos, sameTodoText, type SessionNote, type TodoItem } from "./todo-list.js";
 
 /** Storage is provided by the phone host; no network or provider credentials are involved. */
 export interface HistoryStorage {
@@ -11,7 +12,27 @@ export interface HistorySession {
   id: string; source: KnowledgeSource; title: string; startedAt: string; updatedAt: string;
   /** v0.8 session knowledge (all optional; <= 20 items of <= 500 chars each). */
   summary?: string[]; keyFacts?: string[]; people?: SessionPerson[]; concepts?: string[]; tags?: string[];
+  /** Notes mode: the session's to-do list (<= 60 items) and running notes (<= 80), saved with the session. */
+  todos?: TodoItem[]; notes?: SessionNote[];
+  /** v0.13 post-conversation recap: a one-to-two sentence summary shown on the History card (<= 500 chars). */
+  overview?: string;
+  /** When the session ended (Stop / disconnect). Absent for interrupted and imported sessions. */
+  endedAt?: string;
+  /** Provenance of `title` + `overview` (+ `summary` when the model wrote it). Absent: the title is not a generated one. */
+  recap?: SessionRecapMeta;
+  /** Id of the session this one continues after an interruption (tap to resume). Merged by mergeSession. */
+  continues?: string;
 }
+/** Who wrote a session's title/overview and when. `fallback` = derived on the phone without a model call. */
+export interface SessionRecapMeta {
+  origin: "model" | "fallback"; generatedAt: string;
+  model?: string; provider?: string; endpoint?: string; promptVersion?: string; latencyMs?: number;
+}
+/** Recap fields of a session, set together by updateSessionRecap. Absent fields keep the stored value. */
+export type SessionRecap = Partial<Pick<HistorySession, "title" | "overview" | "endedAt" | "recap">>;
+const RECAP_KEYS = ["overview", "endedAt", "recap", "continues"] as const;
+/** Notes-mode fields of a session. In updateSessionNotebook and upsertSession, an absent field keeps the stored value; [] clears it. */
+export type SessionNotebookData = Pick<HistorySession, "todos" | "notes">;
 /** Knowledge fields of a session. In updateSessionKnowledge and upsertSession, an absent field keeps the stored value; [] clears it. */
 export type SessionKnowledge = Pick<HistorySession, "summary" | "keyFacts" | "people" | "concepts" | "tags">;
 export interface PersonAggregate {
@@ -138,9 +159,48 @@ function cleanKnowledge(value: Record<string, unknown>): SessionKnowledge {
   }
   return result;
 }
+const NOTEBOOK_KEYS = ["todos", "notes"] as const;
+/** Validated to-dos and notes present in `value` (invalid items are dropped, not fatal). */
+function cleanNotebook(value: Record<string, unknown>): SessionNotebookData {
+  const result: SessionNotebookData = {};
+  const todos = value.todos === undefined ? undefined : cleanTodos(value.todos), notes = value.notes === undefined ? undefined : cleanSessionNotes(value.notes);
+  if (todos) result.todos = todos;
+  if (notes) result.notes = notes;
+  return result;
+}
+function cleanRecapMeta(value: unknown): SessionRecapMeta | undefined {
+  if (!record(value) || (value.origin !== "model" && value.origin !== "fallback") || !date(value.generatedAt)) return undefined;
+  const result: SessionRecapMeta = { origin: value.origin, generatedAt: value.generatedAt };
+  for (const key of ["model", "provider", "promptVersion"] as const) { const text = knowledgeText(value[key]).slice(0, 120); if (text) result[key] = text; }
+  const endpoint = safeUrl(value.endpoint);
+  if (endpoint) { const url = new URL(endpoint); url.search = ""; url.hash = ""; result.endpoint = url.toString(); }
+  if (typeof value.latencyMs === "number" && Number.isFinite(value.latencyMs) && value.latencyMs >= 0) result.latencyMs = Math.min(Math.round(value.latencyMs), 3_600_000);
+  return result;
+}
+/** Validated v0.13 recap fields present in `value` (invalid shapes are dropped, not fatal). */
+function cleanRecap(value: Record<string, unknown>): Pick<HistorySession, typeof RECAP_KEYS[number]> {
+  const result: Pick<HistorySession, typeof RECAP_KEYS[number]> = {};
+  const overview = knowledgeText(value.overview); if (overview) result.overview = overview;
+  if (date(value.endedAt)) result.endedAt = value.endedAt;
+  const recap = cleanRecapMeta(value.recap); if (recap) result.recap = recap;
+  if (string(value.continues) && value.continues.length <= 2048) result.continues = value.continues;
+  return result;
+}
+/**
+ * One notebook list of a session (`into`) and of its continuation (`from`, the later state, which
+ * started from a copy of `into`). `from` wins; an earlier item it no longer has was removed there and
+ * stays removed, unless it was added or edited on the saved session after the continuation started.
+ * `from` undefined: the continuation never changed the list.
+ */
+function mergeNotebookList<T extends { id: string; text: string }>(into: readonly T[] | undefined, from: readonly T[] | undefined, stamp: (item: T) => string, fromStartedAt: string, max: number): T[] | undefined {
+  if (from === undefined) return into ? [...into] : undefined;
+  const cut = Date.parse(fromStartedAt), ids = new Set(from.map(item => item.id));
+  const kept = (into ?? []).filter(item => !ids.has(item.id) && Date.parse(stamp(item)) > cut && !from.some(other => sameTodoText(other.text, item.text)));
+  return [...kept, ...from].slice(-max);
+}
 function cleanSession(value: unknown): HistorySession {
   if (!record(value) || !string(value.id) || !KNOWLEDGE_SOURCES.includes(value.source as KnowledgeSource) || typeof value.title !== "string" || !date(value.startedAt) || !date(value.updatedAt)) throw invalid();
-  return { id: value.id, source: value.source as KnowledgeSource, title: value.title, startedAt: value.startedAt, updatedAt: value.updatedAt, ...cleanKnowledge(value) };
+  return { id: value.id, source: value.source as KnowledgeSource, title: value.title, startedAt: value.startedAt, updatedAt: value.updatedAt, ...cleanKnowledge(value), ...cleanNotebook(value), ...cleanRecap(value) };
 }
 function cleanEntry(value: unknown): HistoryEntry {
   if (!record(value) || !string(value.id) || !string(value.sessionId) || typeof value.kind !== "string" || !["transcript", "question", "answer", "fact-check"].includes(value.kind) || !string(value.text) || !date(value.occurredAt)) throw invalid();
@@ -571,7 +631,9 @@ export class LocalHistoryStore {
       const index = draft.sessions.findIndex(s => s.id === clean.id), sessions = draft.writableSessions();
       if (index < 0) { sessions.push(clean); return; }
       const old = sessions[index]!, merged: HistorySession = { ...clean };
-      for (const key of KNOWLEDGE_KEYS) if (merged[key] === undefined && old[key] !== undefined) (merged as unknown as Record<string, unknown>)[key] = old[key];
+      for (const key of [...KNOWLEDGE_KEYS, ...NOTEBOOK_KEYS, ...RECAP_KEYS]) if (merged[key] === undefined && old[key] !== undefined) (merged as unknown as Record<string, unknown>)[key] = old[key];
+      // A generated title (it has a recap) is not replaced by the live placeholder of the same session.
+      if (old.recap && !clean.recap) merged.title = old.title;
       sessions[index] = merged;
     });
   }
@@ -592,6 +654,81 @@ export class LocalHistoryStore {
         if (value.length) (session as unknown as Record<string, unknown>)[key] = value; else delete session[key];
       }
       draft.writableSessions()[index] = session;
+    });
+  }
+  /**
+   * Notes mode: sets the to-do list and/or running notes of an existing session (validated and bounded).
+   * Absent fields are kept, [] clears. Does not change updatedAt or entries.
+   */
+  async updateSessionNotebook(id: string, patch: SessionNotebookData): Promise<void> {
+    if (!record(patch)) throw new Error("Session notebook must be an object.");
+    const clean = cleanNotebook(patch as Record<string, unknown>);
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === id);
+      if (index < 0) throw new Error("Cannot update the notebook of a session that is not saved.");
+      const session: HistorySession = { ...draft.sessions[index]! };
+      for (const key of NOTEBOOK_KEYS) {
+        const value = clean[key];
+        if (value === undefined) continue;
+        // A continuation keeps an emptied list as []: mergeSession must know it was emptied, not untouched.
+        if (value.length || session.continues) (session as unknown as Record<string, unknown>)[key] = value; else delete session[key];
+      }
+      draft.writableSessions()[index] = session;
+    });
+  }
+  /**
+   * v0.13: sets the generated title, overview, end time and their provenance on an existing session.
+   * Absent fields are kept; an empty title is ignored. Does not change updatedAt or entries.
+   */
+  async updateSessionRecap(id: string, patch: SessionRecap): Promise<void> {
+    if (!record(patch)) throw new Error("Session recap must be an object.");
+    const clean = cleanRecap(patch as Record<string, unknown>), title = knowledgeText(patch.title).slice(0, 120);
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === id);
+      if (index < 0) throw new Error("Cannot update the recap of a session that is not saved.");
+      draft.writableSessions()[index] = { ...draft.sessions[index]!, ...(title ? { title } : {}), ...clean };
+    });
+  }
+  /**
+   * v0.13: sessions with nothing in them (no entries, no summary/key facts/people/concepts, no to-dos/notes), newest first.
+   * Unreadable shards are not empty: their entries are only unavailable. Neither is a continuation
+   * that emptied its notebook (todos/notes stored as []): merging it is what removes those items.
+   */
+  emptySessionIds(source?: KnowledgeSource): string[] {
+    return this.listSessions().filter(s => (!source || s.source === source) && !this.corrupt.has(s.id) && !this.entryCount(s.id)
+      && !s.summary?.length && !s.keyFacts?.length && !s.people?.length && !s.concepts?.length && !s.todos?.length && !s.notes?.length && !(s.continues && (s.todos || s.notes))).map(s => s.id);
+  }
+  /**
+   * v0.13: moves every entry of `fromId` into `intoId` and removes `fromId` (one conversation that was
+   * split by an interruption). The target keeps its id and title, spans both time ranges, and gets the
+   * union of the knowledge fields and one notebook (the continuation's to-dos and notes are the later
+   * state: nothing is lost or listed twice); its generated recap is dropped because it no longer covers the session.
+   */
+  mergeSession(fromId: string, intoId: string): Promise<void> {
+    return this.mutate(draft => {
+      const from = draft.sessions.find(s => s.id === fromId), intoIndex = draft.sessions.findIndex(s => s.id === intoId);
+      if (!from || intoIndex < 0 || fromId === intoId) throw new Error("Cannot merge sessions that are not saved.");
+      if (this.corrupt.has(fromId)) throw invalid(); // an unreadable shard stays as stored
+      const into = draft.sessions[intoIndex]!, moved = [...draft.list(fromId)];
+      const target = draft.writableList(intoId);
+      draft.dropList(fromId);
+      for (const entry of moved) { target.push({ ...entry, sessionId: intoId }); draft.setOwner(entry.id, intoId); }
+      const merged: HistorySession = { ...into,
+        startedAt: Date.parse(from.startedAt) < Date.parse(into.startedAt) ? from.startedAt : into.startedAt,
+        updatedAt: Date.parse(from.updatedAt) > Date.parse(into.updatedAt) ? from.updatedAt : into.updatedAt };
+      for (const key of KNOWLEDGE_KEYS) {
+        const joined = key === "people" ? cleanPeople([...(into.people ?? []), ...(from.people ?? [])]) : cleanStrings([...(into[key] ?? []), ...(from[key] ?? [])]);
+        if (joined?.length) (merged as unknown as Record<string, unknown>)[key] = joined; else delete merged[key];
+      }
+      const todos = mergeNotebookList(into.todos, from.todos, item => item.updatedAt, from.startedAt, MAX_TODOS);
+      const notes = mergeNotebookList(into.notes, from.notes, item => item.createdAt, from.startedAt, MAX_SESSION_NOTES);
+      if (todos?.length) merged.todos = todos; else delete merged.todos;
+      if (notes?.length) merged.notes = notes; else delete merged.notes;
+      delete merged.overview; delete merged.recap; delete merged.endedAt;
+      if (from.endedAt) merged.endedAt = from.endedAt;
+      const sessions = draft.writableSessions();
+      sessions[intoIndex] = merged;
+      sessions.splice(sessions.findIndex(s => s.id === fromId), 1);
     });
   }
   /** v0.8 People tab: people across all sessions, merged by normalized name, most mentioned first. */
@@ -639,6 +776,28 @@ export class LocalHistoryStore {
         const target = draft.writableList(entry.sessionId);
         if (owner !== undefined) { const from = draft.writableList(owner), i = from.findIndex(e => e.id === entry.id); if (i >= 0) from.splice(i, 1); }
         target.push(entry); draft.setOwner(entry.id, entry.sessionId);
+      }
+    });
+  }
+  /**
+   * v0.13: stores a whole document (session + all of its entries) as ONE save, replacing an earlier
+   * copy of the same session id. All or nothing: when the save fails (for example the 5 MiB cap),
+   * neither the new session nor a half-written one exists and the earlier copy is untouched.
+   */
+  async replaceSession(session: HistorySession, entries: HistoryEntry[]): Promise<void> {
+    if (!Array.isArray(entries)) throw invalid();
+    const clean = cleanSession(session), cleaned = [...new Map(entries.map(cleanEntry).map(entry => [entry.id, entry])).values()];
+    if (cleaned.some(entry => entry.sessionId !== clean.id)) throw new Error("Cannot save history entries without their session.");
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === clean.id), sessions = draft.writableSessions();
+      if (index < 0) sessions.push(clean); else sessions[index] = clean;
+      draft.dropList(clean.id);
+      const list = draft.writableList(clean.id);
+      for (const entry of cleaned) {
+        // Entry ids are archive-wide: an id saved under another session moves here.
+        const owner = draft.ownerOf(entry.id);
+        if (owner !== undefined && owner !== clean.id) { const from = draft.writableList(owner), i = from.findIndex(e => e.id === entry.id); if (i >= 0) from.splice(i, 1); }
+        list.push(entry); draft.setOwner(entry.id, clean.id);
       }
     });
   }
@@ -744,11 +903,16 @@ export class LocalHistoryStore {
     return result.sort((a, b) => b.score - a.score || Date.parse(b.entry.occurredAt) - Date.parse(a.entry.occurredAt) || a.entry.id.localeCompare(b.entry.id));
   }
   /** Drops the session from the index, then clears its shard. */
-  deleteSession(id: string): Promise<void> {
+  deleteSession(id: string): Promise<void> { return this.deleteSessions([id]); }
+  /** v0.13: drops several sessions in one save (one index write), then clears their shards. */
+  deleteSessions(ids: readonly string[]): Promise<void> {
+    const wanted = [...new Set(ids)];
     return this.mutate(draft => {
-      const index = draft.sessions.findIndex(s => s.id === id);
-      if (index >= 0) draft.writableSessions().splice(index, 1);
-      draft.dropList(id);
+      for (const id of wanted) {
+        const index = draft.sessions.findIndex(s => s.id === id);
+        if (index >= 0) draft.writableSessions().splice(index, 1);
+        draft.dropList(id);
+      }
     });
   }
   /** Single-file export in the v1 snapshot format ({ version: 1, sessions, entries }). */

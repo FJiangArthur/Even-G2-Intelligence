@@ -82,7 +82,7 @@ function seed(presentation: ConversationPresentation): void {
 }
 
 async function mount(options: ConstructorParameters<typeof GlassesHud>[1] = {}, bridge = new PageBridge()) {
-  const hud = new GlassesHud(bridge, { tickMs: 0, writeGapMs: 0, captionIntervalMs: 500, ...options });
+  const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0, writeGapMs: 0, captionIntervalMs: 500, ...options });
   const presentation = new ConversationPresentation();
   presentation.subscribe(snapshot => hud.render(snapshot.glasses, snapshot));
   await hud.initialize();
@@ -280,7 +280,7 @@ describe("v0.8 verify through the real controller", () => {
       onEvenHubEvent: (callback: (event: EvenHubEvent) => void) => { listener = callback; return () => { listener = undefined; }; },
     });
     const presentation = new ConversationPresentation();
-    const hud = new GlassesHud(bridge, { tickMs: 0 });
+    const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0 });
     let transport: DirectConversationTransport | undefined;
     const controller = new G2ConversationController(bridge, hud, presentation,
       (options?: DirectConversationOptions) => (transport = new DirectConversationTransport({ ...options, fetch: fake.fetch } as DirectConversationOptions)));
@@ -443,7 +443,7 @@ describe("v0.8 glasses -> phone mirror", () => {
       shutDownPageContainer: async () => true, onEvenHubEvent: () => () => undefined,
     });
     const presentation = new ConversationPresentation();
-    const hud = new GlassesHud(bridge, { tickMs: 0 });
+    const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0 });
     const controller = new G2ConversationController(bridge, hud, presentation);
     await controller.initialize();
     await vi.waitFor(() => expect(presentation.snapshot().hud?.view).toBe("live"));
@@ -474,7 +474,7 @@ describe("v0.8 glasses lifecycle", () => {
     const failing = new PageBridge();
     failing.createResult = StartUpPageCreateResult.invalid;
     failing.rebuildOk = false;
-    await expect(new GlassesHud(failing, { tickMs: 0 }).initialize()).rejects.toThrow(/startup page creation failed with result 1/u);
+    await expect(new GlassesHud(failing, { display: "always-on", tickMs: 0 }).initialize()).rejects.toThrow(/startup page creation failed with result 1/u);
   });
 
   it("re-push redraws the current page (HUD or MENU) with the OS menu", async () => {
@@ -507,7 +507,7 @@ describe("v0.8 glasses lifecycle", () => {
       onEvenHubEvent: (callback: (event: EvenHubEvent) => void) => { listener = callback; return () => { listener = undefined; }; },
     });
     const presentation = new ConversationPresentation();
-    const hud = new GlassesHud(bridge, { tickMs: 0 });
+    const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0 });
     let transport: DirectConversationTransport | undefined;
     const controller = new G2ConversationController(bridge, hud, presentation,
       (options?: DirectConversationOptions) => (transport = new DirectConversationTransport({ ...options, fetch: fake.fetch } as DirectConversationOptions)));
@@ -558,7 +558,7 @@ describe("v0.8 glasses lifecycle", () => {
     });
     bridge.createResult = StartUpPageCreateResult.invalid; // the page survived the reclaim
     const presentation = new ConversationPresentation();
-    const hud = new GlassesHud(bridge, { tickMs: 0 });
+    const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0 });
     const controller = new G2ConversationController(bridge, hud, presentation);
     const resumed: unknown[] = [];
     controller.setResumeHandler(flag => { resumed.push(flag); });
@@ -577,7 +577,7 @@ describe("v0.8 glasses lifecycle", () => {
     // Stale or missing flags offer nothing.
     storage.set(LIFECYCLE_STORAGE_KEY, JSON.stringify({ connected: true, listening: false, at: Date.now() - 13 * 3600_000 }));
     const fresh = new ConversationPresentation();
-    const again = new G2ConversationController(bridge, new GlassesHud(bridge, { tickMs: 0 }), fresh);
+    const again = new G2ConversationController(bridge, new GlassesHud(bridge, { display: "always-on", tickMs: 0 }), fresh);
     await again.initialize();
     expect(fresh.snapshot().glasses.resumePrompt).toBeUndefined();
     // v0.11.1: an action while not connected offers the one-tap connect instead of only failing.
@@ -600,7 +600,7 @@ describe("v0.8 glasses lifecycle", () => {
         audioControl: async () => true, shutDownPageContainer: async () => true,
         onEvenHubEvent: (callback: (event: EvenHubEvent) => void) => { listener = callback; return () => { listener = undefined; }; },
       });
-      const controller = new G2ConversationController(bridge, new GlassesHud(bridge, { tickMs: 0 }), new ConversationPresentation());
+      const controller = new G2ConversationController(bridge, new GlassesHud(bridge, { display: "always-on", tickMs: 0 }), new ConversationPresentation());
       await controller.initialize();
       listener!({ sysEvent: { eventType } } as EvenHubEvent);
       await new Promise(resolve => setTimeout(resolve, 20));

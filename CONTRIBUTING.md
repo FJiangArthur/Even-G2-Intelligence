@@ -2,6 +2,8 @@
 
 Thanks for helping. This is a small project; a short issue before a large change saves everyone time.
 
+Looking for something to work on? The [README](README.md#ideas-for-contributors) lists good first contributions and larger pieces ([简体中文](README.zh-CN.md#可以参与的方向)). Reports from real G2 hardware and from real provider keys are especially useful, because most of the project is verified only by tests and the simulator.
+
 ## Setup
 
 Node.js 22+ and npm.
@@ -21,6 +23,8 @@ bash scripts/run_gate.sh
 The gate builds all three workspaces, runs every test, and fails if anything that looks like a credential is in the tree. CI runs the same script, and `main` only accepts pull requests whose gate passed.
 
 - Keep orchestration in `packages/conversation-sdk` and Even SDK / display / input code in `apps/g2-plugin` ([AGENTS.md](AGENTS.md) lists the boundaries).
+- User-facing behaviour is documented in `docs/` ([MODES.md](docs/MODES.md), [PIXEL_GESTURES.md](docs/PIXEL_GESTURES.md), [PROVIDERS_AND_SEARCH.md](docs/PROVIDERS_AND_SEARCH.md), [MEMORY_GUIDE.md](docs/MEMORY_GUIDE.md)). Update the matching guide with the change, and keep `README.md` and `README.zh-CN.md` in step.
+- A new provider origin must be added to the `network.whitelist` in `apps/g2-plugin/app.json`; a test checks this.
 - Add or update tests with the change. Tests use fake providers and a fake bridge: no network, no keys.
 - Say what you verified and where: unit test, simulator, or real glasses. Simulator success is not hardware acceptance.
 - One topic per pull request. Describe the behaviour change, not only the code change.
