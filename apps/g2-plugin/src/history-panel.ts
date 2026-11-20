@@ -1,6 +1,7 @@
 import type { HistoryEntry, HistorySession, RetrievedMemory } from "@helix/conversation-sdk";
 import type { G2ConversationController, HistoryState } from "./controller";
 import { icon, type IconName } from "./pixel-art";
+import { renderNotebook } from "./notebook-panel";
 
 export function safeSourceUrl(value: string): string | undefined {
   if (/[\u0000- \u007f]/u.test(value)) return;
@@ -514,6 +515,13 @@ export class HistoryPanel {
         for (const fact of knowledge.keyFacts) list.append(element("li", fact, "fact-row fact-text"));
         section("Key facts", "coin").append(list);
       }
+      // Notes mode: the session's to-do list (editable once the session has ended) and running notes.
+      if (session.todos?.length || session.notes?.length) {
+        const live = this.controller.liveSessionId() === session.id;
+        pane.append(renderNotebook({ todos: session.todos ?? [], notes: session.notes ?? [] },
+          op => { void this.controller.editTodo(op, session.id).then(() => { this.detailSignature = undefined; this.renderDetail(); }, error => this.setNotice(error instanceof Error ? error.message : String(error))); },
+          { editable: !live, readOnlyNote: "This session is live. Edit its to-dos in the Summary tab." }));
+      }
       if (knowledge.people.length) {
         const chips = element("div", undefined, "chip-row");
         for (const person of knowledge.people) {
@@ -525,7 +533,7 @@ export class HistoryPanel {
         }
         section("People", "people").append(chips);
       }
-      if (!hasKnowledge) pane.append(element("p", lines.some(line => line.kind === "speech")
+      if (!hasKnowledge && !session.todos?.length && !session.notes?.length) pane.append(element("p", lines.some(line => line.kind === "speech")
         ? "No summary was saved for this session. Generate one from the transcript (one small model call with your OpenAI key)." : "Nothing was said in this session.", "field-note"));
       if (lines.some(line => line.kind === "speech")) pane.append(generate(hasKnowledge ? "Regenerate summary" : "Generate summary"));
     } else if (this.detailTab === "cues") {

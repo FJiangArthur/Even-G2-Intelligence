@@ -5,6 +5,7 @@
  * protocol GatewayEvent union, so legacy protocol validation stays unchanged.
  */
 import type { Speaker } from "./types.js";
+import type { SessionNotebook } from "./session-notebook.js";
 
 export type ReasoningEffort = "none" | "low" | "medium" | "high";
 
@@ -213,6 +214,11 @@ export interface CopilotCallbacks {
   readonly onClaim?: (claim: CopilotClaim) => void;
   /** v0.8: people, upserted by normalized name (mentions/lastSeen/context update). */
   readonly onPerson?: (person: CopilotPerson) => void;
+  /**
+   * Notes mode: the session notebook the copilot keeps current (to-do operations and running notes).
+   * Used only while the mode preset `noteTaking` is on; changes are reported by the notebook itself.
+   */
+  readonly notebook?: () => SessionNotebook | undefined;
 }
 
 /** Extra transport capabilities exposed by DirectConversationTransport in v0.7. */

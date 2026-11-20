@@ -6,6 +6,8 @@ import { answerModelInfo, liveReasoningEffort, usageRecord, type RawUsage } from
 import { DEFAULT_FACT_CHECK_MODEL, verifyClaim } from "./fact-check.js";
 import { modeProfile } from "./modes.js";
 import type { Speaker } from "./types.js";
+import type { SessionNotebook } from "./session-notebook.js";
+import { NOTEBOOK_PROMPT_VERSION, type TodoOp } from "./todo-list.js";
 
 export interface ConversationCopilotOptions {
   readonly fetch?: DirectFetch;
@@ -64,8 +66,11 @@ const arr = (items: unknown) => ({ type: "array", items });
 const claimsOn = (settings: CopilotSettings) => settings.claims !== false;
 const peopleOn = (settings: CopilotSettings) => settings.people !== false;
 
+/** Notes mode: the mode preset turns the to-do / running-notes sections on (the host must also supply a notebook). */
+const noteTaking = (settings: CopilotSettings) => modeProfile(settings.mode).presets.noteTaking === true;
+
 /** Strict JSON schema for one copilot pass; disabled sections are omitted. */
-export function copilotSchema(settings: CopilotSettings): Record<string, unknown> {
+export function copilotSchema(settings: CopilotSettings, notebook = false): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
   if (settings.summarize) properties.summary = obj({ bullets: arr(str), keyFacts: arr(str) });
   if (settings.concepts) properties.concepts = arr(obj({ term: str, explanation: str }));
@@ -74,10 +79,14 @@ export function copilotSchema(settings: CopilotSettings): Record<string, unknown
   if (settings.implicitAsks) properties.asks = arr(obj({ kind: { type: "string", enum: ["lookup", "propose", "question"] }, topic: str, trigger: str }));
   if (claimsOn(settings)) properties.claims = arr(obj({ text: str, speaker: str, scope: { type: "string", enum: ["public", "conversation"] } }));
   if (peopleOn(settings)) properties.people = arr(obj({ name: str, role: str, context: str }));
+  if (notebook && noteTaking(settings)) {
+    properties.todoOps = arr(obj({ op: { type: "string", enum: ["add", "update", "complete", "remove"] }, id: str, text: str, owner: str, due: str, quote: str }));
+    properties.notes = arr(obj({ text: str, quote: str }));
+  }
   return obj(properties);
 }
 
-export function copilotInstructions(settings: CopilotSettings): string {
+export function copilotInstructions(settings: CopilotSettings, notebook = false): string {
   const profile = modeProfile(settings.mode);
   const parts = [
     "You are a silent conversation copilot for a person wearing smart glasses. Analyze the quoted conversation and return only JSON matching the schema.",
@@ -91,6 +100,10 @@ export function copilotInstructions(settings: CopilotSettings): string {
   if (settings.implicitAsks) parts.push("asks: implicit information needs in newSpeech statements that are not phrased as questions. kind lookup = time-sensitive or public fact worth a web search (e.g. 'Jetson devices are hard to order and have a long lead time right now' -> topic 'current NVIDIA Jetson lead time'); kind propose = a design or decision prompt the wearer could answer (e.g. 'the architecture is 16 GB RAM with a 1 TB SSD' -> topic 'evaluate/propose an architecture for 16GB RAM + 1TB SSD'); kind question = a real question someone asked that is still unanswered in the conversation (not a sentence fragment, filler, rhetorical aside, or a phrase cut off by transcription). Only raise an ask when an answer would genuinely help the wearer right now; a podcast-style monologue usually needs none. trigger quotes the speech verbatim. Skip existingAsks. At most 2. Empty is the normal case.");
   if (claimsOn(settings)) parts.push("claims: checkable statements in newSpeech worth a Verify action: numbers, dates, prices, specs, public facts, or commitments (e.g. 'Jetson Orin has 64 GB of memory', 'we will ship on March 3'). text quotes the statement verbatim from newSpeech (one sentence or clause). scope public = checkable on the web (public facts, specs, prices, release dates); scope conversation = a commitment, owner, decision or number specific to this conversation. speaker is the speaker label of that line. Skip opinions, questions, small talk and anything in knownClaims. At most 3; empty is fine.");
   if (peopleOn(settings)) parts.push("people: real persons named or clearly identified in the conversation (e.g. 'Elaine, head of robotics'). name exactly as written in the conversation text; never invent or complete a name. role = title or team if stated, else empty. context = one short phrase about why they came up or what they own or said here. Never include teams, departments, companies, products, generic roles without a name (e.g. Finance, the vendor, my manager), or speaker labels such as Speaker, Other speaker or You. Repeat a knownPeople entry only when there is new context. At most 5; empty is fine.");
+  if (notebook && noteTaking(settings)) {
+    parts.push("todoOps: keep the wearer's to-do list (todoList) current from newSpeech. op add = a new action item someone committed to or was asked to do: text is a short imperative (e.g. 'Send the quote'); owner is the person's name exactly as spoken, 'Me' when the wearer (speaker label You) takes it, else empty; due is the date or deadline exactly as spoken (e.g. 'Friday'), else empty; id is empty. op update = newSpeech changes an item already in todoList (reassigned, new date, reworded): give its id and only the fields that change, the others empty. op complete = newSpeech says an item in todoList is done. op remove = newSpeech cancels an item in todoList. Never add an item that is already in todoList, even reworded: update it instead. Spoken commands such as 'add a to-do ...' or 'mark ... done' count, unless todoList already reflects them. quote = the words from newSpeech that justify the op, verbatim. Never invent tasks, owners or dates. At most 4; empty is the normal case.");
+    parts.push("notes: concise meeting notes of what was discussed or decided in newSpeech: one fact, decision, number or open question per note, under 20 words, in the speech language. quote = the words from newSpeech the note is based on, verbatim. Skip small talk, action items (they belong in todoOps) and anything already in knownNotes. At most 3; empty is fine.");
+  }
   return parts.join("\n");
 }
 const firstWord = (value: string) => words(value).values().next().value ?? "";
@@ -210,6 +223,11 @@ export class ConversationCopilot {
     this.processed = this.lines.length;
   }
 
+  /** Notes mode: the host's session notebook, while the mode preset asks for note-taking. */
+  private notebook(settings: CopilotSettings): SessionNotebook | undefined {
+    if (!noteTaking(settings)) return undefined;
+    try { return this.options.callbacks.notebook?.(); } catch { return undefined; }
+  }
   private settings(): CopilotSettings | undefined {
     try { return this.options.callbacks.enabled() ? this.options.callbacks.settings() : undefined; } catch { return undefined; }
   }
@@ -230,7 +248,8 @@ export class ConversationCopilot {
     try {
       const settings = this.settings();
       if (!settings) return;
-      const schema = copilotSchema(settings);
+      const notebook = this.notebook(settings);
+      const schema = copilotSchema(settings, notebook !== undefined);
       if (!Object.keys(schema.properties as object).length) { this.processed = target; return; }
       const model = settings.copilotModel, effort = liveReasoningEffort(model);
       const input = JSON.stringify({
@@ -243,8 +262,9 @@ export class ConversationCopilot {
         existingAsks: [...this.askKeys].slice(-50),
         ...(claimsOn(settings) ? { knownClaims: [...this.claimStore.values()].slice(-30).map(c => c.text) } : {}),
         ...(peopleOn(settings) ? { knownPeople: [...this.peopleByKey.values()].slice(-30).map(p => ({ name: p.name, role: p.role ?? "" })) } : {}),
+        ...(notebook ? { todoList: notebook.todos.map(t => ({ id: t.id, text: t.text, owner: t.owner ?? "", due: t.due ?? "", done: t.done })), knownNotes: notebook.notes.slice(-30).map(n => n.text) } : {}),
       });
-      const body = JSON.stringify({ model, store: false, instructions: copilotInstructions(settings), input,
+      const body = JSON.stringify({ model, store: false, instructions: copilotInstructions(settings, notebook !== undefined), input,
         max_output_tokens: effort ? 2500 : 1500, ...(effort ? { reasoning: { effort } } : {}),
         text: { format: { type: "json_schema", name: "helix_copilot", schema, strict: true } } });
       const response = await directFetch(this.fetcher, `${OPENAI_BASE}/responses`, {
@@ -255,7 +275,7 @@ export class ConversationCopilot {
       const parsed = parseResponseOutput(value);
       this.report("copilot", model, parsed.usage, body, parsed.text, parsed.webSearchCalls);
       this.processed = target;
-      this.apply(settings, parsed.text, target);
+      this.apply(settings, parsed.text, target, notebook, model);
     } catch { /* Optional lane: errors are nonfatal; unprocessed speech is retried after cooldown. */ }
     finally {
       clearTimeout(timer);
@@ -267,7 +287,7 @@ export class ConversationCopilot {
     try { this.usage(usageRecord(kind, model, usage, measured !== undefined, relatedId)); } catch { /* best effort */ }
   }
   /** Validates and clamps untrusted model output, dedupes against the session, and emits callbacks. */
-  private apply(settings: CopilotSettings, text: string, target: number): void {
+  private apply(settings: CopilotSettings, text: string, target: number, notebook?: SessionNotebook, model?: string): void {
     if (!text || text.length > MAX_OUTPUT_TEXT) return;
     let data: unknown;
     try { data = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, "")); } catch { return; }
@@ -375,6 +395,51 @@ export class ConversationCopilot {
         if (!person) continue;
         touched.add(person.id);
         safe(() => callbacks.onPerson?.(person));
+      }
+    }
+    if (notebook) this.applyNotebook(notebook, data, target, model);
+  }
+  /**
+   * Notes mode: applies the model's to-do operations and notes to the session notebook. Every item must
+   * quote recent speech (else it is dropped as invented); ids must exist; adds are deduped by the list itself.
+   */
+  private applyNotebook(notebook: SessionNotebook, data: Record<string, unknown>, target: number, model?: string): void {
+    const window = this.lines.slice(Math.max(0, target - 50), target), fresh = this.transcript(window), freshKey = copilotKey(fresh);
+    const passage = (quote: string): Line | undefined => {
+      if (grounded(quote, fresh, freshKey) < 0.6) return undefined;
+      let best: Line | undefined, score = 0;
+      for (let i = window.length - 1; i >= 0 && score < 1; i--) {
+        const line = window[i]!, value = grounded(quote, line.text, copilotKey(line.text));
+        if (value > score) { score = value; best = line; }
+      }
+      return best ?? window[window.length - 1];
+    };
+    if (Array.isArray(data.todoOps)) {
+      let applied = 0;
+      for (const item of data.todoOps) {
+        if (applied >= 4 || !record(item)) continue;
+        const quote = cleanCopilotText(item.quote, 400), line = quote ? passage(quote) : undefined;
+        if (!line) continue;
+        const id = cleanCopilotText(item.id, 100), text = cleanCopilotText(item.text, 200), owner = cleanCopilotText(item.owner, 60), due = cleanCopilotText(item.due, 60);
+        let op: TodoOp | undefined;
+        if (item.op === "add") op = text ? { op: "add", text, ...(owner ? { owner } : {}), ...(due ? { due } : {}) } : undefined;
+        else if (!id || !notebook.todos.some(todo => todo.id === id)) op = undefined;
+        else if (item.op === "update") op = { op: "update", id, ...(text ? { text } : {}), ...(owner ? { owner } : {}), ...(due ? { due } : {}) };
+        else if (item.op === "complete") op = { op: "complete", id };
+        else if (item.op === "remove") op = { op: "remove", id };
+        if (!op) continue;
+        try {
+          if (notebook.apply(op, { origin: "copilot", source: { transcriptId: line.transcriptId, quote, speaker: line.speaker, ...(model ? { model } : {}), promptVersion: NOTEBOOK_PROMPT_VERSION } })) applied++;
+        } catch { /* isolate host */ }
+      }
+    }
+    if (Array.isArray(data.notes)) {
+      let added = 0;
+      for (const item of data.notes) {
+        if (added >= 3 || !record(item)) continue;
+        const text = cleanCopilotText(item.text, 300), quote = cleanCopilotText(item.quote, 400), line = quote ? passage(quote) : undefined;
+        if (!text || !line) continue;
+        try { if (notebook.addNote(text, line.transcriptId)) added++; } catch { /* isolate host */ }
       }
     }
   }

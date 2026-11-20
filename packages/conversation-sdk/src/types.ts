@@ -14,6 +14,8 @@ export const CONVERSATION_MODES = [
   "partner",
   "negotiation",
   "learning",
+  // Notes mode: note-taker (action items, to-do list, running notes)
+  "notes",
 ] as const;
 export type ConversationMode = typeof CONVERSATION_MODES[number];
 export type ConversationModeInput = ConversationMode | "interview";

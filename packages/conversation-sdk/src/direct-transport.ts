@@ -214,6 +214,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
             onSummary: guard(copilot.onSummary), onConcept: guard(copilot.onConcept), onConflict: guard(copilot.onConflict),
             onSuggestions: guard(copilot.onSuggestions), onAsk: guard(copilot.onAsk), onVerification: guard(copilot.onVerification),
             onClaim: guard(copilot.onClaim), onPerson: guard(copilot.onPerson),
+            ...(copilot.notebook ? { notebook: () => live() ? copilot.notebook?.() : undefined } : {}),
           } });
       }
       if (stt === "openai-realtime") runtime.realtime = this.realtimeState(runtime);

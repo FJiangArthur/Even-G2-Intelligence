@@ -1,4 +1,5 @@
 import type { KnowledgeSource } from "./copilot-types.js";
+import { cleanSessionNotes, cleanTodos, type SessionNote, type TodoItem } from "./todo-list.js";
 
 /** Storage is provided by the phone host; no network or provider credentials are involved. */
 export interface HistoryStorage {
@@ -11,7 +12,11 @@ export interface HistorySession {
   id: string; source: KnowledgeSource; title: string; startedAt: string; updatedAt: string;
   /** v0.8 session knowledge (all optional; <= 20 items of <= 500 chars each). */
   summary?: string[]; keyFacts?: string[]; people?: SessionPerson[]; concepts?: string[]; tags?: string[];
+  /** Notes mode: the session's to-do list (<= 60 items) and running notes (<= 80), saved with the session. */
+  todos?: TodoItem[]; notes?: SessionNote[];
 }
+/** Notes-mode fields of a session. In updateSessionNotebook and upsertSession, an absent field keeps the stored value; [] clears it. */
+export type SessionNotebookData = Pick<HistorySession, "todos" | "notes">;
 /** Knowledge fields of a session. In updateSessionKnowledge and upsertSession, an absent field keeps the stored value; [] clears it. */
 export type SessionKnowledge = Pick<HistorySession, "summary" | "keyFacts" | "people" | "concepts" | "tags">;
 export interface PersonAggregate {
@@ -138,9 +143,18 @@ function cleanKnowledge(value: Record<string, unknown>): SessionKnowledge {
   }
   return result;
 }
+const NOTEBOOK_KEYS = ["todos", "notes"] as const;
+/** Validated to-dos and notes present in `value` (invalid items are dropped, not fatal). */
+function cleanNotebook(value: Record<string, unknown>): SessionNotebookData {
+  const result: SessionNotebookData = {};
+  const todos = value.todos === undefined ? undefined : cleanTodos(value.todos), notes = value.notes === undefined ? undefined : cleanSessionNotes(value.notes);
+  if (todos) result.todos = todos;
+  if (notes) result.notes = notes;
+  return result;
+}
 function cleanSession(value: unknown): HistorySession {
   if (!record(value) || !string(value.id) || !KNOWLEDGE_SOURCES.includes(value.source as KnowledgeSource) || typeof value.title !== "string" || !date(value.startedAt) || !date(value.updatedAt)) throw invalid();
-  return { id: value.id, source: value.source as KnowledgeSource, title: value.title, startedAt: value.startedAt, updatedAt: value.updatedAt, ...cleanKnowledge(value) };
+  return { id: value.id, source: value.source as KnowledgeSource, title: value.title, startedAt: value.startedAt, updatedAt: value.updatedAt, ...cleanKnowledge(value), ...cleanNotebook(value) };
 }
 function cleanEntry(value: unknown): HistoryEntry {
   if (!record(value) || !string(value.id) || !string(value.sessionId) || typeof value.kind !== "string" || !["transcript", "question", "answer", "fact-check"].includes(value.kind) || !string(value.text) || !date(value.occurredAt)) throw invalid();
@@ -572,6 +586,7 @@ export class LocalHistoryStore {
       if (index < 0) { sessions.push(clean); return; }
       const old = sessions[index]!, merged: HistorySession = { ...clean };
       for (const key of KNOWLEDGE_KEYS) if (merged[key] === undefined && old[key] !== undefined) (merged as unknown as Record<string, unknown>)[key] = old[key];
+      for (const key of NOTEBOOK_KEYS) if (merged[key] === undefined && old[key] !== undefined) (merged as unknown as Record<string, unknown>)[key] = old[key];
       sessions[index] = merged;
     });
   }
@@ -587,6 +602,25 @@ export class LocalHistoryStore {
       if (index < 0) throw new Error("Cannot update knowledge for a session that is not saved.");
       const session: HistorySession = { ...draft.sessions[index]! };
       for (const key of KNOWLEDGE_KEYS) {
+        const value = clean[key];
+        if (value === undefined) continue;
+        if (value.length) (session as unknown as Record<string, unknown>)[key] = value; else delete session[key];
+      }
+      draft.writableSessions()[index] = session;
+    });
+  }
+  /**
+   * Notes mode: sets the to-do list and/or running notes of an existing session (validated and bounded).
+   * Absent fields are kept, [] clears. Does not change updatedAt or entries.
+   */
+  async updateSessionNotebook(id: string, patch: SessionNotebookData): Promise<void> {
+    if (!record(patch)) throw new Error("Session notebook must be an object.");
+    const clean = cleanNotebook(patch as Record<string, unknown>);
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === id);
+      if (index < 0) throw new Error("Cannot update the notebook of a session that is not saved.");
+      const session: HistorySession = { ...draft.sessions[index]! };
+      for (const key of NOTEBOOK_KEYS) {
         const value = clean[key];
         if (value === undefined) continue;
         if (value.length) (session as unknown as Record<string, unknown>)[key] = value; else delete session[key];

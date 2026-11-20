@@ -587,7 +587,7 @@ export type IconName = keyof typeof ICONS;
 /** v0.10 icon per conversation mode (phone chips and the glasses header badge). */
 export const MODE_ICONS: Readonly<Record<string, IconName>> = Object.freeze({
   general: "people", technical: "chip", interviewer: "clipboard", partner: "heart", negotiation: "scale",
-  learning: "book", social: "bubble", passive: "moon", interviewee: "people", "office-discussion": "people",
+  learning: "book", social: "bubble", passive: "moon", notes: "check", interviewee: "people", "office-discussion": "people",
 });
 export function modeIcon(mode: string | undefined): IconName { return MODE_ICONS[mode ?? ""] ?? "people"; }
 

@@ -130,6 +130,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
     onVerify: (target, id) => controller.verify(target, id),
     onVerifyClaim: id => controller.verifyClaim(id), // phone agent: Checks → Claims → Verify
     onRunCopilot: () => controller.runCopilot(),
+    onTodoEdit: op => controller.editTodo(op),
     onTabSeen: tab => presentation.markSeen(tab),
     onTabSelect: tab => { const view = hudViewForTab(tab); if (view) controller.setHudView(view); },
     onModeChange: mode => controller.setMode(mode),
