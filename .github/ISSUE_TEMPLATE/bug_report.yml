@@ -1,0 +1,30 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not paste API keys, real transcripts or recordings. For security problems use the Security tab instead.
+  - type: input
+    id: version
+    attributes: { label: Helix version, placeholder: "0.12.1 (Setup → Diagnostics shows it)" }
+    validations: { required: true }
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen?
+      options: [Real glasses + phone, Even Hub simulator, Tests / build]
+    validations: { required: true }
+  - type: input
+    id: device
+    attributes: { label: Phone, OS and build type, placeholder: "iPhone 16, iOS 18.7, private build" }
+  - type: textarea
+    id: what
+    attributes: { label: What happened, description: What you did, what you expected, what you saw. }
+    validations: { required: true }
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics log
+      description: Setup → Diagnostics → Copy (after reopening Helix if it froze). No keys or transcripts are in it.
+      render: text

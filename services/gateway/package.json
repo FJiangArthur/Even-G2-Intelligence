@@ -1,0 +1,40 @@
+{
+  "name": "@helix/gateway",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hostable speech and conversation gateway for Helix clients",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/bin.ts",
+    "start": "node dist/bin.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@helix/conversation-sdk": "0.7.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

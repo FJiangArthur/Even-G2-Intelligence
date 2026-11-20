@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/FJiangArthur/Even-G2-Intelligence/security/advisories/new
+    about: Report vulnerabilities privately, not in a public issue.
+  - name: Even Hub SDK, simulator or glasses firmware
+    url: https://hub.evenrealities.com/docs/get-started/overview
+    about: Problems in Even Realities' own software belong with Even Realities.

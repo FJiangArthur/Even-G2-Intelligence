@@ -1,0 +1,27 @@
+{
+  "package_id": "com.helix.g2conversation",
+  "edition": "202601",
+  "name": "Helix Conversation",
+  "version": "0.12.1",
+  "min_app_version": "2.2.9",
+  "min_sdk_version": "0.0.14",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "Capture G2 microphone audio for live Helix transcription and conversation assistance."
+    },
+    {
+      "name": "network",
+      "desc": "Connect directly from the phone to selected transcription, AI and optional Omi providers.",
+      "whitelist": [
+        "https://api.openai.com",
+        "wss://api.openai.com",
+        "https://api.deepgram.com",
+        "wss://stt-rt.soniox.com",
+        "https://api.omi.me"
+      ]
+    }
+  ],
+  "supported_languages": ["en"]
+}

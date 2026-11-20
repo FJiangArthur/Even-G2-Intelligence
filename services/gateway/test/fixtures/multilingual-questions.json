@@ -1,0 +1,10 @@
+[
+  { "input": "你能解释一下这个设计吗", "question": true },
+  { "input": "我们明天发货", "question": false },
+  { "input": "هل يمكن أن تشرح هذا", "question": true },
+  { "input": "¿Puedes explicar el riesgo", "question": true },
+  { "input": "この設計を説明できますか", "question": true },
+  { "input": "这是最终设计？", "question": true },
+  { "input": "هل هذا نهائي؟", "question": true },
+  { "input": "Is this final?", "question": true }
+]

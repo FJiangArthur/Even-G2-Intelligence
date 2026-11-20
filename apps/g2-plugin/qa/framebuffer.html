@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Helix official simulator framebuffer</title></head>
+<body style="margin:0;background:black;width:576px;height:288px">
+  <img id="frame" width="576" height="288" alt="Unmodified EvenHub simulator RGBA framebuffer on black" />
+  <script>
+    const scene = new URLSearchParams(location.search).get('scene') || 'answer';
+    if (['answer', 'ready', 'click', 'error'].includes(scene)) {
+      document.querySelector('#frame').src = '/@fs/ABSOLUTE/PATH/TO/REPO/artifacts/g1-dashboard/glasses-' + scene + '.png';
+    }
+  </script>
+</body>
+</html>

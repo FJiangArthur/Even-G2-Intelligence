@@ -1,0 +1,194 @@
+import type { ConversationMode, ResponseStrategy } from "./types.js";
+
+/**
+ * v0.10 mode profiles: one place that says how Helix behaves in each kind of conversation.
+ * `answer` steers the answer lane, `copilot`/`suggestions`/`summary` steer the background copilot,
+ * `presets` are the feature toggles a mode switch applies (the user can still change them after).
+ */
+export interface ModePresets {
+  readonly summarize: boolean; readonly concepts: boolean; readonly conflicts: boolean; readonly suggestions: boolean;
+  readonly implicitAsks: boolean; readonly webGrounding: boolean; readonly claims: boolean; readonly people: boolean;
+  /** Auto-answer detected questions (others' questions; the interviewer's own ones as an answer key). */
+  readonly autoAnswer: boolean;
+  readonly responseStrategy: ResponseStrategy;
+}
+export interface ModeProfile {
+  readonly id: ConversationMode;
+  /** Phone label. */
+  readonly label: string;
+  /** Glasses status tag (<= 6 chars). */
+  readonly short: string;
+  /** One line on the phone mode picker. */
+  readonly blurb: string;
+  readonly answer: string;
+  /** Extra copilot guidance (fairness, tone, what matters). Empty for the default meeting behaviour. */
+  readonly copilot: string;
+  /** What suggestedQuestions mean in this mode. */
+  readonly suggestions: string;
+  /** Summary focus. */
+  readonly summary: string;
+  /** Glasses label of the suggestions view. */
+  readonly askLabel: string;
+  /** The wearer's own spoken questions: never answered, or answered as an interviewer's answer key. */
+  readonly selfQuestions: "ignore" | "answer-key";
+  readonly presets: ModePresets;
+  /** False for legacy modes kept only for stored settings and the gateway protocol. */
+  readonly picker: boolean;
+}
+
+const DEFAULT_SUGGESTIONS = "at most 5 useful questions the WEARER could ask the other party next, phrased exactly as the wearer would say them aloud to that person (e.g. 'What lead time are you seeing for the Jetson boards?'), spanning the whole conversation, each with a short why. Never questions for the wearer to answer, and never questions that were already asked or answered in the conversation.";
+const ALL_ON: ModePresets = Object.freeze({ summarize: true, concepts: true, conflicts: true, suggestions: true, implicitAsks: true, webGrounding: true, claims: true, people: true, autoAnswer: true, responseStrategy: "reactive" });
+
+const profile = (value: Omit<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions"> & Partial<Pick<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions">>): ModeProfile =>
+  Object.freeze({ picker: true, selfQuestions: "ignore", copilot: "", suggestions: DEFAULT_SUGGESTIONS, ...value });
+
+export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Object.freeze({
+  general: profile({
+    id: "general", label: "Meeting", short: "MEET", askLabel: "ASK THEM",
+    blurb: "Decisions, owners, numbers and the questions worth asking.",
+    answer: "Be a concise, practical meeting assistant. Prioritize a direct answer, then the decision, owner, risk or next step it implies.",
+    summary: "decisions, owners, numbers, dates and open issues",
+    presets: ALL_ON,
+  }),
+  technical: profile({
+    id: "technical", label: "Technical", short: "TECH", askLabel: "PROBE",
+    blurb: "Specs, trade-offs and sharp follow-ups for engineering talks.",
+    answer: "Support a technical discussion as a senior engineer would. Answer precisely with concrete numbers, units, versions and the key assumption; name the main trade-off or failure mode. Prefer a specific recommendation over a survey; say plainly when something depends on unknowns.",
+    copilot: "This is a technical discussion. Prefer precise engineering content: specs, numbers, interfaces, versions, constraints.",
+    suggestions: "at most 5 sharp technical follow-up questions the WEARER could ask next, phrased as they would say them aloud: assumptions, numbers and units, scaling limits, failure modes, edge cases, trade-offs, interfaces and test evidence. Each with a short why. Never questions already asked or answered.",
+    summary: "technical decisions, specs and numbers, open design questions, risks and owners",
+    presets: ALL_ON,
+  }),
+  interviewer: profile({
+    id: "interviewer", label: "Interviewer", short: "INTVW", askLabel: "PROBE", selfQuestions: "answer-key",
+    blurb: "You run the interview: answer keys for your questions, probes, and evidence on the candidate.",
+    answer: "Support the INTERVIEWER (the wearer), never the candidate. For the interviewer's own questions give an answer key: what a strong answer covers, one probing follow-up and one red flag. For the candidate's questions about the role, answer briefly and only from known context. Judge only job-relevant evidence; never comment on age, gender, race, religion, disability, family, nationality, accent or other protected characteristics.",
+    copilot: "The wearer is the interviewer; the other speaker is the candidate. Assess only job-relevant evidence from what the candidate actually said. Never infer or mention protected characteristics (age, gender, race, religion, disability, family status, nationality, accent).",
+    suggestions: "at most 5 follow-up probes the INTERVIEWER (wearer) could ask the candidate next, phrased as they would say them aloud: ask for specifics the candidate glossed over, their own contribution versus the team's, numbers and outcomes, trade-offs they chose, and depth on claimed skills. Each with a short why. Never questions already asked or answered.",
+    summary: "candidate evidence: concrete strengths and concerns, each tied to what the candidate said (scale, tools, outcomes, ownership); keyFacts are the candidate's checkable claims",
+    presets: Object.freeze({ ...ALL_ON, implicitAsks: false }),
+  }),
+  partner: profile({
+    id: "partner", label: "Partner", short: "PARTNR", askLabel: "CHECK IN",
+    blurb: "Personal conversations: listen well, remember what matters. No fact-checking.",
+    answer: "Support a personal conversation with someone close to the wearer. Be warm, brief and human. Never lecture, diagnose, fact-check or score points; when asked, help the wearer respond with care and honesty.",
+    copilot: "This is a personal conversation between the wearer and someone close to them. Be kind and discreet. Never judge, diagnose or take sides, and never suggest manipulative or dishonest lines.",
+    suggestions: "at most 5 gentle things the WEARER could say next to show they are listening: open questions about what the other person shared, or a short reflection of their feelings (e.g. 'That sounds exhausting. What was the hardest part?'). Plain, natural words, no therapy jargon. Each with a short why. Never repeat what was already said.",
+    summary: "what matters to the other person: feelings, needs, plans, dates, preferences and things worth remembering or following up on",
+    presets: Object.freeze({ summarize: true, concepts: false, conflicts: false, suggestions: true, implicitAsks: false, webGrounding: false, claims: false, people: true, autoAnswer: false, responseStrategy: "reactive" }),
+  }),
+  negotiation: profile({
+    id: "negotiation", label: "Negotiation", short: "DEAL", askLabel: "ASK",
+    blurb: "Offers, numbers and concessions on the table; questions that uncover interests.",
+    answer: "Support the wearer in a negotiation or sales conversation. Be concise and numeric: restate the terms on the table, then suggest one next move grounded in what was said. Never suggest deception or pressure tactics.",
+    copilot: "This is a negotiation. Track offers, counteroffers, prices, volumes, deadlines and concessions exactly as stated.",
+    suggestions: "at most 5 questions the WEARER could ask next to uncover the other side's interests, constraints, deadlines, decision process and flexibility, or to pin down vague terms. Phrased as they would say them aloud, each with a short why. Never questions already asked or answered.",
+    summary: "terms on the table (offers, counteroffers, numbers, dates), concessions made, open issues and agreed points",
+    presets: Object.freeze({ ...ALL_ON }),
+  }),
+  learning: profile({
+    id: "learning", label: "Learning", short: "LEARN", askLabel: "ASK",
+    blurb: "Lectures and walkthroughs: concepts explained, study notes, smart questions.",
+    answer: "Support the wearer learning from a lecture or explanation. Explain clearly and simply, with one concrete example or analogy when it helps.",
+    copilot: "The wearer is learning. Explain unfamiliar concepts generously but accurately.",
+    suggestions: "at most 5 clarifying questions the WEARER could ask the speaker about what was just explained: definitions, why it works, how it applies, an example or the limits. Phrased as they would say them aloud, each with a short why. Never questions already asked or answered.",
+    summary: "study notes: key ideas, definitions, formulas, steps and examples in the order they were taught",
+    presets: Object.freeze({ ...ALL_ON, conflicts: false, claims: false, people: false }),
+  }),
+  social: profile({
+    id: "social", label: "Social", short: "SOCIAL", askLabel: "TALK",
+    blurb: "Casual talk: easy follow-ups and quick look-ups, nothing heavy.",
+    answer: "Use a warm, natural tone. Help the conversation flow without sounding scripted or overly formal.",
+    copilot: "This is casual conversation. Keep everything light and friendly.",
+    suggestions: "at most 5 light, friendly follow-ups the WEARER could say next about things the other person shared (their plans, interests, stories). Natural and short, each with a short why. Never questions already asked or answered.",
+    summary: "what people shared: plans, interests, names and things worth following up on",
+    presets: Object.freeze({ summarize: true, concepts: true, conflicts: false, suggestions: true, implicitAsks: true, webGrounding: true, claims: false, people: true, autoAnswer: false, responseStrategy: "reactive" }),
+  }),
+  passive: profile({
+    id: "passive", label: "Quiet", short: "QUIET", askLabel: "ASK THEM",
+    blurb: "Captions and a running summary only. Ask when you want help.",
+    answer: "Remain quiet unless directly asked a clear question or given a manual query. Never proactively interrupt.",
+    summary: "decisions, numbers, dates and open issues",
+    presets: Object.freeze({ summarize: true, concepts: false, conflicts: false, suggestions: false, implicitAsks: false, webGrounding: true, claims: false, people: false, autoAnswer: false, responseStrategy: "reactive" }),
+  }),
+  // Legacy modes: kept for stored settings and the gateway protocol, not offered in the picker.
+  interviewee: profile({
+    id: "interviewee", label: "Interviewee", short: "MEET", askLabel: "ASK THEM", picker: false,
+    blurb: "Legacy mode.",
+    answer: "Support the person answering an interview. Give a confident, truthful, first-person-ready response without inventing experience.",
+    summary: "decisions, owners, numbers, dates and open issues",
+    presets: ALL_ON,
+  }),
+  "office-discussion": profile({
+    id: "office-discussion", label: "Meeting", short: "MEET", askLabel: "ASK THEM", picker: false,
+    blurb: "Legacy name of Meeting.",
+    answer: "Focus on decisions, tradeoffs, owners, risks, and concrete next actions in a workplace discussion.",
+    summary: "decisions, owners, numbers, dates and open issues",
+    presets: ALL_ON,
+  }),
+});
+
+/** Modes offered in the phone picker and the glasses menu, in display order. */
+export const PICKER_MODES: readonly ConversationMode[] = Object.freeze(["general", "technical", "interviewer", "partner", "negotiation", "learning", "social", "passive"]);
+
+export function modeProfile(mode: string | undefined): ModeProfile {
+  return (mode && Object.prototype.hasOwnProperty.call(MODE_PROFILES, mode) ? MODE_PROFILES[mode as ConversationMode] : undefined) ?? MODE_PROFILES.general;
+}
+
+/** Answer-lane request for the interviewer's own question (Interviewer mode). */
+export function answerKeyInput(question: string): string {
+  return `ANSWER KEY. The wearer is interviewing a candidate and just asked them: ${JSON.stringify(question.trim())}
+Give the interviewer, in three short sentences: "Strong answer:" the 2-4 points a strong answer covers (semicolon-separated), "Probe:" one follow-up question, "Flag:" one red flag to listen for. Do not answer as the candidate.`;
+}
+export const ANSWER_KEY_PREFIX = "ANSWER KEY.";
+
+const MODE_INSTRUCTIONS: Readonly<Record<ConversationMode, string>> = Object.freeze(Object.fromEntries(
+  Object.values(MODE_PROFILES).map(item => [item.id, item.answer])) as Record<ConversationMode, string>);
+
+const FILLER = /^(?:ok(?:ay)?|sure|right|yeah|yes|no|thanks?|thank you|got it|sounds good|mm+|uh+|um+)[.! ]*$/i;
+const ACTIONABLE = /\b(?:need(?:s)? to|have to|must|should|decid(?:e|ing)|choos(?:e|ing)|deadline|due\b|by (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)|risk(?:s|y)?\b|block(?:ed|er|ing)?\b|problem\b|issue\b|trade-?off|next step|action item|launch date|ship date|owner\b|priority|prioriti[sz]e)\b/i;
+const NEGATED_ACTION = /\b(?:no|not\s+(?:a|an|the)?|without\s+(?:a|an|any)?)\s*(?:current\s+|remaining\s+)?(?:issue|problem|risk|blocker|action item|next step|decision|need)\b|\b(?:do|does|did)\s+not\s+need\s+to\s+(?:decide|choose|act|change|ship|launch)\b|\bshould\s+not\s+(?:block|change|act|ship|launch)\b/i;
+const TITLED_NEXT_STEP = /\b(?:movie|film|book|song|episode|show)\b.{0,40}\b(?:called|named|titled)\s+["'“‘]?next step\b/i;
+
+export function modeSystemPrompt(
+  protectedBasePrompt: string,
+  mode: ConversationMode,
+  strategy: ResponseStrategy,
+  /** v0.11: the user's own prompt for this mode (replaces the built-in mode instruction). */
+  customInstruction?: string,
+): string {
+  const strategyInstruction = strategy === "reactive"
+    ? "Automatically answer detected questions only; do not invent interventions for ordinary statements."
+    : strategy === "proactive"
+      ? "Automatically intervene only for useful non-question decisions, actions, blockers, or risks. Detected questions wait for a manual query."
+      : "Automatically answer detected questions and also intervene for useful non-question decisions, actions, blockers, or risks.";
+  return [
+    protectedBasePrompt.trim(),
+    `Protected conversation mode: ${mode}. ${customInstruction?.trim() ? customInstruction.trim().slice(0, 4000) : MODE_INSTRUCTIONS[mode]}`,
+    `Protected response strategy: ${strategy}. ${strategyInstruction}`,
+    "Start with the answer itself in natural spoken language. Omit filler, preambles and coaching phrases such as 'you could say'. If evidence is missing, state uncertainty briefly instead of inventing facts.",
+  ].join("\n\n");
+}
+
+export function shouldGenerateProactiveResponse(
+  text: string,
+  mode: ConversationMode,
+  strategy: ResponseStrategy,
+): boolean {
+  if (strategy === "reactive" || mode === "passive") return false;
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length < 18 || FILLER.test(compact)) return false;
+  const words = compact.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (words.length < 4) return false;
+  if (TITLED_NEXT_STEP.test(compact)) return false;
+  if (NEGATED_ACTION.test(compact) && !/\b(?:but|however|although|yet)\b/i.test(compact)) return false;
+  return ACTIONABLE.test(compact);
+}
+
+export function shouldAnswerDetectedQuestions(strategy: ResponseStrategy): boolean {
+  return strategy === "reactive" || strategy === "both";
+}
+
+export function proactiveInput(text: string): string {
+  return `Offer one concise, immediately useful intervention for this statement. Do not pretend it was a question and do not add filler:\n${text.trim()}`;
+}

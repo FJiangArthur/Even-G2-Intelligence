@@ -1,0 +1,289 @@
+[
+  {
+    "id": "mock-interview-ml",
+    "title": "Mock ML / perception engineering interview",
+    "kind": "interview",
+    "lines": [
+      {
+        "speaker": "other",
+        "text": "Thanks for joining. This is a practice round for the perception engineer role, so treat it like the real thing."
+      },
+      {
+        "speaker": "self",
+        "text": "Sounds good, thanks for setting it up."
+      },
+      {
+        "speaker": "other",
+        "text": "Can you start by telling me about your most recent perception project?"
+      },
+      {
+        "speaker": "self",
+        "text": "Sure. I led the obstacle detection stack for a sidewalk delivery robot. Our main detector ran at 30 FPS on the target hardware, and that was enough for the planner."
+      },
+      {
+        "speaker": "other",
+        "text": "What's your experience with TensorRT?"
+      },
+      {
+        "speaker": "self",
+        "text": "I converted our PyTorch models through ONNX into TensorRT engines, mostly FP16, and I experimented with INT8 calibration for the backbone."
+      },
+      {
+        "speaker": "other",
+        "text": "Walk me through how you'd deploy a perception model on an edge device."
+      },
+      {
+        "speaker": "self",
+        "text": "First I profile the model on the device, then export to ONNX, build one engine per target, and keep preprocessing on the GPU so frames never bounce through host memory."
+      },
+      {
+        "speaker": "other",
+        "text": "Our team uses CDTF for the camera pipeline, so you'd be working with it from day one."
+      },
+      {
+        "speaker": "self",
+        "text": "I haven't used CDTF directly, but I've built similar multi-camera fusion pipelines."
+      },
+      {
+        "speaker": "other",
+        "text": "I'd like to hear about a time you dealt with a tight latency budget.",
+        "pauseMs": 1500
+      },
+      {
+        "speaker": "self",
+        "text": "On the delivery robot the end-to-end budget was 50 milliseconds from exposure to planner input. Honestly, we only got about 12 FPS on Orin at first, so we cut the input resolution and merged two detection heads."
+      },
+      {
+        "speaker": "other",
+        "text": "How did you measure that latency?"
+      },
+      {
+        "speaker": "self",
+        "text": "We stamped every frame at capture and again when the detections were published, then tracked the p95 per release."
+      },
+      {
+        "speaker": "other",
+        "text": "Why did you choose FP16 over INT8 for the final release?"
+      },
+      {
+        "speaker": "self",
+        "text": "INT8 lost about two points of recall on small obstacles, and the safety review would not accept that."
+      },
+      {
+        "speaker": "other",
+        "text": "Last one. Where do you want to grow in your next role?"
+      },
+      {
+        "speaker": "self",
+        "text": "I want to own the whole path from sensor calibration to on-vehicle deployment."
+      },
+      {
+        "speaker": "other",
+        "text": "Great, that's everything from me. We'll send written feedback by email."
+      }
+    ],
+    "expectations": {
+      "concepts": [
+        "CDTF",
+        "TensorRT"
+      ],
+      "conflict": true,
+      "questions": [
+        "most recent perception project",
+        "experience with TensorRT",
+        "deploy a perception model",
+        "measure that latency",
+        "FP16 over INT8",
+        "grow in your next role"
+      ],
+      "implicitQuestions": [
+        "tight latency budget"
+      ]
+    }
+  },
+  {
+    "id": "hardware-planning",
+    "title": "Robot compute hardware planning",
+    "kind": "technical",
+    "lines": [
+      {
+        "speaker": "other",
+        "text": "Let's settle the compute plan for the second robot prototype today."
+      },
+      {
+        "speaker": "self",
+        "text": "Agreed. The perception stack has to run ROS 2 Humble with the CDTF camera nodes."
+      },
+      {
+        "speaker": "other",
+        "text": "Jetson devices are hard to order and have a long lead time right now.",
+        "pauseMs": 1500
+      },
+      {
+        "speaker": "self",
+        "text": "Then we should decide this week whether to wait for an Orin module or go with an x86 box and a discrete GPU."
+      },
+      {
+        "speaker": "other",
+        "text": "For the x86 option, the architecture is 16 GB RAM with a 1 TB SSD.",
+        "pauseMs": 1500
+      },
+      {
+        "speaker": "self",
+        "text": "Is 16 GB enough if we record rosbags while the detector is running?"
+      },
+      {
+        "speaker": "other",
+        "text": "Probably, as long as the SSD is NVMe and the bags go to a separate partition."
+      },
+      {
+        "speaker": "self",
+        "text": "What's the budget for the whole compute stack?"
+      },
+      {
+        "speaker": "other",
+        "text": "Finance approved $40,000 for compute hardware this quarter."
+      },
+      {
+        "speaker": "self",
+        "text": "That leaves room for two units plus a spare."
+      },
+      {
+        "speaker": "other",
+        "text": "Actually, I checked again and the cap is $25,000 including sensors."
+      },
+      {
+        "speaker": "self",
+        "text": "So we need to drop either the spare unit or the second lidar."
+      },
+      {
+        "speaker": "other",
+        "text": "Which option keeps the CDTF calibration workflow intact?"
+      },
+      {
+        "speaker": "self",
+        "text": "Dropping the spare unit, because both lidars feed the calibration rig."
+      },
+      {
+        "speaker": "other",
+        "text": "Okay, we decided to drop the spare and order one x86 unit now."
+      },
+      {
+        "speaker": "self",
+        "text": "I'll own the purchase request and send the quote by Thursday."
+      },
+      {
+        "speaker": "other",
+        "text": "Can you also check whether ROS 2 Jazzy supports our camera driver?"
+      },
+      {
+        "speaker": "self",
+        "text": "Yes, I'll test it on the bench next week."
+      }
+    ],
+    "expectations": {
+      "concepts": [
+        "CDTF",
+        "NVMe",
+        "ROS 2"
+      ],
+      "conflict": true,
+      "lookups": [
+        "lead time"
+      ],
+      "proposes": [
+        "16 GB RAM"
+      ],
+      "questions": [
+        "CDTF calibration workflow",
+        "ROS 2 Jazzy"
+      ],
+      "selfQuestions": [
+        "16 GB enough",
+        "budget for the whole compute stack"
+      ]
+    }
+  },
+  {
+    "id": "team-standup",
+    "title": "Team standup with a ship-date change",
+    "kind": "meeting",
+    "lines": [
+      {
+        "speaker": "other",
+        "text": "Morning everyone, quick standup. Let's start with blockers."
+      },
+      {
+        "speaker": "self",
+        "text": "The map tile service migration is done; the last integration test passed overnight."
+      },
+      {
+        "speaker": "other",
+        "text": "Nice. Priya, are you still blocked on the label export?"
+      },
+      {
+        "speaker": "other",
+        "text": "Yes, the export job times out after ten minutes on the large drives."
+      },
+      {
+        "speaker": "self",
+        "text": "I can pair with her after standup. I think the batch size is too large."
+      },
+      {
+        "speaker": "other",
+        "text": "Great, you own that. The plan is to ship the release on Friday."
+      },
+      {
+        "speaker": "self",
+        "text": "Friday works if QA signs off by Thursday noon."
+      },
+      {
+        "speaker": "other",
+        "text": "We agreed the release notes go out with the build, and Marco will write them."
+      },
+      {
+        "speaker": "self",
+        "text": "Who is updating the on-call rotation for release week?"
+      },
+      {
+        "speaker": "other",
+        "text": "I'll take that and post it in the team channel today."
+      },
+      {
+        "speaker": "other",
+        "text": "One change from the product side: we're moving the ship date to next Wednesday so the dashboard fix can land.",
+        "pauseMs": 1200
+      },
+      {
+        "speaker": "self",
+        "text": "Okay, then the QA sign-off moves to Tuesday."
+      },
+      {
+        "speaker": "other",
+        "text": "What's the risk if the dashboard fix slips again?"
+      },
+      {
+        "speaker": "self",
+        "text": "Then we ship without it behind a feature flag."
+      },
+      {
+        "speaker": "other",
+        "text": "Decided: feature flag fallback, ship next Wednesday, owners as discussed."
+      },
+      {
+        "speaker": "self",
+        "text": "I'll update the tracker after this call."
+      }
+    ],
+    "expectations": {
+      "conflict": true,
+      "questions": [
+        "blocked on the label export",
+        "dashboard fix slips"
+      ],
+      "selfQuestions": [
+        "on-call rotation"
+      ]
+    }
+  }
+]

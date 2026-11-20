@@ -1,0 +1,32 @@
+{
+  "name": "helix-g2",
+  "version": "0.7.0",
+  "private": true,
+  "description": "Helix conversation intelligence for Even Realities G2",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @helix/conversation-sdk && npm run build -w @helix/gateway && npm run build -w @helix/g2-plugin",
+    "test": "npm run test -w @helix/conversation-sdk && npm run test -w @helix/gateway && npm run test -w @helix/g2-plugin",
+    "check": "npm run build && npm run test",
+    "dev:gateway": "npm run dev -w @helix/gateway",
+    "dev:plugin": "npm run dev -w @helix/g2-plugin",
+    "pack:g2": "npm run pack -w @helix/g2-plugin"
+  },
+  "license": "MIT",
+  "author": "Art Jiang",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FJiangArthur/Even-G2-Intelligence.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FJiangArthur/Even-G2-Intelligence/issues"
+  },
+  "homepage": "https://github.com/FJiangArthur/Even-G2-Intelligence#readme"
+}
