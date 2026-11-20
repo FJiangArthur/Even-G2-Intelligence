@@ -19,7 +19,13 @@
         "wss://api.openai.com",
         "https://api.deepgram.com",
         "wss://stt-rt.soniox.com",
-        "https://api.omi.me"
+        "https://api.omi.me",
+        "https://api.deepseek.com",
+        "https://dashscope.aliyuncs.com",
+        "https://dashscope-intl.aliyuncs.com",
+        "https://open.bigmodel.cn",
+        "https://api.z.ai",
+        "https://api.moonshot.ai"
       ]
     }
   ],

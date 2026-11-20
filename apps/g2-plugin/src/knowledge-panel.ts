@@ -234,7 +234,7 @@ export class KnowledgePanel {
     localLabel.append(this.local, this.toggleText("Use saved knowledge in answers", "Answers may cite earlier sessions from all three sources"));
     const webLabel = el("label", "toggle"); webLabel.htmlFor = this.web.id;
     webLabel.append(this.web, this.toggleText("Live web fact check", "Short claims are checked as you talk"));
-    const disclosure = el("p", "field-note", "When enabled, short speech claims are sent to OpenAI web search. Search incurs provider charges. Checks may take time and do not verify every utterance. Imported summaries and AI answers are never used as memory evidence.");
+    const disclosure = el("p", "field-note", "When enabled, short speech claims are sent to the web search of your answer provider (OpenAI by default; see Setup → Copilot). Search incurs provider charges. Checks may take time and do not verify every utterance. Imported summaries and AI answers are never used as memory evidence.");
     this.local.addEventListener("change", () => { void controller.setLocalMemoryEnabled(this.local.checked); });
     this.web.addEventListener("change", () => { void controller.setLiveWebFactCheckEnabled(this.web.checked); });
     memory.append(localLabel, this.knowledgeControls(), webLabel, disclosure);

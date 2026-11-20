@@ -306,7 +306,9 @@ describe("plugin config safety", () => {
   it("defaults to the current answer/copilot models and realtime transcription", async () => {
     expect(DEFAULT_CONFIG.model).toBe(DEFAULT_ANSWER_MODEL);
     expect(DEFAULT_CONFIG.transcriptionProvider).toBe("openai-realtime");
-    expect(copilotSettingsFromConfig(DEFAULT_CONFIG)).toEqual({ ...DEFAULT_COPILOT_SETTINGS, mode: "general" });
+    // News-biased fact checks are on by default (the check lanes themselves stay opt-in); standard length sends nothing.
+    expect(copilotSettingsFromConfig(DEFAULT_CONFIG)).toEqual({ ...DEFAULT_COPILOT_SETTINGS, mode: "general", newsSearch: true });
+    expect(copilotSettingsFromConfig({ ...DEFAULT_CONFIG, newsSearch: false })).toEqual({ ...DEFAULT_COPILOT_SETTINGS, mode: "general" });
     await expect(loadPersistedConfig({ getLocalStorage: async () => "", setLocalStorage: async () => true })).resolves.toMatchObject({ model: DEFAULT_ANSWER_MODEL, copilotModel: "gpt-6-luna" });
   });
 
