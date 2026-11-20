@@ -2,6 +2,48 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
+## v0.13.0 — ambient glasses display, more answer providers, news-backed checks, PDFs
+
+Nothing in this release was run on G2 glasses or inside the Even Realities app, and no live request was made to DeepSeek, Qwen, Zhipu, Moonshot, OpenAI or Omi. Evidence: `npm run check` (conversation-sdk 385 tests, gateway 104, g2-plugin 294, all with fake providers and a fake bridge), one simulator smoke run of the ambient display, and a desktop browser with a fake bridge for the knowledge transfers. The device-only gates are listed in `docs/PIXEL_GESTURES.md`, `docs/PROVIDERS_AND_SEARCH.md` and `docs/MEMORY_GUIDE.md`.
+
+**Glasses: ambient display (new default).** Details: `docs/PIXEL_GESTURES.md`.
+
+- During a session the glasses are blank: no caption, views, clock or images. The start screen still shows when not connected, connecting, ended or waiting for "tap to resume"; a failed session shows the full HUD.
+- Answers pop up (THEY ASKED, a requested ANSWER with "Thinking…" while pending, ANSWER KEY), page by themselves and disappear 8 s after they finish. Cues pop up as `CONCEPT` / `LOOKUP` / `CHECK` / `FACT CHECK` (concept, finished lookup, conflict, verification and fact-check verdicts), last page at least 5 s. An answer has the display first; up to 3 cues wait and one that waited more than 45 s is dropped. Suggestions, summaries, key facts, claims and pending or failed lookups do not pop up.
+- Double-tap wakes the full HUD with the menu open; double-tap on the menu, or 20 s without a glasses gesture, returns to blank. While blank: tap pages or closes a pop-up, or asks about the last minute when nothing is showing; swipes page a pop-up; hold is unchanged. Selecting a phone tab does not wake the glasses.
+- `● listening` / `○ paused` / `○ mic off` shows in the status corner for 4 s on a mic change.
+- Pop-ups and their expiry are text writes only, under the existing debounce and write pacing; wake and hide are one page swap each.
+- Setup → G2 controls → "Always show the glasses HUD" restores the previous HUD (stored as `helix.glasses.display.v1`, applies live).
+- Simulator (evenhub-simulator 0.9.5, `scripts/qa_ambient.mjs`, fake provider): the blank frames had 0 lit pixels; the run printed `G2_AMBIENT_SMOKE_PASSED`. Simulator only, not hardware acceptance.
+
+**Answer providers: DeepSeek, Qwen, Zhipu GLM, Moonshot Kimi.** Details: `docs/PROVIDERS_AND_SEARCH.md`.
+
+- Six new profiles for answers and copilot through Chat Completions: `deepseek`, `qwen` (Beijing), `qwen-intl` (Singapore), `zhipu` (bigmodel.cn), `zai` (Z.ai), `moonshot`. Base URLs are fixed; all six origins are in the `app.json` whitelist. Per-provider differences (thinking switch, token-limit parameter, streaming usage, JSON mode) are explicit in `provider-registry.ts`.
+- A provider's key joins a session only when that provider is selected, is never written to the settings record, and is sent only to that provider's URL. Setup → API keys → "Test provider key" sends one small request.
+- A session no longer needs an OpenAI key (for example DeepSeek with Deepgram or Soniox). Connect names the missing key; Setup lists what is reduced without OpenAI (Responses API, model-list check, vector store, OpenAI transcription). History → Generate summary and OpenAI PDF parsing stay on an OpenAI model. A model id from another provider is replaced with a visible "Model switched" notice. Tap-to-resume accepts any key the selected session can use.
+- Provenance (endpoint id, URL, provider, model) names the real provider, e.g. `deepseek-direct`.
+- Cost estimates: DeepSeek uses its published peak rate (an upper bound); Qwen, GLM and Kimi show "price n/a".
+- Built from provider documentation read on 2026-11-19 and tested with mocked responses only. Not added: Doubao and SiliconFlow (parameters could not be verified) and the mainland Moonshot host.
+
+**News-backed fact checks.**
+
+- Setup → Copilot → "Prefer latest news in fact checks" (`newsSearch`, on by default). The check lanes themselves are still opt-in. The prompt carries today's date, and time-sensitive claims (English and Chinese keywords) are marked `recency: "news"`. With the lane enabled, statements about current events also qualify, so it runs somewhat more checks.
+- Citations carry `publishedAt` with `dateSource: "search"` (DeepSeek, Zhipu) or `"model"` (OpenAI, only for a URL that is a real citation). A verdict without a real source is still "uncertain".
+- Search route: DeepSeek `deepseek_web_search`, Zhipu Web Search API (`oneMonth` for time-sensitive claims, widened once), OpenAI Responses `web_search` (no recency parameter, so prompt-only). Qwen, Z.ai and Kimi fall back to OpenAI search when an OpenAI key is entered; otherwise the automatic lane stays silent and Verify says no web search is available. Setup shows which applies.
+- Phone: Checks cards show "latest news", "via <provider>" and source chips with site and date. Glasses: a news verdict reads `news check` and its pop-up ends with `Src: site · date · +n` for the newest dated source.
+
+**Answer length.** Setup → How Helix should help → Answer length: Brief / Standard / Detailed (`answerLength`, default `standard`). It drives live answers (sentence cap, wording, output tokens), copilot lookups and proposals, web-check verdicts and concept explanations. Standard sends the same prompts and limits as before (tested). Detailed lets an ambient cue use 6 pages instead of 3. Not covered: the legacy insight lane's explanation cap and the summary bullet counts.
+
+**Knowledge: transfers fixed, Omi automatic import, PDFs.** Details: `docs/MEMORY_GUIDE.md`.
+
+- **Export fix:** export clicked a hidden download link and always reported "Prepared …", although the Even bridge has no file-save API. It now tries a browser download (outside the embedded WebView), the share sheet, the clipboard, then an in-page Markdown view, and says which one happened.
+- **Note import fix:** one unreadable file used to reject the whole batch without a message, and notes past 200 were dropped silently. Each file is now read on its own and gets a result row; the picker no longer filters by type; paste and `https://` link import are fallbacks (link import is expected to fail inside the Even app, where only whitelisted origins are reachable).
+- **Omi automatic import** (new, off by default): at startup, on return to the foreground and every 30 min while open; retry 5 min after a failure. The switch and last outcome are stored under `helix.omi.auto-import.v1`; the key is not. An unreadable Omi conversation is skipped and counted instead of failing the import.
+- **PDF → Helix** (new): up to 20 PDFs per batch, 30 MB each, 400,000 characters kept per PDF, per-file progress and Cancel. Parser choice: on the phone (pdf.js 4.10.38, lazy-loaded, text layer only, first 500 pages, no OCR) or with OpenAI (Files API upload with `purpose=user_data`, Responses `input_file`, upload deleted afterwards; "Add a PDF by link" passes the URL to OpenAI). Parsed text is saved as a history session tagged `pdf` with page numbers, found by the existing keyword retrieval, and synced to the OpenAI knowledge base when that is in use.
+- **Package size:** pdf.js adds about 1.8 MB of lazily loaded chunks to the build, so the `.ehpk` grows. `npm run pack:g2` was not run for this release.
+
+**Docs:** `docs/MODES.md` and `docs/MODES.zh-CN.md` (a guide to all eight modes), `docs/PROVIDERS_AND_SEARCH.md`, a rewritten `README.md` and a new `README.zh-CN.md`. The app UI is still English only, so `supported_languages` is unchanged.
+
 ## v0.12.1 — cooler phone during long sessions
 
 Even's docs state no CPU, heat, memory or update-rate limits (Display, Device APIs, Networking, Background & Lifecycle, App Submission checked 2026-11-19). Measured in `qa/perf.html`, Helix's own JavaScript uses about 4 % of one core while listening, so the load that heats the phone is mostly radio and native work that Helix triggers. Reduced:
