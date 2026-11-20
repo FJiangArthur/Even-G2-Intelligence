@@ -9,9 +9,11 @@ import {
 } from "@helix/conversation-sdk";
 import type { G2ConversationController, HistoryState } from "./controller";
 import {
-  SOURCE_ICON, SOURCE_LABEL, cleanLineText, copyToClipboard, downloadFile, sessionKnowledge, sessionSource, sessionTitle,
+  SOURCE_ICON, SOURCE_LABEL, cleanLineText, copyToClipboard, sessionKnowledge, sessionSource, sessionTitle,
 } from "./history-panel";
 import { icon, type IconName } from "./pixel-art";
+import { PDF_LIMITS, type PdfFileStatus, type PdfInput, type PdfParser } from "@helix/conversation-sdk";
+import { browserTransferEnv, exportFile, fetchTextFromUrl, importUrl, inEmbeddedWebView, readTextFiles, urlFileName } from "./file-transfer";
 
 /* ================================================================ SDK adapter */
 
@@ -50,6 +52,35 @@ export function omiExportSummary(results: readonly OmiExportResult[]): { exporte
 /** All files as one Markdown document (the Copy fallback when downloads are blocked). */
 export function combinedMarkdown(files: readonly MarkdownFile[]): string {
   return files.map(file => `<!-- ${file.path} -->\n${file.content.trim()}`).join("\n\n---\n\n");
+}
+
+/* ============================================================ v0.13 status text */
+
+export interface FileLine { readonly name: string; readonly state: "working" | "done" | "failed"; readonly detail: string }
+const PDF_STATE_TEXT: Readonly<Record<PdfFileStatus["state"], string>> = {
+  queued: "Waiting", reading: "Reading the file…", uploading: "Uploading to OpenAI…", parsing: "Reading the text…", saving: "Saving on this phone…",
+  done: "Added", failed: "Failed", cancelled: "Cancelled",
+};
+/** One PDF's progress as a row: state, counts and the error or limit that applies. */
+export function pdfFileLine(file: PdfFileStatus, parser?: PdfParser): FileLine {
+  const state = file.state === "done" ? "done" : file.state === "failed" || file.state === "cancelled" ? "failed" : "working";
+  let detail = file.state === "parsing" && parser === "openai" ? "OpenAI is reading the PDF… (can take a minute)" : PDF_STATE_TEXT[file.state];
+  if (file.state === "done") detail = `Added: ${file.pages ?? 0} page${file.pages === 1 ? "" : "s"}, ${file.passages ?? 0} searchable passage${file.passages === 1 ? "" : "s"}${file.detail ? `. ${file.detail}` : ""}`;
+  else if (file.detail) detail = file.state === "failed" ? `Failed: ${file.detail}` : file.detail;
+  return { name: file.name, state, detail };
+}
+/** Per-note outcome of a Markdown import, in the order the files were given. */
+export function markdownFileLines(names: readonly string[], unreadable: readonly { name: string; error: string }[], failed: readonly { name: string; error: string }[]): FileLine[] {
+  const errors = new Map([...failed, ...unreadable].map(item => [item.name, item.error]));
+  return names.map(name => errors.has(name) ? { name, state: "failed" as const, detail: `Failed: ${errors.get(name)!.replace(`${name}: `, "")}` } : { name, state: "done" as const, detail: "Imported" });
+}
+/** The Omi auto-import line under its switch. */
+export function autoImportText(view: { enabled: boolean; running: boolean; lastSuccessAt?: string; lastImported?: number; lastError?: string }, format: (iso: string) => string = iso => new Date(iso).toLocaleString()): string {
+  if (!view.enabled) return "Off. Omi conversations are imported only when you tap Import from Omi.";
+  if (view.running) return "Importing new Omi conversations…";
+  const last = view.lastSuccessAt ? `Last import ${format(view.lastSuccessAt)}: ${view.lastImported ?? 0} conversation${view.lastImported === 1 ? "" : "s"} checked.` : "";
+  if (view.lastError) return `Not imported: ${view.lastError}${last ? ` ${last}` : ""} Helix retries in a few minutes while this page is open.`;
+  return last ? `${last} Checks again about every 30 minutes while Helix is open.` : "On. The first import starts now and covers the last 14 days.";
 }
 
 /* ======================================================== stats & diagram model */
@@ -202,6 +233,19 @@ export class KnowledgePanel {
   private readonly obsidianToOmiButton = button("Send Obsidian notes to Omi", "button button-secondary button-small", "send");
   private readonly omiReason = el("p", "field-note");
   private readonly downloadSlot = el("div", "download-slot");
+  // v0.13: results are shown next to the control that produced them, not only at the top of the tab.
+  private readonly exportStatus = el("p", "field-note io-status");
+  private readonly importStatus = el("p", "field-note io-status");
+  private readonly importList = el("ul", "file-status-list");
+  private readonly omiStatus = el("p", "field-note io-status");
+  private readonly autoImport = el("input");
+  private readonly autoImportStatus = el("p", "field-note io-status");
+  private readonly pdfList = el("ul", "file-status-list");
+  private readonly pdfStatus = el("p", "field-note io-status");
+  private readonly pdfCancel = button("Cancel", "button button-quiet button-small", "stop");
+  private pdfBusy: HTMLElement[] = [];
+  private pdfSignature = "[]";
+  private readonly onVisible = () => { if (document.visibilityState === "visible") void this.controller.maybeAutoImport("resume"); };
   private readonly unsubscribe: () => void;
   private signature = "";
   private notice = "";
@@ -220,8 +264,9 @@ export class KnowledgePanel {
     const transfers = this.group("Transfers", "send", "Move context between Helix, Obsidian and Omi.");
     transfers.append(
       this.route("helix", "obsidian", "Export sessions as Markdown notes with summary, people, concepts and a Mermaid map.", this.exportControls()),
-      this.route("obsidian", "helix", "Import .md notes. Summary, key facts, people and “Speaker: text” lines are kept.", this.importControls()),
+      this.route("obsidian", "helix", "Import .md or .txt notes: choose files, paste text, or load a link. Summary, key facts, people and “Speaker: text” lines are kept.", this.importControls()),
       this.route("omi", "helix", "Import your Omi conversations (uses the Omi API key in Setup → API keys). Repeat imports update existing records.", this.omiImportControls()),
+      this.pdfCard(),
       this.route("helix", "omi", "Send saved sessions to Omi as conversations. Needs an Omi developer key with conversations:write; Omi accepts about 25 per hour.", this.omiExportControls()),
       this.route("obsidian", "omi", "Import notes from Obsidian first, then send them to Omi.", this.obsidianToOmiControls()),
     );
@@ -241,10 +286,24 @@ export class KnowledgePanel {
 
     this.panel.prepend(this.status);
     root.append(this.panel);
+    for (const node of [this.exportStatus, this.importStatus, this.omiStatus, this.autoImportStatus, this.pdfStatus]) node.setAttribute("role", "status");
     this.unsubscribe = controller.subscribeHistory(state => this.render(state));
+    // v0.13 Omi auto-import: the controller checks once now and then every minute; also when the app returns to the foreground.
+    controller.configureAutoImport(options.omiKey);
+    document.addEventListener("visibilitychange", this.onVisible);
   }
 
-  public dispose(): void { this.unsubscribe(); this.panel.remove(); }
+  public dispose(): void { document.removeEventListener("visibilitychange", this.onVisible); this.unsubscribe(); this.panel.remove(); }
+
+  /** A result line beside the control that produced it, mirrored in the tab's status line. */
+  private say(node: HTMLElement, message: string): void { node.textContent = message; this.setNotice(message); }
+  private fileRows(list: HTMLElement, lines: readonly FileLine[]): void {
+    list.replaceChildren(...lines.map(line => {
+      const row = el("li", `file-status is-${line.state}`);
+      row.append(el("span", "file-status-name", line.name), el("span", "file-status-detail", line.detail));
+      return row;
+    }));
+  }
 
   private group(title: string, iconName: IconName, copy: string): HTMLElement {
     const section = el("section", "config-group knowledge-group");
@@ -268,63 +327,170 @@ export class KnowledgePanel {
 
   private exportControls(): HTMLElement {
     const row = el("div", "button-row");
-    const vault = button("Download vault", "button button-secondary button-small", "download");
+    const vault = button("Export vault", "button button-secondary button-small", "download");
     const copy = button("Copy Markdown", "button button-secondary button-small", "copy");
+    const show = button("Show Markdown here", "button button-quiet button-small", "book");
+    const view = el("textarea", "export-view"); view.readOnly = true; view.rows = 8; view.hidden = true; view.id = "vault-export-view";
+    view.setAttribute("aria-label", "Exported Markdown. Select all and copy.");
+    const reveal = (text: string) => { view.value = text; view.hidden = false; view.focus({ preventScroll: true }); view.select(); };
     vault.addEventListener("click", () => {
       const files = this.controller.vaultFiles();
-      if (!files.length) { this.setNotice("Nothing to export yet."); return; }
-      const single = files.length === 1;
-      const result = single ? downloadFile(files[0]!.path.split("/").pop()!, files[0]!.content, "text/markdown")
-        : downloadFile(`helix-vault-${new Date().toISOString().slice(0, 10)}.zip`, zipFiles(files), "application/zip");
-      this.downloadSlot.replaceChildren(...(result.link ? [result.link] : []));
-      this.setNotice(result.ok ? `Prepared ${result.name} (${files.length} note${files.length === 1 ? "" : "s"}). Unzip it into your vault. If nothing downloaded, tap the link or use Copy Markdown.` : "Downloads are blocked in this app. Use Copy Markdown and paste into Obsidian.");
+      if (!files.length) { this.say(this.exportStatus, "Nothing to export yet."); return; }
+      const text = combinedMarkdown(files), count = `${files.length} note${files.length === 1 ? "" : "s"}`;
+      const file = files.length === 1 ? { name: files[0]!.path.split("/").pop()!, content: files[0]!.content, type: "text/markdown", text }
+        : { name: `helix-vault-${new Date().toISOString().slice(0, 10)}.zip`, content: zipFiles(files), type: "application/zip", text };
+      // Called straight from the tap: the share sheet needs the user gesture. The line below stays while a share sheet is open.
+      this.say(this.exportStatus, `Exporting ${count}… If a share sheet opened, choose where to save. Otherwise use Copy Markdown or Show Markdown here.`);
+      void exportFile<HTMLAnchorElement>(file, browserTransferEnv(copyToClipboard)).then(result => {
+        this.downloadSlot.replaceChildren(...(result.link ? [result.link] : []));
+        if (result.method === "view") reveal(text);
+        this.say(this.exportStatus, result.cancelled ? result.message : `${result.message} (${count}${file.type === "application/zip" && (result.method === "share" || result.method === "download") ? "; unzip it into your vault" : ""})`);
+      });
     });
     copy.addEventListener("click", () => {
       const files = this.controller.vaultFiles();
-      void copyToClipboard(combinedMarkdown(files)).then(ok => this.setNotice(ok ? `Copied ${files.length} note${files.length === 1 ? "" : "s"} as Markdown.` : "Copy was blocked. Export a single session from History and select its Markdown preview."));
+      if (!files.length) { this.say(this.exportStatus, "Nothing to export yet."); return; }
+      const text = combinedMarkdown(files);
+      void copyToClipboard(text).then(ok => {
+        if (!ok) reveal(text);
+        this.say(this.exportStatus, ok ? `Copied ${files.length} note${files.length === 1 ? "" : "s"} as Markdown.` : "Copy was blocked. The Markdown is shown below: select all of it and copy.");
+      });
     });
-    row.append(vault, copy);
-    const wrap = el("div", "route-controls"); wrap.append(row, this.downloadSlot,
-      el("p", "field-note", "One session at a time: History → open a session → Export .md."));
+    show.addEventListener("click", () => {
+      if (!view.hidden) { view.hidden = true; return; }
+      const files = this.controller.vaultFiles();
+      if (!files.length) { this.say(this.exportStatus, "Nothing to export yet."); return; }
+      reveal(combinedMarkdown(files));
+    });
+    row.append(vault, copy, show);
+    const wrap = el("div", "route-controls"); wrap.append(row, this.exportStatus, this.downloadSlot, view,
+      el("p", "field-note", inEmbeddedWebView()
+        ? "Inside the Even app, Export opens the share sheet when the phone offers one; otherwise the notes are copied to the clipboard or shown here. One session at a time: History → open a session → Export .md."
+        : "One session at a time: History → open a session → Export .md."));
     return wrap;
   }
 
   private importControls(): HTMLElement {
     const wrap = el("div", "route-controls");
-    const input = el("input"); input.type = "file"; input.multiple = true; input.accept = ".md,text/markdown"; input.id = "obsidian-import-files";
+    // No `accept` filter: iOS greys out .md files for extension filters it does not know. The content is checked after reading.
+    const input = el("input"); input.type = "file"; input.multiple = true; input.id = "obsidian-import-files";
     const label = el("label", "file-pick"); label.htmlFor = input.id;
-    label.append(iconSpan("upload", "button-icon"), el("span", "button-label", "Choose .md files"), input);
+    label.append(iconSpan("upload", "button-icon"), el("span", "button-label", "Choose note files"), input);
     input.addEventListener("change", () => {
       const files = [...(input.files ?? [])];
-      if (!files.length) return;
-      void Promise.all(files.map(async file => ({ name: file.name, text: await file.text() })))
-        .then(items => this.importMarkdown(items))
+      if (!files.length) { this.say(this.importStatus, "No file was selected."); return; }
+      this.say(this.importStatus, `Reading ${files.length} file${files.length === 1 ? "" : "s"}…`);
+      void readTextFiles(files)
+        .then(read => this.importMarkdown(read.flatMap(item => item.ok ? [{ name: item.name, text: item.text }] : []), read.flatMap(item => item.ok ? [] : [{ name: item.name, error: item.error }])))
+        .catch(error => this.say(this.importStatus, `Import failed: ${error instanceof Error ? error.message : String(error)}`))
         .finally(() => { input.value = ""; });
     });
     const paste = el("details", "paste-markdown");
-    const summary = el("summary", "", "Paste Markdown instead");
+    const summary = el("summary", "", "Paste text instead (no file picker needed)");
     const area = el("textarea"); area.id = "obsidian-paste"; area.rows = 6; area.placeholder = "# Note title\n\n## Summary\n- …\n\nPriya: …";
     const pasteLabel = el("label", "sr-only", "Markdown to import"); pasteLabel.htmlFor = area.id;
     const go = button("Import pasted note", "button button-secondary button-small", "upload");
     go.addEventListener("click", () => {
       const text = area.value;
-      if (!text.trim()) { this.setNotice("Paste a Markdown note first."); return; }
+      if (!text.trim()) { this.say(this.importStatus, "Paste a Markdown note first."); return; }
       const title = /^#\s+(.+)$/mu.exec(text)?.[1]?.trim() ?? "Pasted note";
       void this.importMarkdown([{ name: `${title.slice(0, 60)}.md`, text }]).then(ok => { if (ok) area.value = ""; });
     });
     paste.append(summary, pasteLabel, area, go);
-    wrap.append(label, paste);
+    const link = el("details", "paste-markdown");
+    const url = el("input"); url.type = "url"; url.id = "obsidian-import-url"; url.placeholder = "https://…/note.md"; url.autocapitalize = "none"; url.spellcheck = false;
+    const urlLabel = el("label", "sr-only", "Link to a Markdown or text file"); urlLabel.htmlFor = url.id;
+    const load = button("Import from link", "button button-secondary button-small", "download");
+    load.addEventListener("click", () => {
+      load.disabled = true; this.say(this.importStatus, "Loading the link…");
+      void fetchTextFromUrl(url.value).then(file => this.importMarkdown([file])).then(ok => { if (ok) url.value = ""; })
+        .catch(error => this.say(this.importStatus, error instanceof Error ? error.message : String(error)))
+        .finally(() => { load.disabled = false; });
+    });
+    link.append(el("summary", "", "Import from a link"), urlLabel, url, load,
+      el("p", "field-note", "Works for links that allow cross-site reads. Inside the Even app only the plugin's listed provider hosts can be reached, so most links fail there: paste the text instead."));
+    wrap.append(label, paste, link, this.importStatus, this.importList);
     return wrap;
   }
 
-  private async importMarkdown(files: { name: string; text: string }[]): Promise<boolean> {
-    this.setNotice(`Importing ${files.length} note${files.length === 1 ? "" : "s"}…`);
+  private async importMarkdown(files: { name: string; text: string }[], unreadable: { name: string; error: string }[] = []): Promise<boolean> {
+    const names = [...files.map(file => file.name), ...unreadable.map(file => file.name)];
+    if (!files.length) {
+      this.fileRows(this.importList, markdownFileLines(names, unreadable, []));
+      this.say(this.importStatus, `Nothing imported: ${unreadable.length} file${unreadable.length === 1 ? "" : "s"} could not be read.`);
+      return false;
+    }
+    this.say(this.importStatus, `Importing ${files.length} note${files.length === 1 ? "" : "s"}…`);
     try {
       const result = await this.controller.importMarkdownFiles(files);
-      const failed = result.failed.length ? ` ${result.failed.length} failed: ${result.failed.map(item => item.error).join("; ")}` : "";
-      this.setNotice(`Imported ${result.imported} note${result.imported === 1 ? "" : "s"} from Obsidian.${failed}`);
+      const failed = result.failed.length + unreadable.length;
+      this.fileRows(this.importList, markdownFileLines(names, unreadable, result.failed));
+      this.say(this.importStatus, `Imported ${result.imported} of ${names.length} note${names.length === 1 ? "" : "s"}.${failed ? ` ${failed} failed (see below).` : ""}`);
       return result.imported > 0;
-    } catch (error) { this.setNotice(error instanceof Error ? error.message : String(error)); return false; }
+    } catch (error) { this.say(this.importStatus, `Import failed: ${error instanceof Error ? error.message : String(error)}`); return false; }
+  }
+
+  /** v0.13: several PDFs into the knowledge base, parsed on the phone or by OpenAI. */
+  private pdfCard(): HTMLElement {
+    const card = el("article", "route-card route-pdf");
+    const head = el("div", "route-head");
+    const from = el("span", "source-badge badge-pdf"); from.append(iconSpan("book", "badge-icon"), "PDF");
+    const arrow = el("span", "route-arrow"); arrow.setAttribute("aria-hidden", "true");
+    const to = el("span", "source-badge badge-helix"); to.append(iconSpan(SOURCE_ICON.helix, "badge-icon"), SOURCE_LABEL.helix);
+    head.append(from, arrow, to); head.setAttribute("aria-label", "PDF documents to Helix");
+    const megabytes = Math.round(PDF_LIMITS.maxBytes / 1024 / 1024);
+    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. They are listed under Obsidian with the tag “pdf”.`);
+    const box = el("fieldset", "toggle-group pdf-parser"); box.append(el("legend", "", "Read the PDFs"));
+    const local = el("input"), openai = el("input");
+    const option = (input: HTMLInputElement, value: PdfParser, title: string, note: string) => {
+      input.type = "radio"; input.name = "pdf-parser"; input.value = value; input.id = `pdf-parser-${value}`;
+      const label = el("label", "toggle"); label.htmlFor = input.id; label.append(input, this.toggleText(title, note)); return label;
+    };
+    box.append(
+      option(local, "local", "On this phone", `Nothing is uploaded and it costs nothing. Reads the text layer only: scanned or photographed PDFs have no text to read (no OCR), and multi-column pages can come out mixed. First ${PDF_LIMITS.maxPages} pages.`),
+      option(openai, "openai", "With OpenAI", "Uploads each PDF to your OpenAI project with the key from Setup. OpenAI reads the text and an image of every page, so scanned PDFs work; you pay for input tokens per page plus the transcribed text as output tokens. The upload is deleted from OpenAI when the PDF is done."),
+    );
+    local.checked = true;
+    const parser = (): PdfParser => openai.checked ? "openai" : "local";
+    const input = el("input"); input.type = "file"; input.multiple = true; input.accept = "application/pdf,.pdf"; input.id = "pdf-import-files";
+    const pick = el("label", "file-pick"); pick.htmlFor = input.id;
+    pick.append(iconSpan("upload", "button-icon"), el("span", "button-label", "Choose PDFs"), input);
+    const start = (inputs: PdfInput[], done: () => void) => {
+      if (!inputs.length) { this.say(this.pdfStatus, "No PDF was selected."); done(); return; }
+      const mode = parser();
+      this.say(this.pdfStatus, mode === "openai" ? `Sending ${inputs.length} PDF${inputs.length === 1 ? "" : "s"} to OpenAI, one at a time…` : `Reading ${inputs.length} PDF${inputs.length === 1 ? "" : "s"} on this phone…`);
+      void this.controller.importPdfs(inputs, { parser: mode, openaiKey: this.options.openaiKey?.() ?? "",
+        // pdfjs is a separate chunk, fetched only now.
+        extractLocal: async (data, extract) => (await import("./pdf-local")).extractPdfText(data, extract) })
+        .then(files => {
+          const added = files.filter(file => file.state === "done").length, failed = files.length - added;
+          this.say(this.pdfStatus, `Added ${added} of ${files.length} PDF${files.length === 1 ? "" : "s"}.${failed ? ` ${failed} not added (see below).` : ""}${added ? " Ask about them, or find them in History." : ""}`);
+        })
+        .catch(error => this.say(this.pdfStatus, error instanceof Error ? error.message : String(error)))
+        .finally(done);
+    };
+    input.addEventListener("change", () => {
+      const files = [...(input.files ?? [])];
+      start(files.map(file => ({ name: file.name, size: file.size, data: file })), () => { input.value = ""; });
+    });
+    const link = el("details", "paste-markdown");
+    const url = el("input"); url.type = "url"; url.id = "pdf-import-url"; url.placeholder = "https://…/paper.pdf"; url.autocapitalize = "none"; url.spellcheck = false;
+    const urlLabel = el("label", "sr-only", "Link to a PDF"); urlLabel.htmlFor = url.id;
+    const add = button("Add PDF from link (OpenAI)", "button button-secondary button-small", "download");
+    add.addEventListener("click", () => {
+      let target: URL;
+      try { target = importUrl(url.value); } catch (error) { this.say(this.pdfStatus, error instanceof Error ? error.message : String(error)); return; }
+      openai.checked = true; // a link is fetched by OpenAI, not by the phone
+      start([{ name: urlFileName(target, "pdf"), url: target.toString() }], () => { url.value = ""; });
+    });
+    link.append(el("summary", "", "No file picker? Add a PDF by link"), urlLabel, url, add,
+      el("p", "field-note", "The link is sent to OpenAI, which downloads and reads the PDF (publicly reachable https links only). The phone does not download it, so this also works where the file picker does not."));
+    this.pdfCancel.id = "pdf-import-cancel"; this.pdfCancel.hidden = true;
+    this.pdfCancel.addEventListener("click", () => this.controller.cancelPdfImport());
+    this.pdfBusy = [input, add, local, openai];
+    const controls = el("div", "route-controls"); controls.append(box, pick, link, this.pdfCancel, this.pdfStatus, this.pdfList);
+    card.append(head, copy, controls);
+    return card;
   }
 
   private omiImportControls(): HTMLElement {
@@ -336,12 +502,19 @@ export class KnowledgePanel {
     const grid = el("div", "field-grid"); grid.append(startLabel, endLabel);
     this.importButton.id = "import-omi"; this.cancelButton.id = "cancel-omi-import";
     this.importButton.addEventListener("click", () => {
+      if (!this.options.omiKey().trim()) { this.say(this.omiStatus, "Enter your Omi developer API key in Setup → API keys first."); return; }
       void this.controller.importOmi({ key: this.options.omiKey(), ...(start.value ? { startDate: start.value } : {}), ...(end.value ? { endDate: `${end.value}T23:59:59.999Z` } : {}) })
-        .catch(error => this.setNotice(error instanceof Error ? error.message : String(error)));
+        .catch(error => this.say(this.omiStatus, error instanceof Error ? error.message : String(error)));
     });
     this.cancelButton.addEventListener("click", () => this.controller.cancelImport());
     const row = el("div", "button-row"); row.append(this.importButton, this.cancelButton);
-    wrap.append(grid, row);
+    // v0.13 auto-import
+    this.autoImport.type = "checkbox"; this.autoImport.id = "omi-auto-import";
+    const autoLabel = el("label", "toggle"); autoLabel.htmlFor = this.autoImport.id;
+    autoLabel.append(this.autoImport, this.toggleText("Import new Omi conversations automatically", "When Helix opens and about every 30 minutes while it is open. Needs the Omi key saved on this phone."));
+    this.autoImport.addEventListener("change", () => { void this.controller.setAutoImportEnabled(this.autoImport.checked); });
+    wrap.append(grid, row, this.omiStatus, autoLabel, this.autoImportStatus,
+      el("p", "field-note", "Automatic import cannot run while the Even app is closed or Helix is not open: plugins have no background execution."));
     return wrap;
   }
 
@@ -362,7 +535,8 @@ export class KnowledgePanel {
   }
 
   private async sendToOmi(source: KnowledgeSource): Promise<void> {
-    const ids = this.controller.listHistorySessions().filter(session => sessionSource(session) === source).map(session => session.id);
+    // v0.13: PDF documents are stored under the Obsidian source but are not notes to send to Omi.
+    const ids = this.controller.listHistorySessions().filter(session => sessionSource(session) === source && !session.id.startsWith("pdf:")).map(session => session.id);
     if (!ids.length) { this.setNotice(source === "obsidian" ? "Import notes from Obsidian first." : "No Helix sessions to send yet."); return; }
     this.omiExportButton.disabled = this.obsidianToOmiButton.disabled = true;
     try {
@@ -432,6 +606,15 @@ export class KnowledgePanel {
     this.local.checked = state.useLocalMemory; this.web.checked = state.liveWebFactCheck;
     this.renderKnowledgeBase(state);
     this.importButton.disabled = state.importing; this.cancelButton.disabled = !state.importing;
+    // v0.13: Omi import progress beside its buttons, auto-import state, PDF progress.
+    if (state.importing || /Omi|conversations/u.test(state.status)) this.omiStatus.textContent = state.status;
+    this.autoImport.checked = state.autoImport.enabled;
+    this.autoImportStatus.textContent = autoImportText(state.autoImport);
+    this.autoImportStatus.classList.toggle("is-warning", state.autoImport.enabled && !!state.autoImport.lastError);
+    this.pdfCancel.hidden = !state.pdfImport.running;
+    for (const node of this.pdfBusy) (node as HTMLInputElement | HTMLButtonElement).disabled = state.pdfImport.running;
+    const pdfLines = state.pdfImport.files.map(file => pdfFileLine(file, state.pdfImport.parser)), pdfSignature = JSON.stringify(pdfLines);
+    if (pdfSignature !== this.pdfSignature) { this.pdfSignature = pdfSignature; this.fileRows(this.pdfList, pdfLines); }
     if (!this.notice) this.status.textContent = state.status;
     if (this.panel.closest("[hidden]")) { this.dirty = true; return; }
     const support = this.controller.omiExportSupport();

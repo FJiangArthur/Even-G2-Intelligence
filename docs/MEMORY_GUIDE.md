@@ -4,11 +4,66 @@ Release target: 0.6.0. See MEMORY_FACTS_QA.md for actual validation/upload statu
 
 ## Import Omi records
 
-Omi integration imports conversations and their transcript passages into this phone's Helix history. It does not search Omi while generating answers, and it does not automatically upload Helix notes to Omi.
+Omi integration imports conversations and their transcript passages into this phone's Helix history. It does not search Omi while generating answers, and it does not automatically upload Helix notes to Omi. Import is manual unless you turn on automatic import (below).
 
 Use an Omi **Developer API Key** with conversation-read access, obtained in the Omi app's **Settings → Developer → Create Key**, not a key from its MCP settings. Enter it in the masked Omi key field, choose the desired date range in History, and use the explicit import action. You can cancel an import. Previously saved pages remain available after a cancellation or network failure; retrying upserts matching records instead of duplicating them. The imported count means conversations processed in that run, including records already present.
 
 No key is stored inside the history archive. The separate save-API-keys option is an explicit opt-in to ordinary Even App local storage, not a documented encrypted vault.
+
+### Import automatically (0.13)
+
+**Knowledge → Transfers → Omi → Helix → Import new Omi conversations automatically** is OFF by default. Until 0.13 there was no automatic import at all: Omi conversations arrived only when you tapped **Import from Omi**.
+
+When it is ON, Helix imports when the app opens, when it returns to the foreground, and about every 30 minutes while it stays open (a failed attempt is retried after 5 minutes). The first run covers the last 14 days; later runs start one day before the last successful run, and repeated records are updated, not duplicated. The line under the switch shows the last result or the reason nothing was imported.
+
+- It needs the Omi developer key at that moment. After a restart the key is only there if **Save API keys on this phone** is on; otherwise the status line says the key is missing and the import starts as soon as you enter it.
+- It cannot run while the Even app is closed or Helix is not open. Plugins have no background execution.
+- The switch and the last outcome are stored under `helix.omi.auto-import.v1`. The key and conversation text are never written there.
+- A conversation Omi returns in a form Helix cannot read is skipped and counted instead of failing the whole import (this also applies to the manual import). Timestamps without a UTC offset are read as UTC.
+
+## Import notes, export notes (0.13)
+
+All of this is in **Knowledge → Transfers**. Every action now reports next to its own button, with one row per file.
+
+**Import (Obsidian → Helix).** Three ways, because the Even app's WebView may not offer a file picker:
+
+1. **Choose note files**: several `.md` / `.txt` files at once. Each file gets its own row (imported, or the reason it failed). One unreadable file no longer cancels the others. Limits: 2 MB per note, 200 notes per batch.
+2. **Paste text instead**: no file picker needed.
+3. **Import from a link**: an `https://` link to a Markdown or text file. This only works when the site allows cross-site reads; inside the Even app only the plugin's whitelisted provider hosts are reachable, so expect it to fail there and paste the text instead.
+
+**Export (Helix → Obsidian).** **Export vault** tries, in order, and tells you which one happened:
+
+1. In an ordinary browser: a normal download (one `.md`, or a `.zip` of notes).
+2. In the Even app: the system share sheet with the file, where the phone's WebView offers it ("Save to Files", Obsidian, AirDrop…).
+3. The notes copied to the clipboard as one Markdown document.
+4. The Markdown shown in the page (**Show Markdown here**) to select and copy by hand.
+
+Before 0.13 the app clicked a hidden download link and always reported "Prepared …". The Even bridge has no file-save API and an embedded WebView only saves such a link if the host app handles downloads, so in the app nothing was saved. Helix no longer attempts that link inside the Even app.
+
+## PDF documents (0.13)
+
+**Knowledge → Transfers → PDF → Helix** adds PDFs to the knowledge base: up to 20 per batch, 30 MB each, at most 400,000 characters of text kept per PDF. Each PDF has its own progress row; one failing does not affect the others, and **Cancel** keeps what was already added. Adding the same file again replaces it.
+
+Choose how the PDFs are read:
+
+| | On this phone | With OpenAI |
+|---|---|---|
+| Upload | None | Each PDF is uploaded to your OpenAI project with the key from Setup |
+| Cost | None | Billed to your key: input tokens for the text and an image of every page, plus the transcription as output tokens |
+| Scanned / photographed PDFs | Not readable (no OCR): reported as "No selectable text found" | Readable, the model sees the page images |
+| Limits | Text layer only; first 500 pages; multi-column pages and tables can come out mixed; password-protected PDFs are rejected | Long documents can be cut at the model's output limit (reported as "text was cut") |
+| After parsing | — | The upload is deleted from OpenAI again |
+| By link | No (needs the file) | Yes: **Add a PDF by link** sends the link to OpenAI, which downloads it. Use this when the file picker is unavailable |
+
+The on-phone parser is pdf.js. It is loaded only when the first PDF is parsed, so it does not slow app start, but it adds about 1.8 MB to the plugin package.
+
+The text is saved on the phone as an ordinary knowledge document: listed under **Obsidian** with the tag `pdf`, visible in History, deletable there, and counted in the 5 MiB archive limit. The on-phone keyword search uses it in answers like any other passage, with the page number kept. If **OpenAI knowledge base** is selected and already created, newly added PDFs are synced to it right away; otherwise they are included in the next **Sync to OpenAI**. PDFs are not sent by **Send Obsidian notes to Omi**.
+
+### What was checked where
+
+Checked by automated tests and in a desktop browser with a fake bridge (`apps/g2-plugin/qa/knowledge-io.html`): the fallback order, per-file results, auto-import schedule and persistence, both PDF parsers against a fake OpenAI, and real PDF bytes through pdf.js.
+
+Not checked, needs the real Even app on a phone: whether its WebView opens a file picker for `<input type="file">` (and with multiple selection), whether it offers the share sheet with files, whether the clipboard works there, whether pdf.js can start its worker from the app's origin (it falls back to the main thread), and the real OpenAI and Omi responses.
 
 ## Search and use local memory
 
@@ -47,3 +102,5 @@ Use the native OS tap-then-hold menu or the phone Shortcuts button for Explain t
 - [Omi Developer API](https://docs.omi.me/api-reference/introduction)
 - [Omi conversation list and transcript inclusion](https://docs.omi.me/api-reference/endpoint/conversations/list)
 - [OpenAI Responses web search](https://developers.openai.com/api/docs/guides/tools-web-search)
+- [OpenAI file inputs (PDF `input_file`, 50 MB limits, text + page images)](https://developers.openai.com/api/docs/guides/file-inputs)
+- [OpenAI Files API (`purpose: user_data`)](https://developers.openai.com/api/reference/resources/files/methods/create)

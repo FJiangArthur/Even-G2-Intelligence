@@ -1,6 +1,7 @@
 import type { HistoryEntry, HistorySession, RetrievedMemory } from "@helix/conversation-sdk";
 import type { G2ConversationController, HistoryState } from "./controller";
 import { icon, type IconName } from "./pixel-art";
+import { browserTransferEnv, exportFile } from "./file-transfer";
 
 export function safeSourceUrl(value: string): string | undefined {
   if (/[\u0000- \u007f]/u.test(value)) return;
@@ -454,9 +455,12 @@ export class HistoryPanel {
     if (!support.supported) omiButton.title = support.reason;
     const markdown = () => this.controller.sessionMarkdown(session.id) ?? "";
     exportButton.addEventListener("click", () => {
-      const result = downloadFile(markdownFileName(card.title, session.startedAt), markdown(), "text/markdown");
-      this.setNotice(result.ok ? `Saved ${result.name}. If nothing downloaded, use Copy Markdown.` : "Downloads are blocked here. Use Copy Markdown instead.");
-      if (result.link) this.detail.querySelector(".detail-actions")?.append(result.link);
+      // v0.13: share sheet -> browser download -> clipboard -> Markdown preview, and the notice says which one happened.
+      const text = markdown();
+      void exportFile<HTMLAnchorElement>({ name: markdownFileName(card.title, session.startedAt), content: text, type: "text/markdown", text }, browserTransferEnv(copyToClipboard)).then(result => {
+        this.setNotice(result.method === "view" ? "Saving and copying are both blocked here. Open “Markdown for Obsidian” below and select the text." : result.message);
+        if (result.link) this.detail.querySelector(".detail-actions")?.append(result.link);
+      });
     });
     copyButton.addEventListener("click", () => { void copyToClipboard(markdown()).then(ok => this.setNotice(ok ? "Markdown copied. Paste it into a new Obsidian note." : "Copy was blocked. Open the Markdown preview below and select the text.")); });
     omiButton.addEventListener("click", () => {
@@ -621,6 +625,8 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * @deprecated v0.13: use exportFile() from ./file-transfer, which falls back to the share sheet,
+ * the clipboard or an in-page view and reports which one happened. This always reports ok.
  * Blob + object-URL download. Also returns a visible link the wearer can tap, because the Even
  * App WebView may ignore programmatic downloads. The URL is revoked after a minute.
  */

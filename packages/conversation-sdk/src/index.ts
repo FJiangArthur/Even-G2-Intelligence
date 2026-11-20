@@ -23,3 +23,4 @@ export * from "./captions.js";
 export * from "./knowledge-transfer.js";
 export * from "./session-digest.js";
 export * from "./openai-knowledge.js";
+export * from "./pdf-knowledge.js";

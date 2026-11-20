@@ -63,6 +63,7 @@ import {
 import { modeProfile, summarizeSession } from "@helix/conversation-sdk";
 import { EMPTY_OPENAI_KNOWLEDGE, cleanOpenAIKnowledgeState, deleteOpenAIKnowledge, syncOpenAIKnowledge, type KnowledgeDocument, type KnowledgeSyncProgress, type OpenAIKnowledgeState } from "@helix/conversation-sdk";
 import type { ShortcutActionId } from "./shortcut-actions";
+import { ingestPdfs, type PdfDocumentText, type PdfFileStatus, type PdfInput, type PdfParser } from "@helix/conversation-sdk"; // v0.13 knowledge I/O
 
 /** Where answers look up saved knowledge: on this phone (BM25) or in the user's OpenAI vector store. */
 export type KnowledgeSource = "local" | "openai";
@@ -76,8 +77,35 @@ export interface KnowledgeBaseView {
   readonly notice?: string;
 }
 export const OPENAI_KNOWLEDGE_STORAGE_KEY = "helix.openai.knowledge.v1";
+// ---- v0.13 knowledge I/O: Omi auto-import and PDF ingestion ----
+/** Holds the switch and the last outcome only. Never a key and never conversation text. */
+export const OMI_AUTO_IMPORT_STORAGE_KEY = "helix.omi.auto-import.v1";
+/** Gap between automatic Omi imports while the app is open, and before a retry after a failure. */
+export const OMI_AUTO_IMPORT_INTERVAL_MS = 30 * 60_000;
+export const OMI_AUTO_IMPORT_RETRY_MS = 5 * 60_000;
+/** The first automatic import reads this many days back; later ones start a day before the last success. */
+export const OMI_AUTO_IMPORT_FIRST_DAYS = 14;
+export type AutoImportReason = "startup" | "interval" | "resume" | "enabled" | "manual";
+export type AutoImportOutcome = "disabled" | "not-ready" | "no-key" | "busy" | "not-due" | "imported" | "failed";
+export interface AutoImportView {
+  readonly enabled: boolean; readonly running: boolean;
+  readonly lastAttemptAt?: string; readonly lastSuccessAt?: string; readonly lastImported?: number;
+  /** Why the last attempt did not import (missing key, Omi error, storage full). */
+  readonly lastError?: string;
+}
+export interface PdfImportView { readonly running: boolean; readonly parser?: PdfParser; readonly files: readonly PdfFileStatus[] }
+export interface PdfImportRequest {
+  readonly parser: PdfParser;
+  /** OpenAI key from Setup (in memory). Needed for the OpenAI parser; also used to sync the result to the OpenAI knowledge base when that is selected. */
+  readonly openaiKey?: string;
+  /** On-phone text extractor (pdf-local.ts, lazy-loaded by the panel). Needed for the local parser. */
+  readonly extractLocal?: (data: Uint8Array, options: { signal?: AbortSignal; maxPages: number }) => Promise<PdfDocumentText>;
+}
+// ---- end v0.13 knowledge I/O ----
 export interface HistoryState {
   readonly knowledge: KnowledgeBaseView;
+  readonly autoImport: AutoImportView;
+  readonly pdfImport: PdfImportView;
   readonly sessions: HistorySession[];
   readonly status: string;
   readonly importing: boolean;
@@ -173,7 +201,7 @@ export class G2ConversationController {
   ) { this.history = new LocalHistoryStore(bridge); }
 
   public historySnapshot(): HistoryState {
-    return { knowledge: this.knowledgeBase(), sessions: this.history.listSessions(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
+    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), sessions: this.history.listSessions(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
       useLocalMemory: this.localMemoryEnabled, liveWebFactCheck: this.webCheckEnabled, autoExplainTerms: this.autoExplainEnabled };
   }
   public subscribeHistory(listener: (state: HistoryState) => void): () => void {
@@ -227,16 +255,140 @@ export class G2ConversationController {
     const completion = (async () => {
       try {
         await archives;
-        const result = await importOmiConversations({ ...request, store: this.history, signal: abort.signal,
+        // v0.13 skipInvalid: one conversation Helix cannot read is counted and skipped instead of failing every import.
+        const result = await importOmiConversations({ skipInvalid: true, ...request, store: this.history, signal: abort.signal,
           onProgress: progress => this.setHistoryStatus(`Imported ${progress.imported} conversations · ${progress.pages} pages`) });
-        this.setHistoryStatus(`Import complete: ${result.imported} conversations processed. Repeated imports update existing records.`);
-      } catch (error) { this.setHistoryStatus(errorMessage(error)); }
+        this.lastOmiImport = { ok: true, imported: result.imported, skipped: result.skipped ?? 0 };
+        this.setHistoryStatus(`Import complete: ${result.imported} conversations processed${result.skipped ? ` · ${result.skipped} skipped (Omi returned them in a form Helix cannot read)` : ""}. Repeated imports update existing records.`);
+      } catch (error) { this.lastOmiImport = { ok: false, message: errorMessage(error) }; this.setHistoryStatus(errorMessage(error)); }
       finally { this.importAbort = undefined; this.importCompletion = undefined; this.bulkHistoryWrites--; this.syncHistoryWriteDelay(); this.emitHistory(); }
     })();
     this.importCompletion = completion;
     await completion;
   }
   public cancelImport(): void { this.importAbort?.abort(); }
+
+  // ---- v0.13 Omi auto-import ----
+  /** Outcome of the most recent importOmi() run (it reports through the status line and never throws). */
+  private lastOmiImport?: { ok: true; imported: number; skipped: number } | { ok: false; message: string };
+  private autoImport: { enabled: boolean; lastAttemptAt?: string; lastSuccessAt?: string; lastImported?: number; lastError?: string } = { enabled: false };
+  private autoImportRunning = false;
+  private autoImportKey?: () => string;
+  private autoImportTimer?: ReturnType<typeof setInterval>;
+  private autoImportWrite: Promise<void> = Promise.resolve();
+  /** Test hook: the fetch used by automatic Omi imports. */
+  public omiImportFetch?: (url: string, init?: RequestInit) => Promise<Response>;
+  public autoImportView(): AutoImportView { return { ...this.autoImport, running: this.autoImportRunning }; }
+  private saveAutoImport(): Promise<void> {
+    const value = JSON.stringify(this.autoImport);
+    this.autoImportWrite = this.autoImportWrite.then(async () => { try { await this.bridge.setLocalStorage(OMI_AUTO_IMPORT_STORAGE_KEY, value); } catch { /* best effort: the switch still applies until the app closes */ } });
+    return this.autoImportWrite;
+  }
+  /**
+   * Gives the controller the Omi key source (the Setup field) and starts the schedule: one check now,
+   * then one a minute, each of which imports only when the switch is on and an import is due.
+   * Called by the Knowledge panel; without it nothing runs automatically.
+   */
+  public configureAutoImport(key: () => string, checkEveryMs = 60_000): void {
+    this.autoImportKey = key;
+    if (this.autoImportTimer !== undefined) clearInterval(this.autoImportTimer);
+    this.autoImportTimer = setInterval(() => { void this.maybeAutoImport("interval"); }, checkEveryMs);
+    void this.maybeAutoImport("startup");
+  }
+  public async setAutoImportEnabled(enabled: boolean): Promise<AutoImportOutcome> {
+    const { lastError: _cleared, ...kept } = this.autoImport;
+    this.autoImport = { ...kept, enabled };
+    this.emitHistory();
+    await this.saveAutoImport();
+    return enabled ? this.maybeAutoImport("enabled") : "disabled";
+  }
+  /**
+   * Runs an Omi import when the switch is on, the app is ready, a key is present, no import is
+   * running and one is due ("enabled" and "manual" skip the due check). Incremental: from a day
+   * before the last success, or OMI_AUTO_IMPORT_FIRST_DAYS back the first time. Never throws; the
+   * outcome is stored (without the key) and shown in the Knowledge tab.
+   */
+  public async maybeAutoImport(reason: AutoImportReason, now = Date.now()): Promise<AutoImportOutcome> {
+    if (!this.autoImport.enabled) return "disabled";
+    if (!this.initialized || !this.autoImportKey || this.disposed || this.exiting) return "not-ready";
+    if (this.autoImportRunning || this.importAbort) return "busy";
+    const last = Date.parse(this.autoImport.lastAttemptAt ?? ""), failed = !!this.autoImport.lastError;
+    if (reason !== "enabled" && reason !== "manual" && Number.isFinite(last) && now - last < (failed ? OMI_AUTO_IMPORT_RETRY_MS : OMI_AUTO_IMPORT_INTERVAL_MS)) return "not-due";
+    const key = (this.autoImportKey?.() ?? "").trim();
+    if (!key) {
+      // Not counted as an attempt: the next check imports as soon as a key is there.
+      const message = "Auto-import is on, but there is no Omi key. Enter your Omi developer key in Setup → API keys, and turn on “Save API keys on this phone” so it is still there after a restart.";
+      if (this.autoImport.lastError !== message) { this.autoImport = { ...this.autoImport, lastError: message }; this.emitHistory(); await this.saveAutoImport(); }
+      return "no-key";
+    }
+    this.autoImportRunning = true;
+    const since = Date.parse(this.autoImport.lastSuccessAt ?? "");
+    const startDate = new Date(Number.isFinite(since) ? since - 24 * 60 * 60_000 : now - OMI_AUTO_IMPORT_FIRST_DAYS * 24 * 60 * 60_000).toISOString();
+    this.lastOmiImport = undefined;
+    try {
+      await this.importOmi({ key, startDate, ...(this.omiImportFetch ? { fetch: this.omiImportFetch } : {}) });
+    } catch (error) { this.lastOmiImport = { ok: false, message: errorMessage(error) }; }
+    const result = this.lastOmiImport as { ok: true; imported: number; skipped: number } | { ok: false; message: string } | undefined;
+    const at = new Date(now).toISOString();
+    const { lastError: _cleared, ...kept } = this.autoImport;
+    this.autoImport = result?.ok ? { ...kept, lastAttemptAt: at, lastSuccessAt: at, lastImported: result.imported }
+      : { ...kept, lastAttemptAt: at, lastError: result?.message ?? "The Omi import did not finish." };
+    this.autoImportRunning = false;
+    this.emitHistory();
+    await this.saveAutoImport();
+    return result?.ok ? "imported" : "failed";
+  }
+  // ---- end v0.13 Omi auto-import ----
+
+  // ---- v0.13 PDF ingestion ----
+  private pdfImport: { abort: AbortController; parser: PdfParser } | undefined;
+  private pdfFiles: readonly PdfFileStatus[] = [];
+  public pdfImportView(): PdfImportView { return { running: !!this.pdfImport, ...(this.pdfImport ? { parser: this.pdfImport.parser } : {}), files: this.pdfFiles }; }
+  public cancelPdfImport(): void { this.pdfImport?.abort.abort(); }
+  /**
+   * Parses PDFs (on this phone, or in the user's OpenAI project) and saves each as a knowledge
+   * session that on-phone retrieval searches. One failing file never loses the others. When the
+   * OpenAI knowledge base is selected and already created, the new documents are synced to it too.
+   */
+  public async importPdfs(inputs: readonly PdfInput[], request: PdfImportRequest): Promise<PdfFileStatus[]> {
+    if (this.disposed || this.exiting) throw new Error("Helix has exited.");
+    if (this.pdfImport) throw new Error("PDFs are already being added. Wait for them to finish or cancel first.");
+    if (!inputs.length) return [];
+    const key = (request.openaiKey ?? "").trim();
+    if (request.parser === "openai" && !key) throw new Error("The OpenAI parser needs your OpenAI API key. Enter it in Setup → API keys, or choose “On this phone”.");
+    const run = { abort: new AbortController(), parser: request.parser };
+    this.pdfImport = run; this.pdfFiles = inputs.map(input => ({ name: input.name, state: "queued" as const })); this.emitHistory();
+    const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init));
+    this.bulkHistoryWrites++; this.syncHistoryWriteDelay();
+    let files: PdfFileStatus[] = [];
+    try {
+      files = await ingestPdfs(inputs, {
+        parser: request.parser, signal: run.abort.signal,
+        ...(request.extractLocal ? { extractLocal: request.extractLocal } : {}),
+        ...(request.parser === "openai" ? { openai: { fetch: fetcher, key, model: this.config.copilotModel } } : {}),
+        onStatus: status => { this.pdfFiles = status; this.emitHistory(); },
+        save: async ({ session, entries }) => {
+          await this.archiveQueue;
+          // Re-adding the same PDF replaces it; otherwise passages of the old, longer version would stay.
+          if (this.history.getSession(session.id)) await this.history.deleteSession(session.id);
+          await this.history.upsertSession(session);
+          await this.history.upsertEntries(entries);
+        },
+      });
+    } finally {
+      this.bulkHistoryWrites--; this.syncHistoryWriteDelay();
+      this.pdfImport = undefined;
+      if (files.length) this.pdfFiles = files;
+      const done = files.filter(file => file.state === "done").length, failed = files.filter(file => file.state === "failed").length, cancelled = files.filter(file => file.state === "cancelled").length;
+      this.setHistoryStatus(`Added ${done} of ${inputs.length} PDF${inputs.length === 1 ? "" : "s"} to the knowledge base${failed ? ` · ${failed} failed` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}.`);
+    }
+    // The OpenAI knowledge base, when in use, gets the new documents too (same Files API the user already opted into).
+    if (files.some(file => file.state === "done") && key && this.knowledgeSource === "openai" && this.openaiKnowledge.vectorStoreId && !this.knowledgeSync) {
+      await this.syncOpenAIKnowledge(key).catch(() => undefined); // the outcome is in the knowledge base status line
+    }
+    return files;
+  }
+  // ---- end v0.13 PDF ingestion ----
   public setLocalMemoryEnabled(enabled: boolean): Promise<void> {
     this.localMemoryEnabled = enabled; return this.saveMemorySettings();
   }
@@ -383,6 +535,13 @@ export class G2ConversationController {
       this.openaiKnowledge = cleanOpenAIKnowledgeState(saved.state);
       this.knowledgeSource = saved.source === "openai" ? "openai" : "local";
     } catch { /* no knowledge base yet */ }
+    try { // v0.13 Omi auto-import switch and last outcome
+      const saved = JSON.parse(await this.bridge.getLocalStorage(OMI_AUTO_IMPORT_STORAGE_KEY) || "{}") as Record<string, unknown>;
+      const text = (value: unknown) => typeof value === "string" && value.length <= 600 ? value : undefined;
+      const lastAttemptAt = text(saved.lastAttemptAt), lastSuccessAt = text(saved.lastSuccessAt), lastError = text(saved.lastError);
+      this.autoImport = { enabled: saved.enabled === true, ...(lastAttemptAt ? { lastAttemptAt } : {}), ...(lastSuccessAt ? { lastSuccessAt } : {}), ...(lastError ? { lastError } : {}),
+        ...(typeof saved.lastImported === "number" && Number.isSafeInteger(saved.lastImported) ? { lastImported: saved.lastImported } : {}) };
+    } catch { /* auto-import stays off */ }
     try { await this.history.load(); this.setHistoryStatus("History is saved only on this phone."); }
     catch (error) { this.setHistoryStatus(errorMessage(error)); }
     this.presentation.setStatus("starting");
@@ -399,6 +558,7 @@ export class G2ConversationController {
     this.unsubscribeHub = this.bridge.onEvenHubEvent(this.handleEvenHubEvent);
     this.initialized = true;
     this.presentation.setStatus("ready");
+    void this.maybeAutoImport("startup"); // v0.13: no-op unless the Omi auto-import switch is on
     await this.offerResume();
   }
 
@@ -949,6 +1109,8 @@ export class G2ConversationController {
     for (const file of files.slice(0, 200)) {
       try { parsed.push(markdownSession(file.name, file.text)); } catch (error) { failed.push({ name: file.name, error: errorMessage(error) }); }
     }
+    // v0.13: files past the batch limit are reported, not silently dropped.
+    for (const file of files.slice(200)) failed.push({ name: file.name, error: "Only 200 notes can be imported at once. Import this one in the next batch." });
     const sessionIds: string[] = [];
     await this.archiveQueue;
     this.bulkHistoryWrites++; this.syncHistoryWriteDelay();
@@ -1018,6 +1180,7 @@ export class G2ConversationController {
     this.disposed = true;
     this.cancelInsights();
     this.cancelImport();
+    this.cancelPdfImport(); if (this.autoImportTimer !== undefined) { clearInterval(this.autoImportTimer); this.autoImportTimer = undefined; } // v0.13
     this.cancelFactChecks();
     this.session = undefined;
     this.archiveSessionId = undefined;
