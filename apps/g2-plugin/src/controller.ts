@@ -62,6 +62,7 @@ import {
   type ConversationMode,
 } from "./config";
 import { modeProfile, summarizeSession } from "@helix/conversation-sdk";
+import { SessionNotebook, applyTodoOp, type SessionNotebookData, type TodoOp } from "@helix/conversation-sdk";
 import { EMPTY_OPENAI_KNOWLEDGE, cleanOpenAIKnowledgeState, deleteOpenAIKnowledge, syncOpenAIKnowledge, type KnowledgeDocument, type KnowledgeSyncProgress, type OpenAIKnowledgeState } from "@helix/conversation-sdk";
 import type { ShortcutActionId } from "./shortcut-actions";
 import { ingestPdfs, type PdfDocumentText, type PdfFileStatus, type PdfInput, type PdfParser } from "@helix/conversation-sdk"; // v0.13 knowledge I/O
@@ -580,6 +581,7 @@ export class G2ConversationController {
     const session: HistorySession = { id: createId("session"), source: "helix", title: `Helix · ${now}`, startedAt: now, updatedAt: now };
     this.session = session;
     this.archiveSessionId = session.id;
+    this.startNotebook(session.id);
     this.transcriptRevisions.clear();
     this.memoryByQuestion.clear();
     this.manualRevision = 0;
@@ -660,7 +662,7 @@ export class G2ConversationController {
       onListenerError: (error) => this.handleError(error),
     });
     this.client = client;
-    this.unsubscribeClientEvent = client.subscribe((event) => { this.presentation.apply(event); this.archiveEvent(event); });
+    this.unsubscribeClientEvent = client.subscribe((event) => { this.presentation.apply(event); this.archiveEvent(event); this.notebookTranscript(event); });
     this.unsubscribeClientState = client.subscribeState(this.handleClientState);
 
     try {
@@ -1034,6 +1036,8 @@ export class G2ConversationController {
       onClaim: claim => { if (live()) this.presentation.applyClaim(claim); },
       // v0.8 People (phone agent): live People tab + persisted session people.
       onPerson: person => { if (live()) { this.presentation.applyPerson(person); this.noteSessionPerson(sessionId, person); } },
+      // Notes mode: the copilot edits the session notebook (to-do operations, running notes).
+      notebook: () => live() ? this.notebook : undefined,
     };
   }
 
@@ -1076,6 +1080,7 @@ export class G2ConversationController {
   /** Queues summary/keyFacts/people/concepts into the session's history record (after its upsert). */
   public flushSessionKnowledge(): void {
     if (this.knowledgeTimer !== undefined) { clearTimeout(this.knowledgeTimer); this.knowledgeTimer = undefined; }
+    this.flushNotebook();
     for (const [sessionId, draft] of this.knowledgeDrafts) {
       if (this.historyDeletions.has(sessionId)) { this.knowledgeDrafts.delete(sessionId); continue; }
       const patch: SessionKnowledge = {
@@ -1317,6 +1322,55 @@ export class G2ConversationController {
     return this.saveMemorySettings();
   }
   // ---- end v0.10 modes ----
+
+  // ---- Notes mode: session notebook (to-do list + running notes) ----
+  private notebook?: SessionNotebook;
+  private readonly notebookDrafts = new Map<string, SessionNotebookData>();
+  /** One notebook per live session; every change reaches the phone, the glasses (confirmation) and the session's history record. */
+  private startNotebook(sessionId: string): void {
+    this.notebookDrafts.delete(sessionId);
+    this.notebook = new SessionNotebook({ onChange: event => {
+      if (this.session?.id !== sessionId || this.disposed) return;
+      this.presentation.applyNotebook(event.todos, event.notes, this.exiting ? undefined : event.confirmation);
+      this.notebookDrafts.set(sessionId, { todos: [...event.todos], notes: [...event.notes] });
+      this.scheduleKnowledgeFlush();
+    } });
+  }
+  /** Spoken to-do commands ("add a to-do ...", "mark the vendor call done") while Notes mode is on. */
+  private notebookTranscript(event: GatewayEvent): void {
+    if (event.type !== "transcript.final" || !this.notebook || event.sessionId !== this.session?.id) return;
+    if (modeProfile(this.config.conversationMode).presets.noteTaking !== true) return;
+    try { this.notebook.handleTranscript(event.transcriptId, event.text, event.context.speaker); } catch (error) { console.warn("Helix to-do command failed", error); }
+  }
+  /** Queues the notebook into the session's history record (same queue and debounce as session knowledge). */
+  private flushNotebook(): void {
+    for (const [sessionId, patch] of this.notebookDrafts) {
+      this.notebookDrafts.delete(sessionId);
+      if (this.historyDeletions.has(sessionId)) continue;
+      const live = this.archiveSessionId === sessionId;
+      this.enqueueArchive(async () => {
+        if (this.historyDeletions.has(sessionId) || (!live && !this.history.listSessions().some(session => session.id === sessionId))) return;
+        await this.history.updateSessionNotebook(sessionId, patch);
+      });
+    }
+  }
+  /**
+   * Phone edit of a to-do list (add / update / complete / remove / move): the live session's notebook,
+   * or a saved session in History. Resolves false when nothing changed.
+   */
+  public async editTodo(op: TodoOp, sessionId?: string): Promise<boolean> {
+    const id = sessionId ?? this.session?.id;
+    if (!id) return false;
+    if (this.session?.id === id && this.notebook) return this.notebook.apply(op, { origin: "user" }) !== undefined;
+    const saved = this.history.getSession(id);
+    if (!saved) return false;
+    const result = applyTodoOp(saved.todos ?? [], op, { origin: "user" });
+    if (!result.change) return false;
+    await this.history.updateSessionNotebook(id, { todos: result.list });
+    this.emitHistory();
+    return true;
+  }
+  // ---- end Notes mode ----
 
   /** Phone -> glasses: move the HUD to `view` (e.g. when a phone tab is tapped). */
   public setHudView(view: HudView): void {

@@ -11,6 +11,8 @@ export interface ModePresets {
   /** Auto-answer detected questions (others' questions; the interviewer's own ones as an answer key). */
   readonly autoAnswer: boolean;
   readonly responseStrategy: ResponseStrategy;
+  /** Notes mode: the copilot lane maintains the session to-do list and running notes. */
+  readonly noteTaking?: boolean;
 }
 export interface ModeProfile {
   readonly id: ConversationMode;
@@ -111,6 +113,14 @@ export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Ob
     summary: "decisions, numbers, dates and open issues",
     presets: Object.freeze({ summarize: true, concepts: false, conflicts: false, suggestions: false, implicitAsks: false, webGrounding: true, claims: false, people: false, autoAnswer: false, responseStrategy: "reactive" }),
   }),
+  notes: profile({
+    id: "notes", label: "Notes", short: "NOTES", askLabel: "ASK THEM",
+    blurb: "Note-taker: action items, a living to-do list and meeting notes. No auto-answers.",
+    answer: "Act as the wearer's note-taker. Stay quiet unless the wearer asks directly; then answer briefly from the conversation: what was decided, who owns what and by when. Never invent action items, owners or dates.",
+    copilot: "The wearer wants notes, not answers. Capture action items with their owner and due date exactly as stated, keep the to-do list current by editing existing items instead of duplicating them, and write short factual notes of what was discussed and decided.",
+    summary: "decisions, action items with owners and due dates, open questions and numbers",
+    presets: Object.freeze({ summarize: true, concepts: false, conflicts: false, suggestions: false, implicitAsks: false, webGrounding: true, claims: false, people: true, autoAnswer: false, responseStrategy: "reactive", noteTaking: true }),
+  }),
   // Legacy modes: kept for stored settings and the gateway protocol, not offered in the picker.
   interviewee: profile({
     id: "interviewee", label: "Interviewee", short: "MEET", askLabel: "ASK THEM", picker: false,
@@ -129,7 +139,7 @@ export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Ob
 });
 
 /** Modes offered in the phone picker and the glasses menu, in display order. */
-export const PICKER_MODES: readonly ConversationMode[] = Object.freeze(["general", "technical", "interviewer", "partner", "negotiation", "learning", "social", "passive"]);
+export const PICKER_MODES: readonly ConversationMode[] = Object.freeze(["general", "technical", "interviewer", "partner", "negotiation", "learning", "social", "passive", "notes"]);
 
 export function modeProfile(mode: string | undefined): ModeProfile {
   return (mode && Object.prototype.hasOwnProperty.call(MODE_PROFILES, mode) ? MODE_PROFILES[mode as ConversationMode] : undefined) ?? MODE_PROFILES.general;

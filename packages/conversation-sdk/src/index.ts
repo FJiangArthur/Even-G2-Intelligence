@@ -27,3 +27,5 @@ export * from "./answer-length.js";
 export * from "./provider-registry.js";
 export { chatComplete, chatAnswerStream, chatRequestBody, cleanPublishedAt, deepseekSearchDetails, testProviderKey, zhipuSearchQuery, zhipuWebSearch, type ChatCompletion, type ChatMessage, type ProviderKeyTestResult, type ProviderKeyTestStatus, type SearchRecency, type SearchResult } from "./chat-providers.js";
 export * from "./pdf-knowledge.js";
+export * from "./todo-list.js";
+export * from "./session-notebook.js";

@@ -47,7 +47,7 @@ import {
   TextContainerUpgrade,
 } from "@evenrealities/even_hub_sdk";
 import * as conversationSdk from "@helix/conversation-sdk";
-import { MODE_PROFILES, PICKER_MODES, modeProfile } from "@helix/conversation-sdk";
+import { MODE_PROFILES, PICKER_MODES, modeProfile, todoShort } from "@helix/conversation-sdk";
 import type { CopilotClaim, CopilotConcept, HudMirror, VerificationResult } from "@helix/conversation-sdk";
 import { AnswerPager, pageReadingMs, paginateAnswer, type PageLayout } from "./answer-pager";
 import { blankImage, centeredImage, drawBitmap, encodeGrayPng, type GrayImage } from "./glasses-image";
@@ -489,7 +489,7 @@ function rightAlign(text: string, width: number): string {
   return `${" ".repeat(Math.max(0, Math.floor((width - hudTextWidth(line)) / hudGlyphWidth(" "))))}${line}`;
 }
 
-type ItemKind = "concept" | "conflict" | "ask" | "verification" | "fact-check" | "fact" | "suggestion";
+type ItemKind = "concept" | "conflict" | "ask" | "verification" | "fact-check" | "fact" | "suggestion" | "todo";
 interface HudItem {
   readonly key: string;
   readonly sig: string;
@@ -557,6 +557,10 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
   for (const fact of snapshot.summary?.keyFacts ?? []) {
     items.push({ key: `kf:${oneLine(fact).toLowerCase()}`, sig: "", kind: "fact", live: `Fact: ${oneLine(fact)}` });
   }
+  // Notes mode: one short confirmation per captured or changed to-do ("TODO + Send quote - Mei, Fri").
+  for (const cue of snapshot.notebook?.cues ?? []) {
+    items.push({ key: `t:${cue.id}`, sig: cue.text, kind: "todo", live: oneLine(cue.text) });
+  }
   for (const suggestion of snapshot.suggestions) {
     items.push({ key: `s:${suggestion.id}`, sig: "", kind: "suggestion", live: `? ${oneLine(suggestion.question)}` });
   }
@@ -592,7 +596,7 @@ const VERIFY_PENDING_MS = 45_000;
 const CUE_QUEUE = 3, CUE_STALE_MS = 45_000, CUE_PAGES = 3, CUE_PAGES_DETAILED = 6, CUE_LAST_PAGE_MS = 5000;
 /** Ambient: "● listening" / "○ paused" shows this long after the mic state changes. */
 const STATUS_CUE_MS = 4000;
-const CUE_TITLE: Readonly<Partial<Record<ItemKind, string>>> = { concept: "CONCEPT", ask: "LOOKUP", conflict: "CHECK", verification: "CHECK", "fact-check": "FACT CHECK" };
+const CUE_TITLE: Readonly<Partial<Record<ItemKind, string>>> = { concept: "CONCEPT", ask: "LOOKUP", conflict: "CHECK", verification: "CHECK", "fact-check": "FACT CHECK", todo: "TO-DO" };
 /** A cue that pops up on the blank ambient display: body pages, the page shown and when it turns / expires. */
 interface AmbientCue { readonly key: string; readonly title: string; readonly pages: readonly string[]; readonly at: number; page: number; until: number }
 const PARTIAL_ID = "transcript-partial";
@@ -1007,13 +1011,17 @@ export class GlassesHud implements GlassesSurface {
     add("qa", snapshot.suggestions.map(item => item.id));
     add("concepts", snapshot.concepts.map(item => item.id));
     add("checks", [...snapshot.conflicts, ...snapshot.verifications, ...snapshot.factChecks, ...snapshot.claims].map(item => item.id));
-    const sig = snapshot.summary ? `${snapshot.summary.bullets.join("|")}#${snapshot.summary.keyFacts.join("|")}` : "";
+    const notebook = snapshot.notebook ? `#${snapshot.notebook.todos.map(item => `${item.id}:${item.done}:${item.text}:${item.owner ?? ""}:${item.due ?? ""}`).join("|")}#${snapshot.notebook.notes.length}` : "";
+    const sig = snapshot.summary || notebook ? `${snapshot.summary?.bullets.join("|") ?? ""}#${snapshot.summary?.keyFacts.join("|") ?? ""}${notebook}` : "";
     if (sig !== this.summarySig) { this.summarySig = sig; if (sig) this.unseen.summary = 1; }
     while (this.counted.size > 2000) this.counted.delete(this.counted.values().next().value!);
   }
 
   private answerKeys(): boolean { return modeProfile(this.glasses.mode).selfQuestions === "answer-key"; }
   private askLabel(): string { return modeProfile(this.glasses.mode).askLabel; }
+  /** Notes mode: the SUMMARY view is the to-do / notes view. */
+  private noteTaking(): boolean { return modeProfile(this.glasses.mode).presets.noteTaking === true; }
+  private summaryLabel(): string { return this.noteTaking() ? "TO-DO" : VIEW_LABEL.summary; }
 
   private kindOf(glasses: GlassesConversationState): AnswerKind {
     const question = glasses.question;
@@ -1449,14 +1457,22 @@ export class GlassesHud implements GlassesSurface {
   private checkList(): HudItem[] { return this.ordered(["conflict", "verification", "fact-check"]).slice(0, CAPS.checks); }
 
   private summaryPages(): string[][] {
-    const summary = this.snapshot?.summary;
-    if (!summary || (!summary.bullets.length && !summary.keyFacts.length)) return [];
+    const summary = this.snapshot?.summary ?? { bullets: [], keyFacts: [] };
+    // Notes mode: the to-do list (open items first) and the newest notes lead this view.
+    const notebook = this.snapshot?.notebook, todos = notebook?.todos ?? [], notes = notebook?.notes ?? [];
+    if (!summary.bullets.length && !summary.keyFacts.length && !todos.length && !notes.length) return [];
     const lines: string[] = [];
     const add = (marker: string, text: string) => {
       const hang = indent(hudTextWidth(`${marker} `));
       const width = HUD_LINE_WIDTH.body - Math.max(hudTextWidth(`${marker} `), hudTextWidth(hang));
       wrapText(oneLine(text), width).forEach((line, index) => lines.push(`${index ? hang : `${marker} `}${line}`));
     };
+    for (const todo of [...todos.filter(item => !item.done), ...todos.filter(item => item.done)]) add(todo.done ? "[x]" : "[ ]", todoShort(todo, 80));
+    if (notes.length) {
+      if (lines.length) lines.push("Notes");
+      for (const note of notes.slice(-6).reverse()) add("•", note.text);
+    }
+    if (lines.length && summary.bullets.length) lines.push("Summary");
     for (const bullet of summary.bullets) add("•", bullet);
     if (summary.keyFacts.length) {
       lines.push("Key facts");
@@ -1532,7 +1548,7 @@ export class GlassesHud implements GlassesSurface {
   private composeRail(): string {
     const current = this.railKey();
     return RAIL_ROWS.map(key => {
-      const name = key === "qa" ? this.askLabel() : RAIL_LABEL[key];
+      const name = key === "qa" ? this.askLabel() : key === "summary" ? this.summaryLabel() : RAIL_LABEL[key];
       if (key === current) return ellipsize(`▶ ${name}`, HUD_LINE_WIDTH.rail);
       const count = this.unseen[key];
       const badge = !count ? "" : key === "summary" ? " ●" : ` ${CIRCLED[Math.min(count, CIRCLED.length) - 1]}`;
@@ -1607,7 +1623,7 @@ export class GlassesHud implements GlassesSurface {
     if (glasses.status === "failed") {
       return { label: "LIVE", text: `Problem: ${oneLine(glasses.error ?? "Helix stopped.")}\n\nCheck the phone, then tap to try again.` };
     }
-    const items = this.ordered(["concept", "conflict", "ask", "verification", "fact-check", "fact"]);
+    const items = this.ordered(["concept", "conflict", "ask", "verification", "fact-check", "fact", "todo"]);
     if (!items.length) {
       const text = glasses.status === "listening"
         ? "Listening…\n\nConcepts, lookups, claims and\nquestions appear as people talk."
@@ -1723,12 +1739,13 @@ export class GlassesHud implements GlassesSurface {
   }
 
   private summaryView(): BodyView {
-    const pages = this.summaryPages();
+    const pages = this.summaryPages(), label = this.summaryLabel();
     if (!pages.length) {
+      if (this.noteTaking()) return { label, text: "No to-dos or notes yet.\n\nAction items and notes appear\nhere as people talk." };
       return { label: VIEW_LABEL.summary, text: "No summary yet.\n\nA rolling summary appears after\nabout a minute of conversation." };
     }
     const index = Math.min(this.cursor.summary, pages.length - 1);
-    return { label: VIEW_LABEL.summary, position: `${index + 1}/${pages.length}`, text: pages[index]!.join("\n") };
+    return { label, position: `${index + 1}/${pages.length}`, text: pages[index]!.join("\n") };
   }
 
   private checksView(): BodyView {

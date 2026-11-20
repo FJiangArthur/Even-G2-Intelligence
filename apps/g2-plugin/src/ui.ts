@@ -41,6 +41,8 @@ import {
 } from "./config";
 import { icon, mascotMarkup, modeIcon, pixelSvg, pixelText, MASCOT_FRAMES, type IconName, type MascotState } from "./pixel-art";
 import { TAB_DEFINITIONS, defaultTabForHudView, shouldFollowHud, tabFromKey } from "./tabs";
+import { renderNotebook } from "./notebook-panel";
+import type { TodoOp } from "@helix/conversation-sdk";
 
 /* v0.8 glasses mirror contract (glasses agent, src/glasses-mirror.ts). Resolved without a static
  * import so the phone UI builds before that module lands; falls back to a local text mirror. */
@@ -117,6 +119,8 @@ export interface CompanionUiActions {
   readonly onVerifyClaim?: (claimId: string) => void | Promise<void>;
   readonly onRehearse?: (scriptId: string, speed: RehearsalSpeed) => void | Promise<void>;
   readonly onStopRehearsal?: () => void | Promise<void>;
+  /** Notes mode: one to-do list operation from the phone (add / update / complete / remove / move). */
+  readonly onTodoEdit?: (op: TodoOp) => void | Promise<unknown>;
   /** Run the copilot lane now (summary/concepts/suggestions refresh). */
   readonly onRunCopilot?: () => void | Promise<void>;
   /** Setup → Test key. Resolves to a short human-readable verdict. */
@@ -1203,10 +1207,14 @@ export class CompanionUi {
 
   private renderSummary(snapshot: PresentationSnapshot): Node[] {
     const summary = snapshot.summary;
+    // Notes mode: the editable to-do list and running notes lead the Summary tab.
+    const notebook = snapshot.notebook ?? (modeProfile(snapshot.glasses.mode).presets.noteTaking ? { todos: [], notes: [] } : undefined);
+    const lead: Node[] = notebook ? [renderNotebook(notebook, op => { void Promise.resolve(this.actions?.onTodoEdit?.(op)).catch(() => undefined); },
+      { editable: ACTIVE.includes(snapshot.status), readOnlyNote: "Session ended. Edit this list in History." })] : [];
     if (!summary || (!summary.bullets.length && !summary.keyFacts.length)) {
-      return [emptyBlock("scroll", "No summary yet", "A rolling summary builds as the conversation goes. Use Refresh to build one now.")];
+      return notebook ? lead : [emptyBlock("scroll", "No summary yet", "A rolling summary builds as the conversation goes. Use Refresh to build one now.")];
     }
-    const nodes: Node[] = [el("p", "panel-meta", `Updated ${formatClock(summary.updatedAt)} · ${formatTokens(summary.transcriptChars)} characters heard`)];
+    const nodes: Node[] = [...lead, el("p", "panel-meta", `Updated ${formatClock(summary.updatedAt)} · ${formatTokens(summary.transcriptChars)} characters heard`)];
     if (summary.bullets.length) {
       const list = el("ul", "card-list summary-list");
       summary.bullets.forEach((bullet, index) => {
@@ -1996,7 +2004,7 @@ function panelSignature(tab: CompanionTab, snapshot: PresentationSnapshot): stri
   const connected = ACTIVE.includes(snapshot.status);
   switch (tab) {
     case "concepts": return JSON.stringify([snapshot.concepts, snapshot.feed.filter(item => item.kind === "transcript").map(item => item.id)]);
-    case "summary": return JSON.stringify(snapshot.summary ?? null);
+    case "summary": return JSON.stringify([snapshot.summary ?? null, snapshot.notebook?.todos, snapshot.notebook?.notes, snapshot.glasses.mode, connected]);
     case "qa": return JSON.stringify([snapshot.suggestions, snapshot.asks, connected,
       snapshot.feed.filter(item => item.kind === "question").map(item => [item.id, item.questionKind, item.body])]);
     case "checks": return JSON.stringify([snapshotClaims(snapshot), (snapshot as PresentationSnapshot & { verifying?: readonly string[] }).verifying ?? [], snapshot.conflicts, snapshot.verifications, snapshot.factChecks]);

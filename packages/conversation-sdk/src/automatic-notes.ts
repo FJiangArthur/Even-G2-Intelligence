@@ -38,6 +38,9 @@ const SENSITIVE_PATTERNS = [
   /\b(?:diagnosed with|medical record|prescription for)\b/i,
 ];
 
+/** Credentials, card/ID numbers and medical records never enter notes or to-dos (Notes mode reuses this filter). */
+export function containsSensitiveNoteText(text: string): boolean { return SENSITIVE_PATTERNS.some((pattern) => pattern.test(text)); }
+
 const QUESTION_OPENING = /^(?:who|what|when|where|why|which|whose|how|can|could|would|will|should|may|might|must|do|does|did|is|are|am|was|were|have|has|had)\b/i;
 const CANNED_ERROR_PATTERNS = [
   /^(?:i(?:'m| am)\s+)?sorry[,. ]+(?:something|an error|i (?:cannot|can't|couldn't|was unable))/i,

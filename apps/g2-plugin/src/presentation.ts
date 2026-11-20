@@ -2,7 +2,7 @@ import type {
   GatewayEvent, FactCheckResult, RetrievedMemory, ContextInsight,
   AnswerMeta, CopilotAsk, CopilotConcept, CopilotConflict, CopilotSuggestion, CopilotSummary,
   CopilotPerson, UsageKind, UsageRecord, VerificationResult,
-  CopilotClaim, HudMirror,
+  CopilotClaim, HudMirror, SessionNote, TodoItem,
 } from "@helix/conversation-sdk";
 import type { GlassesConversationState, NoteDeliveryState } from "./glasses-renderer";
 
@@ -126,6 +126,14 @@ export interface PresentationPeek {
   readonly text: string;
 }
 
+/** Notes mode: the live session's to-do list and running notes, plus the latest glasses confirmations. */
+export interface NotebookView {
+  readonly todos: readonly TodoItem[];
+  readonly notes: readonly SessionNote[];
+  /** Newest last, bounded to 5; each is one short line such as "TODO + Send quote - Mei, Fri". */
+  readonly cues: readonly { readonly id: string; readonly text: string }[];
+}
+
 export interface PresentationSnapshot {
   readonly status: string;
   /** Exact asynchronous failure detail, when the current status needs attention. */
@@ -154,6 +162,8 @@ export interface PresentationSnapshot {
   readonly claims: readonly CopilotClaim[];
   /** v0.8 verification ids requested and not yet answered (verify(target, id) with an id). */
   readonly verifying: readonly string[];
+  /** Notes mode notebook of the live session (absent until something was captured). */
+  readonly notebook?: NotebookView;
 }
 
 const LIMITS = { concepts: 100, conflicts: 50, asks: 50, verifications: 50, factChecks: 50, answerMeta: 100, people: 100 } as const;
@@ -213,6 +223,22 @@ export class ConversationPresentation {
   private hud?: HudMirror;
   private claims: CopilotClaim[] = [];
   private readonly verifying = new Map<string, number>();
+  // ---- Notes mode: to-do list + running notes ----
+  private notebook?: NotebookView;
+  private notebookSeq = 0;
+
+  /**
+   * Notes mode: the notebook changed. `confirmation` is the one-line glasses confirmation of a to-do
+   * change; it travels the cue path (LIVE item on the HUD, cue on the answers-only layout).
+   */
+  public applyNotebook(todos: readonly TodoItem[], notes: readonly SessionNote[], confirmation?: string): void {
+    const text = confirmation?.replace(/\s+/gu, " ").trim();
+    const cue = text ? { id: `todo-cue-${++this.notebookSeq}`, text } : undefined;
+    this.notebook = { todos: structuredClone([...todos]), notes: structuredClone([...notes]), cues: cue ? [...(this.notebook?.cues ?? []), cue].slice(-5) : this.notebook?.cues ?? [] };
+    this.unseen.summary = 1;
+    if (cue && ACTIVE_STATUSES.includes(this.status) && this.cueEligible()) this.glasses = { ...this.glasses, cue };
+    this.emit();
+  }
 
   /** Glasses -> phone mirror. Emits only when the visible content or menu/selection changed. */
   public setHud(mirror: HudMirror): void {
@@ -497,6 +523,7 @@ export class ConversationPresentation {
       ...(this.hud ? { hud: { ...this.hud } } : {}),
       claims: [...this.claims],
       verifying: [...this.verifying.keys()],
+      ...(this.notebook ? { notebook: this.notebook } : {}),
     };
   }
 
@@ -552,6 +579,7 @@ export class ConversationPresentation {
     this.peek = undefined;
     this.people = [];
     this.claims = []; this.verifying.clear();
+    this.notebook = undefined;
     this.emit();
   }
 
