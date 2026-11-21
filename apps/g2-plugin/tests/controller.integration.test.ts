@@ -520,4 +520,39 @@ describe("G2 controller integration", () => {
 
     await controller.dispose();
   });
+  it("v0.12.2 audio intake: 20 ms frames are handed on in ~100 ms batches, and a backlog delivered at once after a suspension is dropped", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.UTC(2026, 10, 21, 20, 0, 0) });
+    const bridge = new FakeBridge();
+    const presentation = new ConversationPresentation();
+    const controller = testController(bridge, new GlassesRenderer(bridge), presentation);
+    controller.audioRealtimeGuard = true;
+    await controller.initialize();
+    await controller.connect(form);
+    const socket = FakeWebSocket.latest!;
+    await controller.startListening();
+    await vi.waitFor(() => expect(presentation.snapshot().status).toBe("listening"));
+    const frame = () => bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array(640).fill(7), source: AudioInputSource.Glasses, speakerRole: AudioSpeakerRole.Other }) });
+    const audio = () => socket.sent.filter((item): item is ArrayBuffer => item instanceof ArrayBuffer);
+    const bytes = () => audio().reduce((sum, item) => sum + item.byteLength, 0);
+    // One second of live audio, 20 ms apart: 50 frames in, 10 hand-offs of 100 ms out, nothing lost.
+    for (let i = 0; i < 50; i++) { vi.setSystemTime(Date.now() + 20); frame(); }
+    await vi.waitFor(() => expect(bytes()).toBe(50 * 640));
+    expect(audio()).toHaveLength(10);
+    // Locked for 5 minutes: the native side queued 15,000 frames and delivers them in one go on resume.
+    vi.setSystemTime(Date.now() + 300_000);
+    const before = bytes();
+    for (let i = 0; i < 15_000; i++) frame();
+    await controller.togglePause(); // drains what was accepted
+    const accepted = (bytes() - before) / 640 / 50;
+    expect(accepted).toBeGreaterThan(1.5); expect(accepted).toBeLessThanOrEqual(2); // only the 2 s burst allowance
+    // Live audio afterwards flows normally again.
+    await controller.startListening();
+    await vi.waitFor(() => expect(presentation.snapshot().status).toBe("listening"));
+    const resumed = bytes();
+    for (let i = 0; i < 25; i++) { vi.setSystemTime(Date.now() + 20); frame(); }
+    await vi.waitFor(() => expect(bytes() - resumed).toBe(25 * 640));
+    vi.useRealTimers();
+    await controller.dispose();
+  });
 });

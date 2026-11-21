@@ -2,6 +2,17 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
+## v0.13.1 — lock screen: no replay of queued audio
+
+Report: after locking the phone, captions stop within a minute; on unlock the page is frozen or white and the phone is hot.
+
+- **Cause reproduced in `qa/perf.html` (`window.__burst`)**: while the WebView is suspended the microphone events queue up, and on resume they arrive at once. Helix processed all of them: after a 5 minute pause it uploaded 21 MB of stale audio in a burst (3,393 socket sends) with the main thread blocked for 4.7 s (Chrome, 4x CPU throttle, measured on the 0.12 line). With the fix the same resume uploads only live audio and the longest block is 0.4 s.
+- **Audio intake** (`controller.audioRealtimeGuard`, on in the app): microphone audio is accepted only at its real-time rate (2 s burst allowance); a queued backlog is dropped before the PCM is converted and logged as `audio-backlog`. At most 3 s may wait for the session.
+- **Batching:** 20 ms frames are handed to the session in ~100 ms batches (one hand-off instead of five promise chains).
+- **Suspension detected without a visibility event:** 15 s without a timer runs the resume path (glasses re-push, microphone re-open, stale socket check) and logs `suspended`.
+- Private builds are still stopped by the Even app shortly after the phone locks (Even docs, Private Testing); staying alive while locked needs a Beta or published build.
+- Not verified on a phone: the reproduction is a simulation of the resume burst.
+
 ## v0.13.0 — ambient glasses display, more answer providers, news-backed checks, PDFs, Notes mode, History
 
 Nothing in this release was run on G2 glasses or inside the Even Realities app, and no live request was made to DeepSeek, Qwen, Zhipu, Moonshot, OpenAI or Omi. Evidence: `npm run check` (conversation-sdk 425 tests, gateway 104, g2-plugin 333, all with fake providers and a fake bridge), one simulator smoke run of the ambient display, and a desktop browser with a fake bridge for the knowledge transfers. The device-only gates are listed in `docs/PIXEL_GESTURES.md`, `docs/PROVIDERS_AND_SEARCH.md` and `docs/MEMORY_GUIDE.md`.

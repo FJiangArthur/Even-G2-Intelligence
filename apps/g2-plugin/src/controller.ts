@@ -843,7 +843,7 @@ export class G2ConversationController {
         return;
       }
       await this.closeMic();
-      await this.audioSendChain;
+      await this.audioDrained();
       await this.commitIfAudioAvailable();
       this.presentation.setStatus("paused");
       this.presentation.setInteraction("PAUSED / RESUME ON PHONE");
@@ -886,7 +886,7 @@ export class G2ConversationController {
       const pauseAfter = this.holdOpenedMic;
       this.holdOpenedMic = false;
       if (pauseAfter) await this.closeMic();
-      await this.audioSendChain;
+      await this.audioDrained();
       const committed = await this.commitIfAudioAvailable();
       if (pauseAfter) this.presentation.setStatus("paused");
       this.presentation.setInteraction(committed ? "SENT / WAITING FOR RESPONSE" : "NO NEW AUDIO / HOLD AND SPEAK");
@@ -1416,7 +1416,7 @@ export class G2ConversationController {
     this.presentation.setStatus("stopped");
     this.holding = false;
     await this.closeMic();
-    await this.audioSendChain;
+    await this.audioDrained();
     await this.releaseClient();
     if (hadClient) this.clearLifecycle(); // a user disconnect is not an interrupted session
     await this.archiveQueue;
@@ -1447,7 +1447,7 @@ export class G2ConversationController {
     try {
       if (this.micOn) await this.bridge.audioControl(false);
       this.micOn = false;
-      await this.audioSendChain;
+      await this.audioDrained();
       await this.releaseClient("shutdown");
       await this.archiveQueue;
       this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined);
@@ -1722,27 +1722,72 @@ export class G2ConversationController {
     }
   };
 
+  // ---- v0.12.2 audio intake: batched, bounded, and never replaying a backlog ----
+  // The Even app delivers the microphone as 20 ms events (50 a second). When the WebView was suspended
+  // (phone locked, app in the background) the events queued up natively and all arrive at once on resume:
+  // measured in qa/perf.html, 5 minutes of backlog meant 21 MB of stale audio uploaded in a burst and a
+  // main thread blocked for seconds, on a phone that was already hot. Only audio that can be live is kept.
+  /** App bootstrap turns this on. Off, every frame is accepted at any rate (tests, offline replays). */
+  public audioRealtimeGuard = false;
+  private audioBudget = AUDIO_BURST_SAMPLES;
+  private audioBudgetAt = 0;
+  private audioDropped = 0;
+  private audioBatch: Int16Array[] = [];
+  private audioBatchSamples = 0;
+  private audioBatchMeta?: { source: AudioEvent["source"]; direction: AudioEvent["direction"]; speakerRole: ReturnType<typeof normalizeSpeakerRole> };
+  private audioBatchTimer?: ReturnType<typeof setTimeout>;
+  private audioPending = 0;
+
   private enqueueAudio(audio: AudioEvent): void {
     if (!this.micOn || this.disposed || this.exiting || this.client?.state !== "active") return;
-    const client = this.client;
+    const sampleCount = ((audio.audioPcm as ArrayLike<number> | undefined)?.length ?? 0) >> 1;
+    if (sampleCount === 0) return;
+    if (this.audioRealtimeGuard) {
+      // Token bucket at the microphone's own rate (16 kHz, 25 % tolerance, 2 s burst for BLE jitter).
+      const now = Date.now();
+      this.audioBudget = Math.min(AUDIO_BURST_SAMPLES, this.audioBudget + Math.max(0, now - this.audioBudgetAt) * 20);
+      this.audioBudgetAt = now;
+      // Checked before the PCM is even converted: dropping a queued frame costs almost nothing.
+      if (sampleCount > this.audioBudget || this.audioPending >= AUDIO_MAX_PENDING) { this.audioDropped += sampleCount; return; }
+      this.audioBudget -= sampleCount;
+      if (this.audioDropped) {
+        const seconds = this.audioDropped / 16000; this.audioDropped = 0;
+        if (seconds >= 1) recordDiagnostic("audio-backlog", `dropped ${seconds.toFixed(0)} s of queued microphone audio after a pause`);
+      }
+    }
     const samples = pcmS16LeBytesToSamples(audio.audioPcm);
     if (samples.length === 0) return;
-
     const speakerRole = normalizeSpeakerRole(audio.speakerRole);
     this.lastFrameSpeaker = speakerForRole(speakerRole);
+    const meta = this.audioBatchMeta;
+    if (meta && (meta.speakerRole !== speakerRole || meta.source !== audio.source || meta.direction !== audio.direction)) this.flushAudioBatch();
+    this.audioBatchMeta ??= { source: audio.source, direction: audio.direction, speakerRole };
+    this.audioBatch.push(samples); this.audioBatchSamples += samples.length;
+    // One hand-off per ~100 ms instead of one promise chain per 20 ms frame.
+    if (this.audioBatchSamples >= AUDIO_BATCH_SAMPLES) this.flushAudioBatch();
+    else this.audioBatchTimer ??= setTimeout(() => this.flushAudioBatch(), 120);
+  }
+
+  private flushAudioBatch(): void {
+    clearTimeout(this.audioBatchTimer); this.audioBatchTimer = undefined;
+    const meta = this.audioBatchMeta, parts = this.audioBatch, total = this.audioBatchSamples;
+    this.audioBatch = []; this.audioBatchSamples = 0; this.audioBatchMeta = undefined;
+    const client = this.client;
+    if (!meta || !total || !client || this.disposed || client.state !== "active") return;
+    let samples: Int16Array;
+    if (parts.length === 1) samples = parts[0]!;
+    else { samples = new Int16Array(total); let offset = 0; for (const part of parts) { samples.set(part, offset); offset += part.length; } }
+    this.audioPending++;
     this.audioSendChain = this.audioSendChain
-      .catch(() => undefined)
       .then(async () => {
         if (this.disposed || client !== this.client || client.state !== "active") return;
-        await client.sendAudio(samples, {
-          source: audio.source,
-          direction: audio.direction,
-          speakerRole,
-          capturedAt: new Date().toISOString(),
-        });
+        await client.sendAudio(samples, { source: meta.source, direction: meta.direction, speakerRole: meta.speakerRole, capturedAt: new Date().toISOString() });
       })
-      .catch((error: unknown) => this.handleError(error));
+      .catch((error: unknown) => this.handleError(error))
+      .finally(() => { this.audioPending--; });
   }
+  /** Everything received so far has been handed to the session. */
+  private async audioDrained(): Promise<void> { this.flushAudioBatch(); await this.audioSendChain; }
 
   private async commitIfAudioAvailable(): Promise<boolean> {
     const client = this.client;
@@ -1908,6 +1953,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Audio intake: frames are handed on in ~100 ms batches; at most 2 s may arrive at once; at most 3 s may wait. */
+const AUDIO_BATCH_SAMPLES = 1600, AUDIO_BURST_SAMPLES = 32_000, AUDIO_MAX_PENDING = 30;
 /** Live-session history write coalescing window for the phone app (set on G2ConversationController.liveHistoryWriteDelayMs). */
 export const LIVE_HISTORY_WRITE_DELAY_MS = 10_000;
 

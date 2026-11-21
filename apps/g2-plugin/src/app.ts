@@ -55,6 +55,9 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   const controller = new G2ConversationController(bridge, renderer, presentation, ...(options.transportFactory ? [options.transportFactory] as const : []));
   // Battery: batch live-session history saves (one shard + one index write per ~3 s, flushed on hide/stop).
   controller.liveHistoryWriteDelayMs = LIVE_HISTORY_WRITE_DELAY_MS;
+  // Heat / lock screen: accept microphone audio only at its real-time rate (a backlog queued while the
+  // WebView was suspended is dropped, not uploaded). `?audio=all` keeps everything (offline QA replays).
+  controller.audioRealtimeGuard = new URLSearchParams(options.search ?? location.search).get("audio") !== "all";
   const ui = new CompanionUi(root, config, providerCredentials, {
     rehearsalScripts: REHEARSAL_SCRIPTS.map(script => ({ id: script.id, title: script.title })),
   });

@@ -194,7 +194,7 @@ export function monitorBridge<T extends object>(bridge: T): T {
 // every 10 s (and on visibility changes, taps and stalls), also mirrored into the Even bridge storage.
 export const HEARTBEAT_KEY = "helix.heartbeat.v1";
 export const HEARTBEAT_MS = 10_000;
-export const STALL_TICK_MS = 1000, STALL_MIN_MS = 1500;
+export const STALL_TICK_MS = 1000, STALL_MIN_MS = 1500, SUSPEND_GAP_MS = 15_000;
 interface Heartbeat { at: number; boot: number; visible: boolean; hiddenAt?: number; clean?: boolean; state?: string; taps?: string; stalls?: number; maxStall?: number; bridge?: string; io?: string }
 /** Verdict on the previous page load; null until read (the UI may ask before watchLifecycle runs). */
 let previousExit: string | undefined | null = null;
@@ -280,10 +280,18 @@ export function watchLifecycle(handlers: { onResume: (reason: string) => void; o
   const heartbeat = setInterval(() => beat(), HEARTBEAT_MS);
   // Main-thread stall timer: a 1 s tick that arrives late while the page is on screen means the page
   // could not handle taps or scrolling for that long. Late ticks after a background stay are ignored.
+  let lastSuspendResume = 0;
   let lastTick = Date.now(), visibleSince = document.visibilityState === "visible" ? boot : Number.POSITIVE_INFINITY, stuckReported = 0;
   const watchdog = setInterval(() => {
     const now = Date.now(), late = now - lastTick - STALL_TICK_MS, since = lastTick;
     lastTick = now;
+    // No timer for 15 s or more: the WebView was suspended (phone locked, app in the background). Sockets and
+    // the glasses page may be stale, so run the resume path even if no visibility event arrives. Once a minute at most.
+    if (late >= SUSPEND_GAP_MS && now - lastSuspendResume > 60_000) {
+      lastSuspendResume = now;
+      recordDiagnostic("suspended", `${Math.round(late / 1000)} s without running · ${document.visibilityState}`);
+      try { handlers.onResume("timer-gap"); } catch { /* resume is best effort */ }
+    }
     // Timers arriving 0.2-1.5 s late: the page is struggling (heavy work, or the phone is throttling a hot app).
     if (late >= 200 && late < STALL_MIN_MS && document.visibilityState === "visible" && visibleSince <= since) countDiagnostic("timer-late", late);
     if (late >= STALL_MIN_MS && document.visibilityState === "visible" && visibleSince <= since) {
