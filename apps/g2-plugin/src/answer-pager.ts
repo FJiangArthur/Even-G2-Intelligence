@@ -86,6 +86,11 @@ export const MAX_WAITING_ANSWERS = 2;
 /** A streaming answer that received no text for this long is treated as cut off, so it cannot hold the display forever. */
 export const STREAM_STALL_MS = 20_000;
 
+/** A waiting answer older than this is not shown when its turn comes: it would arrive with no sign of its age. The phone keeps it. */
+export const MAX_WAITING_AGE_MS = 30_000;
+/** Dropped answers remembered, so a re-render of the same answer does not bring it back. */
+const MAX_DROPPED = 8;
+
 export interface PagedAnswer {
   readonly id?: string;
   readonly questionId?: string;
@@ -96,7 +101,7 @@ export interface PagedAnswer {
   /** Page geometry of this answer; defaults to the pager's layout. */
   readonly layout?: PageLayout;
 }
-interface WaitingAnswer { identity: string; revision?: number; answer: PagedAnswer }
+interface WaitingAnswer { identity: string; revision?: number; answer: PagedAnswer; /** When it started waiting. */ arrivedAt: number }
 
 /** Timers belong to the reading lifecycle, never to incoming transcript events.
  * Once a page has a successor its boundary is frozen, including while tokens
@@ -104,7 +109,10 @@ interface WaitingAnswer { identity: string; revision?: number; answer: PagedAnsw
  *
  * Back-to-back answers: a different answer that arrives while the first page of the
  * current one is still inside its reading time waits (see `waiting`) and takes over
- * when that time is up, or when the current answer ends or is dismissed. Clearing the
+ * when that time is up, or when the current answer ends or is dismissed. If the wearer
+ * pages through the current answer instead, the waiting one takes over once a page has
+ * had its reading time without another gesture. A waiting answer older than
+ * MAX_WAITING_AGE_MS is dropped instead of shown. Clearing the
  * answer (`update(undefined)`, e.g. a manual ask) drops everything at once. */
 export class AnswerPager {
   private identity?: string;
@@ -119,6 +127,8 @@ export class AnswerPager {
   private timerKind?: "advance" | "hide";
   private revision?: number;
   private queue: WaitingAnswer[] = [];
+  /** "<identity>:<revision>" of waiting answers dropped for their age. */
+  private dropped: string[] = [];
   /** When the first page of the current answer appeared. */
   private shownAt = 0;
   private swapTimer?: ReturnType<typeof setTimeout>;
@@ -144,7 +154,7 @@ export class AnswerPager {
   /** "<id>:<revision>" of the answer on screen; undefined when nothing is shown. */
   public get key(): string | undefined { return this.text ? `${this.identity ?? "anonymous"}:${this.revision ?? 0}` : undefined; }
   /** Answers waiting behind the one on screen. */
-  public get waiting(): number { return this.text ? this.queue.length : 0; }
+  public get waiting(): number { return this.text ? this.queue.filter(item => this.fresh(item)).length : 0; }
   /** The answer on screen was cut short (provider cut-off, or its stream stalled). */
   public get isCutOff(): boolean { return this.cut && !this.streaming; }
 
@@ -163,11 +173,13 @@ export class AnswerPager {
   private go(index: number): boolean {
     if (this.disposed || this.hidden || index < 0 || index >= this.pages.length) return false;
     this.cancelTimer();
-    // The wearer is reading this answer: a waiting one no longer cuts in, it follows when this one ends.
+    // The wearer is reading this answer: a waiting one does not cut in on the gesture. It takes over
+    // when this page has had its reading time with no further gesture (instead of the next page).
     this.cancelSwap();
     this.index = index;
     this.onChange(this.text);
-    this.schedule();
+    if (this.queue.some(item => this.fresh(item))) this.scheduleSwap();
+    else this.schedule();
     return true;
   }
 
@@ -175,6 +187,7 @@ export class AnswerPager {
     if (this.disposed) return;
     if (!answer) {
       this.clear();
+      this.dropped = [];
       this.identity = undefined;
       this.revision = revision;
       this.onChange("");
@@ -182,12 +195,13 @@ export class AnswerPager {
     }
     const identity = answer.id ?? answer.questionId ?? "anonymous";
     if (identity !== this.identity || revision !== this.revision) {
+      if (this.dropped.includes(waitingKey(identity, revision))) return;
       const waiting = this.queue.find(item => item.identity === identity && item.revision === revision);
       if (waiting) { waiting.answer = answer; return; }
       if (this.text && (this.queue.length || this.dwellLeft() > 0)) {
         // The answer on screen gets no more text once another one has started.
         if (this.streaming) { this.streaming = false; this.cancelStall(); this.schedule(); }
-        this.queue = [...this.queue, { identity, revision, answer }].slice(-MAX_WAITING_ANSWERS);
+        this.queue = [...this.queue, { identity, revision, answer, arrivedAt: this.now() }].slice(-MAX_WAITING_ANSWERS);
         this.scheduleSwap();
         this.onChange(this.text);
         return;
@@ -236,9 +250,15 @@ export class AnswerPager {
     return Math.max(0, this.shownAt + pageReadingMs(visibleCharacters) - this.now());
   }
 
-  /** The next waiting answer takes the display. */
+  private fresh(item: WaitingAnswer): boolean { return this.now() - item.arrivedAt <= MAX_WAITING_AGE_MS; }
+
+  /** The next waiting answer takes the display. Answers that waited too long are dropped on the way. */
   private promote(): boolean {
-    const next = this.queue.shift();
+    let next = this.queue.shift();
+    while (next && !this.fresh(next)) {
+      this.dropped = [...this.dropped, waitingKey(next.identity, next.revision)].slice(-MAX_DROPPED);
+      next = this.queue.shift();
+    }
     if (!next) return false;
     const queue = this.queue;
     this.clear();
@@ -250,13 +270,17 @@ export class AnswerPager {
   }
 
   private scheduleSwap(): void {
-    if (this.swapTimer !== undefined || !this.queue.length || this.index !== 0) return;
+    if (this.swapTimer !== undefined || !this.queue.length || !this.text) return;
+    // First page: the rest of its reading time. A page the wearer turned to: its own reading time.
+    const visibleCharacters = [...segmenter.segment(this.text.trim())].length;
     this.swapTimer = setTimeout(() => {
       this.swapTimer = undefined;
-      if (this.disposed || !this.queue.length) return;
-      this.cancelTimer();
-      this.promote();
-    }, this.dwellLeft());
+      if (this.disposed || this.hidden || !this.queue.length) return;
+      if (this.promote()) return;
+      // Everything waiting was too old: the answer on screen carries on.
+      this.onChange(this.text);
+      this.schedule();
+    }, this.index === 0 ? this.dwellLeft() : pageReadingMs(visibleCharacters));
   }
   private cancelSwap(): void {
     if (this.swapTimer !== undefined) clearTimeout(this.swapTimer);
@@ -321,8 +345,11 @@ export class AnswerPager {
 
   public dispose(): void {
     this.clear();
+    this.dropped = [];
     this.hidden = true;
     this.disposed = true;
     this.onChange("");
   }
 }
+
+function waitingKey(identity: string, revision?: number): string { return `${identity}:${revision ?? ""}`; }

@@ -194,6 +194,10 @@ const ENDING_STATUSES = ["failed", "stopped", "exited", "ready"];
 
 export type PresentationListener = (snapshot: PresentationSnapshot) => void;
 
+/** SDK error codes that never concern an answer in flight: the transcription-backlog notice, and a
+ * manual ask refused before any answer text. Every other non-fatal code may be the answer's own failure. */
+const NOT_ANSWER_ERROR_CODES: readonly string[] = ["conversation-busy", "context-empty"];
+
 export class ConversationPresentation {
   private status = "ready";
   private error?: string;
@@ -502,6 +506,26 @@ export class ConversationPresentation {
       answerResetRevision: (this.glasses.answerResetRevision ?? 0) + 1 };
   }
 
+  /**
+   * A provider failure mid-stream ends the answer: no `answer.completed` follows it, so without this
+   * the answer would count as streaming until the next one (no cues, no web-check correction, a phone
+   * item stuck on "answering"). The text stays on screen, marked as cut off.
+   *
+   * The SDK error event names no answer or lane, so the code decides (see NOT_ANSWER_ERROR_CODES). If
+   * the error was a transcription failure after all, the answer's next delta or its completion puts
+   * the answer back to its real state: both rebuild the feed item and the glasses answer from scratch.
+   */
+  private cutOffStreamingAnswer(): void {
+    const answer = this.glasses.answer;
+    if (!answer?.streaming) return;
+    const item = answer.id ? this.feed.find(entry => entry.id === answer.id && entry.kind === "answer" && entry.streaming) : undefined;
+    if (item) {
+      this.upsert({ ...item, streaming: false, partial: true, label: "Helix · answer cut off" });
+      this.unseen.answers++;
+    }
+    this.glasses = { ...this.glasses, answer: { ...answer, streaming: false, partial: true } };
+  }
+
   private acceptsAnswer(answerId: string, questionId?: string): boolean {
     if (this.retiredAnswers.has(answerId) || (questionId !== undefined && this.retiredQuestions.has(questionId))) return false;
     if (this.waitingForManual) return false;
@@ -768,6 +792,7 @@ export class ConversationPresentation {
       }
       case "error":
         this.glasses = { ...this.glasses, interaction: undefined };
+        if (!event.fatal && !NOT_ANSWER_ERROR_CODES.includes(event.code)) this.cutOffStreamingAnswer();
         this.upsert({
           id: event.eventId,
           kind: "error",
