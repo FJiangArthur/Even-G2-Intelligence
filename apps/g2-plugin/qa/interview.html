@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Helix interview harness</title>
+<style>
+  /* Test-only panel below the real app. Its own colours, so it can never be mistaken for a Helix screen. */
+  #interview-panel { margin: 24px 8px 40px; padding: 10px; border: 2px dashed #b45309; border-radius: 10px; background: #fffbeb; color: #1c1917; font: 13px/1.4 system-ui, -apple-system, sans-serif; }
+  #interview-panel h2 { margin: 0 0 2px; font-size: 14px; letter-spacing: .04em; color: #92400e; }
+  #interview-panel p { margin: 0 0 8px; color: #57534e; font-size: 12px; }
+  #interview-panel .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 8px; }
+  #interview-panel label { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: #44403c; }
+  /* The app's stylesheet styles every select / input / button on the page: set the panel's own look in full. */
+  #interview-panel select, #interview-panel input, #interview-panel button { font: inherit; font-size: 12px; min-height: 32px; width: auto; margin: 0; padding: 5px 7px; border: 1px solid #a8a29e; border-radius: 6px; box-shadow: none; background: #fff; color: #1c1917; max-width: 100%; }
+  #interview-panel label { min-width: 0; }
+  #interview-panel label select { min-width: 0; flex: 1 1 auto; }
+  #interview-panel #iv-script { max-width: 250px; }
+  #interview-panel button { cursor: pointer; background: #fef3c7; }
+  #interview-panel button.primary { background: #b45309; border-color: #92400e; color: #fff; }
+  #interview-panel input[type=text] { flex: 1 1 160px; min-width: 0; }
+  #interview-panel .scroll { overflow-x: auto; }
+  #interview-panel table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  #interview-panel th, #interview-panel td { text-align: left; vertical-align: top; padding: 3px 4px; border-top: 1px solid #e7e5e4; }
+  #interview-panel th { color: #57534e; font-weight: 600; white-space: nowrap; }
+  #interview-panel td.q { min-width: 84px; word-break: break-word; }
+  #interview-panel td.s { min-width: 62px; }
+  #interview-panel td.q small { display: block; color: #92400e; }
+  #interview-panel td.n { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #interview-panel tr.bad td { background: #fee2e2; }
+  #interview-panel #iv-summary { font-size: 12px; margin: 0 0 6px; color: #1c1917; }
+  #interview-panel #iv-violations { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #991b1b; }
+  #interview-panel #iv-state { font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<section id="interview-panel" aria-label="Interview test harness">
+  <h2>TEST HARNESS · NOT PART OF HELIX</h2>
+  <p>The app above is the real one, on a fake G2 bridge and a fake provider: no key, no network. <span id="iv-state">starting…</span></p>
+  <div class="row">
+    <label>Script <select id="iv-script"></select></label>
+    <label>Speed <select id="iv-speed"><option>1</option><option>2</option><option>4</option><option>8</option></select></label>
+    <label>Lines <select id="iv-path"><option value="typed">typed</option><option value="audio">audio (fake mic)</option></select></label>
+    <button id="iv-play" class="primary" type="button">Play</button>
+    <button id="iv-stop" type="button">Stop</button>
+  </div>
+  <div class="row">
+    <label>Mode <select id="iv-mode"></select></label>
+    <select id="iv-speaker" aria-label="Speaker"><option value="other">other</option><option value="self">self</option><option value="unknown">unknown</option></select>
+    <input id="iv-text" type="text" placeholder="Say a line…" aria-label="Line to say">
+    <button id="iv-say" type="button">Say</button>
+  </div>
+  <div class="row" id="iv-faults" aria-label="Faults"></div>
+  <div id="iv-summary"></div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th title="Line number">L</th><th>Question</th><th title="Speaker">Who</th><th title="Expected outcome: answer, answer key or none">Exp</th><th title="Times answered">×</th><th title="Line heard to first answer token, ms">Tok</th><th title="Line heard to answer on the glasses, ms">Glass</th><th>State</th></tr></thead>
+      <tbody id="iv-rows"></tbody>
+    </table>
+  </div>
+  <ul id="iv-violations"></ul>
+  <div class="row"><button id="iv-copy" type="button">Copy report JSON</button><button id="iv-copy-timeline" type="button">Copy timeline JSON</button></div>
+</section>
+<script type="module" src="/qa/interview.ts"></script>
+</body>
+</html>
