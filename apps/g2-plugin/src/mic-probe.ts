@@ -46,10 +46,13 @@ const windowGaps = new Float32Array(GAP_SAMPLES);
 let w = fresh();
 
 // Per-call state (plain numbers; nothing is allocated per event).
-let entryAt = 0, entryDepth = 0, entryRaw: unknown, callAudio = false, callCounted = false;
+let entryAt = 0, entryDepth = 0, entryRaw: unknown, callAudio = false, callCounted = false, directPending = false;
 let messageAt = 0, messageRaw: unknown;
 let eventPending = false, lastArrival = 0, quiet = true, installed = false;
 let restore: (() => void) | undefined;
+// Health of the installed wrappers (see micProbeCheck).
+let check: (() => string) | undefined, entryGetter: (() => unknown) | undefined, logWrapper: unknown;
+let entryOk = true, logOk = true, entryReinstalled = false, logReinstalled = false, health = "ok";
 /** Entry points seen since the page loaded (for the report header). */
 const seen = { fn: 0, message: 0, event: 0, direct: 0 };
 
@@ -91,7 +94,10 @@ function noteRaw(raw: unknown): void {
 export function micHandlerBegin(bytes: number): number {
   const at = clock();
   if (eventPending) eventPending = false; // arrival already counted where the SDK dispatched it
-  else { w.direct += 1; seen.direct += 1; arrival(entryAt || at, bytes); if (entryAt) { callAudio = true; callCounted = true; } } // no window event seen (yet): count here
+  else { // no window event seen (yet): count here, and tell the probe's listener in case it runs after this one
+    w.direct += 1; seen.direct += 1; arrival(entryAt || at, bytes);
+    if (entryAt) { callAudio = true; callCounted = true; } else directPending = true;
+  }
   const from = entryAt || (messageAt && at - messageAt < 250 ? messageAt : 0);
   if (from) { const took = at - from; w.decode += took; w.decodeN += 1; if (took > w.decodeMax) w.decodeMax = took; }
   return at;
@@ -124,30 +130,35 @@ export function installMicProbe(target: Target | undefined = typeof window === "
   installed = true;
   const undo: (() => void)[] = [];
   // 1. Timing wrapper around the SDK's global entry function. An accessor keeps the wrapper in place
-  //    if the SDK assigns the function again later.
-  try {
-    let original = target[ENTRY_FN] as ((this: unknown, message: unknown) => unknown) | undefined;
-    const wrapper = function (this: unknown, message: unknown): unknown {
-      if (!original) return undefined;
-      if (entryDepth++) { try { return original.call(this, message); } finally { entryDepth--; } }
-      entryAt = clock(); callAudio = false; callCounted = false; entryRaw = message;
-      try { return original.call(this, message); }
-      finally {
-        entryDepth = 0;
-        if (callAudio) {
-          const took = clock() - entryAt;
-          w.fn += 1; seen.fn += 1; w.call += took; w.callN += 1; if (took > w.callMax) w.callMax = took;
-          noteRaw(entryRaw);
+  //    if the SDK assigns the function again later; micProbeCheck() notices a redefinition.
+  const installEntry = (): boolean => {
+    try {
+      let original = target[ENTRY_FN] as ((this: unknown, message: unknown) => unknown) | undefined;
+      const wrapper = function (this: unknown, message: unknown): unknown {
+        if (!original) return undefined;
+        if (entryDepth++) { try { return original.call(this, message); } finally { entryDepth--; } }
+        entryAt = clock(); callAudio = false; callCounted = false; entryRaw = message;
+        try { return original.call(this, message); }
+        finally {
+          entryDepth = 0;
+          if (callAudio) {
+            const took = clock() - entryAt;
+            w.fn += 1; seen.fn += 1; w.call += took; w.callN += 1; if (took > w.callMax) w.callMax = took;
+            noteRaw(entryRaw);
+          }
+          entryAt = 0; entryRaw = undefined; eventPending = false;
         }
-        entryAt = 0; entryRaw = undefined; eventPending = false;
-      }
-    };
-    const had = Object.getOwnPropertyDescriptor(target, ENTRY_FN);
-    if (!had || had.configurable) {
-      Object.defineProperty(target, ENTRY_FN, { configurable: true, enumerable: true, get: () => original ? wrapper : undefined, set: (next: unknown) => { original = typeof next === "function" ? next as typeof original : undefined; } });
-      undo.push(() => { try { Object.defineProperty(target, ENTRY_FN, { configurable: true, enumerable: true, writable: true, value: original }); } catch { /* leave it */ } });
-    }
-  } catch { /* entry function not wrappable on this host: reported as not observed */ }
+      };
+      const had = Object.getOwnPropertyDescriptor(target, ENTRY_FN);
+      if (had && !had.configurable) return false;
+      const get = (): unknown => original ? wrapper : undefined;
+      Object.defineProperty(target, ENTRY_FN, { configurable: true, enumerable: true, get, set: (next: unknown) => { original = typeof next === "function" ? next as typeof original : undefined; } });
+      entryGetter = get;
+      undo.push(() => { try { if (Object.getOwnPropertyDescriptor(target, ENTRY_FN)?.get === get) Object.defineProperty(target, ENTRY_FN, { configurable: true, enumerable: true, writable: true, value: original }); } catch { /* leave it */ } });
+      return true;
+    } catch { return false; /* entry function not wrappable on this host: reported as not observed */ }
+  };
+  installEntry();
   // 2. Hosts (or a simulator) that post a window message instead. Capture phase, registered before the bridge exists.
   const onMessage = (event: { data?: unknown }): void => {
     const data = event.data;
@@ -159,10 +170,11 @@ export function installMicProbe(target: Target | undefined = typeof window === "
     if (!audio) return;
     const at = clock(), viaMessage = !entryAt && messageAt > 0 && at - messageAt < 250;
     w.event += 1; seen.event += 1;
-    if (entryAt && callCounted) return; // the app's listener ran first (it was registered before the probe) and counted this one
+    if (viaMessage) { w.message += 1; seen.message += 1; noteRaw(messageRaw); messageRaw = undefined; }
+    // The app's listener ran first (it was registered before the probe) and counted this one already.
+    if (entryAt ? callCounted : directPending) { directPending = false; return; }
     eventPending = true;
     if (entryAt) callAudio = true;
-    else if (viaMessage) { w.message += 1; seen.message += 1; noteRaw(messageRaw); messageRaw = undefined; }
     arrival(entryAt || (viaMessage ? messageAt : at), audio.audioPcm?.length ?? -1);
   };
   try {
@@ -172,18 +184,41 @@ export function installMicProbe(target: Target | undefined = typeof window === "
   } catch { /* no event target */ }
   // 4. The SDK logs every event with its payload. In the Even app's WebView console.log is forwarded to the
   //    native side, so this line is timed (or skipped) here; any other console line passes through untouched.
-  try {
-    const log = logger.log;
-    const timed = function (this: unknown, ...args: unknown[]): void {
-      if (!isAudioLog(args[0], args[1])) { log.apply(this, args); return; }
-      if (quiet) { w.logSkipped += 1; return; }
-      const at = clock();
-      try { log.apply(this, args); } finally { const took = clock() - at; w.log += took; w.logN += 1; if (took > w.logMax) w.logMax = took; }
-    };
-    logger.log = timed;
-    undo.push(() => { if (logger.log === timed) logger.log = log; });
-  } catch { /* console not writable */ }
-  restore = () => { for (const step of undo.reverse()) { try { step(); } catch { /* best effort */ } } installed = false; restore = undefined; };
+  const installLog = (): boolean => {
+    try {
+      const log = logger.log;
+      const timed = function (this: unknown, ...args: unknown[]): void {
+        if (!isAudioLog(args[0], args[1])) { log.apply(this, args); return; }
+        if (quiet) { w.logSkipped += 1; return; }
+        const at = clock();
+        try { log.apply(this, args); } finally { const took = clock() - at; w.log += took; w.logN += 1; if (took > w.logMax) w.logMax = took; }
+      };
+      logger.log = timed;
+      if (logger.log !== timed) return false;
+      logWrapper = timed;
+      undo.push(() => { if (logger.log === timed) logger.log = log; });
+      return true;
+    } catch { return false; /* console not writable */ }
+  };
+  installLog();
+  // Called at each heartbeat: is what was installed still what runs? Another script (the SDK, the host's
+  // injected console hook) may have put its own function in either place since.
+  check = () => {
+    const notes: string[] = [];
+    entryOk = !entryGetter || Object.getOwnPropertyDescriptor(target, ENTRY_FN)?.get === entryGetter;
+    if (!entryOk) {
+      // Once: wrap whatever is there now. A second replacement is reported and left alone (no fight over the property).
+      if (!entryReinstalled) { entryReinstalled = true; entryOk = installEntry(); }
+      notes.push(entryOk ? "entry function was replaced: probe re-installed" : "probe displaced: the entry function was replaced");
+    }
+    logOk = !logWrapper || logger.log === logWrapper;
+    if (!logOk) {
+      if (!logReinstalled) { logReinstalled = true; logOk = installLog(); }
+      notes.push(logOk ? "console.log was replaced: SDK audio log wrapper re-installed" : "SDK audio log NOT skipped: console replaced");
+    }
+    return notes.length ? notes.join(" · ") : "ok";
+  };
+  restore = () => { for (const step of undo.reverse()) { try { step(); } catch { /* best effort */ } } installed = false; restore = undefined; check = undefined; entryGetter = undefined; logWrapper = undefined; entryOk = true; logOk = true; entryReinstalled = false; logReinstalled = false; health = "ok"; };
   return restore;
 }
 
@@ -194,8 +229,13 @@ const pair = (sum: number, n: number, max: number): string => `${ms(n ? sum / n 
 export function micEntryObserved(): MicEntryKind {
   return seen.fn ? "fn" : seen.message ? "message" : seen.event ? "event" : "none";
 }
+/** Verifies the wrappers are still in place (re-installing each once) and returns "ok" or what is wrong. Heartbeat only, never per event. */
+export function micProbeCheck(): string { try { health = check ? check() : "ok"; } catch { /* keep the last verdict */ } return health; }
+/** The last verdict of micProbeCheck. */
+export function micProbeHealth(): string { return health; }
 export function micProbeState(): string {
-  return `mic-entry ${micEntryObserved()}${seen.direct ? " (+direct listener)" : ""} · probe ${installed ? "installed" : "not installed"} · SDK audio log ${quiet ? "skipped" : "left on"}`;
+  return `mic-entry ${micEntryObserved()}${seen.direct ? " (+direct listener)" : ""} · probe ${!installed ? "not installed" : entryOk ? "installed" : "displaced"}`
+    + ` · SDK audio log ${!installed ? "not wrapped" : !logOk ? "NOT skipped: console replaced" : quiet ? "skipped" : "left on"}`;
 }
 
 export interface MicWindowReport { readonly mic: string; readonly sdk: string }
@@ -237,6 +277,6 @@ export function micProbeWindow(lag?: { avg: number; max: number }, at = clock())
 /** Test hook: remove the probes and forget everything. */
 export function resetMicProbeForTest(): void {
   restore?.();
-  w = fresh(); entryAt = 0; entryDepth = 0; entryRaw = undefined; callAudio = false; callCounted = false; messageAt = 0; messageRaw = undefined; eventPending = false; lastArrival = 0; quiet = true; installed = false;
+  w = fresh(); entryAt = 0; entryDepth = 0; entryRaw = undefined; callAudio = false; callCounted = false; directPending = false; messageAt = 0; messageRaw = undefined; eventPending = false; lastArrival = 0; quiet = true; installed = false;
   seen.fn = 0; seen.message = 0; seen.event = 0; seen.direct = 0;
 }

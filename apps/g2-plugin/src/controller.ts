@@ -1454,8 +1454,10 @@ export class G2ConversationController {
     this.unsubscribePresentation = undefined;
     this.renderer.dispose(); // Stop display traffic before asynchronous teardown.
     try {
-      if (this.micOn) await this.bridge.audioControl(false, this.micSource);
+      // Guard timers go first: if the close below throws, nothing of the guard may outlive the controller.
+      const wasOn = this.micOn;
       this.micOn = false; this.clearAudioPause();
+      if (wasOn) await this.bridge.audioControl(false, this.micSource);
       await this.audioDrained();
       await this.releaseClient("shutdown");
       await this.archiveQueue;
@@ -1647,8 +1649,11 @@ export class G2ConversationController {
     const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
     if (this.audioSuspended) {
       // Paused for load while hidden: only a visible page (or the retry timer) turns the microphone back on.
-      // A pause that began on screen waits for its own timer, or a glasses event would undo it at once.
-      if (!hidden && this.audioSuspendedHidden) await this.resumeAudioAfterLoad("visible");
+      // A pause that began on screen is not undone by a glasses event (foreground-enter / -exit).
+      // Coming back from hidden (unlock, app switch, WebView resume) re-opens either kind: the phone had a rest,
+      // and waiting out a retry timer of up to 240 s after an unlock would look broken. A new overload is
+      // caught again by the guard (not sooner than 4 s after this re-open).
+      if (!hidden && (this.audioSuspendedHidden || !reason.startsWith("foreground-"))) await this.resumeAudioAfterLoad("visible");
     } else if (this.micOn && !this.audioFlushing && this.client?.state === "active") {
       // Android stops the mic while suspended; re-enable with the same source. Not in the middle of an overload flush.
       try { await this.bridge.audioControl(true, this.micSource); } catch (error) { console.warn("Helix mic re-enable failed", error); }
@@ -1728,6 +1733,8 @@ export class G2ConversationController {
     if (state === "connecting") this.presentation.setStatus("connecting");
     if (state === "starting") this.presentation.setStatus("authorizing");
     if (state === "active" && !this.micOn) this.presentation.setStatus("connected");
+    // The guard wanted to re-open the microphone while the session was not active: do it now, not at the retry timer.
+    if (state === "active" && this.micOn && this.audioSuspended && this.audioReopenFails > 0) void this.resumeAudioAfterLoad("retry");
     if (state === "failed") {
       this.presentation.setStatus("failed", "Direct provider connection failed");
       this.micOn = false; this.clearAudioPause(); this.resetAudioLoad();
@@ -1777,7 +1784,7 @@ export class G2ConversationController {
    */
   private receiveAudio(audio: AudioEvent): void {
     if (this.audioFlushing || this.audioSuspended) { this.audioFlushSeen++; this.audioFlushLastAt = Date.now(); return; }
-    const began = micHandlerBegin(audio.audioPcm.byteLength);
+    const began = micHandlerBegin(audio.audioPcm?.byteLength ?? 0);
     countDiagnostic("audio");
     this.enqueueAudio(audio);
     micHandlerEnd(began);
@@ -1848,7 +1855,7 @@ export class G2ConversationController {
   private audioWindowGap = 0;
   private audioLastAt = 0;
   private audioBaseline = 1;
-  private audioBaselineWindows = 0;
+  private audioBaselineSeeds: number[] = [];
   private audioSlowWindows = 0;
   private audioSteadySlow = 0;
   private audioStreamWindows = 0;
@@ -1890,14 +1897,31 @@ export class G2ConversationController {
     const steady = this.audioWindowGap < AUDIO_STEADY_GAP_MS;
     this.audioWindowAt = now; this.audioWindowSamples = 0; this.audioWindowGap = 0;
     const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
-    // This device's normal delivery rate (42 events a second was measured, not 50). Learned on screen or
-    // off, but never from a slow window: at 60 % a baseline that followed the rate would hide the overload.
-    if (ratio < 1.5 && (this.audioBaselineWindows ? ratio >= this.audioBaseline * 0.85 : ratio > 0.7)) {
-      this.audioBaselineWindows++;
-      this.audioBaseline = this.audioBaselineWindows === 1 ? ratio : this.audioBaseline * 0.8 + ratio * 0.2;
+    // Second signal first: the baseline below must not learn from a window that has it.
+    const pressure = hidden ? NO_PRESSURE : this.audioPressure(now);
+    if (this.audioPingAt && now - this.audioPingAt >= AUDIO_PING_TIMEOUT_MS) { // reply lost: one failed sample, then ask again
+      this.audioPingMs = now - this.audioPingAt; this.audioPingDoneAt = now; this.audioPingAt = 0;
     }
-    // The first window of a stream is never judged: a microphone that was just opened starts unevenly.
-    const below = ratio > 0.1 && ratio < this.audioBaseline * AUDIO_SLOW_SHARE, slow = this.audioStreamWindows++ > 0 && below;
+    const pingMs = this.audioPingAt ? now - this.audioPingAt : now - this.audioPingDoneAt <= 2 * AUDIO_LOAD_WINDOW_MS ? this.audioPingMs : 0;
+    const confirmed = pingMs >= AUDIO_PING_SLOW_MS || pressure.bridgePendingMs >= AUDIO_BRIDGE_PENDING_MS || pressure.timerLateMs >= AUDIO_TIMER_LATE_MS;
+    const repeat = this.audioFlushTimes.some(at => now - at < AUDIO_FLUSH_ESCALATE_MS);
+    // The first window of a stream is never judged or learned from: a microphone that was just opened starts
+    // unevenly, and the host may hand over frames it buffered (a burst above real time).
+    const judged = this.audioStreamWindows++ > 0;
+    const wasBelow = ratio > 0.1 && ratio < this.audioBaseline * AUDIO_SLOW_SHARE;
+    // This device's normal delivery rate (42 events a second was measured, not 50), on screen or off.
+    // - A steady stream cannot run faster than real time, so a window above 1.1 is a burst and teaches nothing.
+    // - It starts as the median of the first three plausible windows, so one odd window cannot set it.
+    // - Up: followed. Down: followed too (a stream that is simply slower is the new normal), but only at a
+    //   crawl from a window that already counts as slow, and not at all while a second signal says backlog
+    //   or a confirmed flush is less than a minute old - an overload must not become the baseline.
+    if (judged && ratio > 0.3 && ratio <= 1.1) {
+      if (this.audioBaselineSeeds.length < 3) {
+        if (ratio > 0.7) { this.audioBaselineSeeds.push(ratio); this.audioBaseline = [...this.audioBaselineSeeds].sort((a, b) => a - b)[this.audioBaselineSeeds.length >> 1]!; }
+      } else if (ratio >= this.audioBaseline) this.audioBaseline = this.audioBaseline * 0.8 + ratio * 0.2;
+      else if (!confirmed && !repeat) { const rate = wasBelow ? 0.03 : 0.2; this.audioBaseline = this.audioBaseline * (1 - rate) + ratio * rate; }
+    }
+    const below = ratio > 0.1 && ratio < this.audioBaseline * AUDIO_SLOW_SHARE, slow = judged && below;
     this.audioSlowWindows = slow ? this.audioSlowWindows + 1 : 0;
     this.audioSteadySlow = slow && steady ? this.audioSteadySlow + 1 : 0;
     if (this.audioSuspended || this.audioFlushing) return;
@@ -1907,14 +1931,10 @@ export class G2ConversationController {
     }
     if (below && steady) this.pingBridge(now); // asked already in a stream's first window, so the answer is in by the next
     if (!this.audioSteadySlow) return;
-    const pressure = this.audioPressure(now);
-    const pingMs = this.audioPingAt ? now - this.audioPingAt : now - this.audioPingDoneAt <= 2 * AUDIO_LOAD_WINDOW_MS ? this.audioPingMs : 0;
-    const confirmed = pingMs >= AUDIO_PING_SLOW_MS || pressure.bridgePendingMs >= AUDIO_BRIDGE_PENDING_MS || pressure.timerLateMs >= AUDIO_TIMER_LATE_MS;
     // A hold-to-talk turn is the wearer's; the guard waits for the release. No flush right after a re-open either.
     if (this.holding || now - this.audioResumedAt < AUDIO_FLUSH_SPACING_MS) return;
     // After a confirmed flush in the last minute one slow window is enough: waiting for two lets the queue grow
     // back to 4 s (seen in qa/mic-guard.html: 170 events, 8.8 s to drain).
-    const repeat = this.audioFlushTimes.some(at => now - at < AUDIO_FLUSH_ESCALATE_MS);
     if (confirmed ? this.audioSteadySlow < (repeat ? 1 : AUDIO_FLUSH_WINDOWS)
       : this.audioSteadySlow < AUDIO_FLUSH_UNCONFIRMED_WINDOWS || now - this.audioUnconfirmedAt < AUDIO_FLUSH_UNCONFIRMED_EVERY_MS) return;
     const numbers = `audio at ${(ratio / this.audioBaseline * 100).toFixed(0)} % of this phone's normal rate (${ratio.toFixed(2)} of ${this.audioBaseline.toFixed(2)}) for ${this.audioSteadySlow} windows · ping ${Math.round(pingMs)} ms · bridge pending ${Math.round(pressure.bridgePendingMs)} ms · timer late ${Math.round(pressure.timerLateMs)} ms`;
@@ -1942,6 +1962,7 @@ export class G2ConversationController {
 
   private beginAudioFlush(now: number, confirmed: boolean, numbers: string): void {
     this.audioSteadySlow = 0; this.audioSlowWindows = 0;
+    this.audioPingAt = 0; this.audioPingMs = 0; this.audioPingDoneAt = 0; // evidence is used up: the next decision needs a new answer
     if (confirmed) { this.audioFlushTimes = this.audioFlushTimes.filter(at => now - at < AUDIO_FLUSH_ESCALATE_MS); this.audioFlushTimes.push(now); }
     else this.audioUnconfirmedAt = now;
     if (confirmed && this.audioFlushTimes.length >= AUDIO_FLUSH_ESCALATE) {
@@ -1963,6 +1984,7 @@ export class G2ConversationController {
   private pollAudioFlush(generation: number): void {
     if (generation !== this.audioFlushGeneration || !this.audioFlushing) return;
     this.audioFlushTimer = undefined;
+    if (this.disposed || this.exiting) { this.audioFlushing = false; return; }
     const now = Date.now(), closed = now - this.audioFlushAt, quiet = now - this.audioFlushLastAt;
     if (closed >= AUDIO_FLUSH_MIN_MS && quiet >= AUDIO_FLUSH_QUIET_MS) {
       const seen = this.audioFlushSeen;
@@ -2010,7 +2032,7 @@ export class G2ConversationController {
   }
   /** New session, other microphone or failure: forget the learned delivery rate and the flush history. */
   private resetAudioLoad(): void {
-    this.audioBaseline = 1; this.audioBaselineWindows = 0; this.audioFlushTimes = []; this.audioUnconfirmedAt = 0; this.audioResumedAt = 0;
+    this.audioBaseline = 1; this.audioBaselineSeeds = []; this.audioFlushTimes = []; this.audioUnconfirmedAt = 0; this.audioResumedAt = 0;
     this.audioPingAt = 0; this.audioPingMs = 0; this.audioPingDoneAt = 0; this.micWrongSource = 0; this.micRightSource = 0;
   }
 
@@ -2022,8 +2044,8 @@ export class G2ConversationController {
     if (seen) noteMicDropped("flush", seen);
     this.audioSuspended = false; this.audioSlowWindows = 0; this.audioSteadySlow = 0;
     if (reason === "visible") this.audioRetryMs = AUDIO_RETRY_MS;
-    if (!this.micOn || this.disposed || this.exiting || this.client?.state !== "active") return;
-    this.presentation.setInteraction("LISTENING");
+    if (!this.micOn || this.disposed || this.exiting) return;
+    if (this.client?.state === "active") this.presentation.setInteraction("LISTENING");
     await this.reopenAfterGuard(seen ? `${reason} · ${seen} late audio events discarded` : reason, ++this.audioFlushGeneration);
   }
 
@@ -2040,14 +2062,17 @@ export class G2ConversationController {
     // A fresh window and a small budget: anything that still trickles in from before the gap is not accepted as live.
     const now = Date.now();
     this.audioLastAt = 0; this.audioBudget = AUDIO_BATCH_SAMPLES * 2; this.audioBudgetAt = now; this.audioResumedAt = now;
-    if (!this.micOn || this.disposed || this.exiting || this.client?.state !== "active") return;
+    if (!this.micOn || this.disposed || this.exiting || !this.client) return;
+    // Session not active right now (reconnecting): the microphone must not stay closed with listening on,
+    // so this is retried like a refusal, and at once when the session becomes active (handleClientState).
+    const active = this.client.state === "active";
     let opened = false;
-    try { opened = await this.bridge.audioControl(true, this.micSource); } catch { /* retried below */ }
+    if (active) { try { opened = await this.bridge.audioControl(true, this.micSource); } catch { /* retried below */ } }
     if (generation !== this.audioFlushGeneration || !this.micOn || this.disposed) return; // paused, stopped or held meanwhile
     if (opened) { this.audioReopenFails = 0; recordDiagnostic("audio-resume", `${reason} · microphone re-opened`); return; }
-    // Refused: stay closed and try again (5 s once, then the long-pause back-off), never in a tight loop.
+    // Stay closed and try again (5 s once, then the long-pause back-off), never in a tight loop.
     const retry = this.audioReopenFails++ ? this.audioRetryMs : AUDIO_REOPEN_RETRY_MS;
-    recordDiagnostic("audio-resume", `${reason} · re-open refused · retry in ${Math.round(retry / 1000)} s`);
+    recordDiagnostic("audio-resume", `${reason} · ${active ? "re-open refused" : "session not active"} · retry in ${Math.round(retry / 1000)} s`);
     this.audioSuspended = true;
     clearTimeout(this.audioRetryTimer);
     this.audioRetryTimer = setTimeout(() => { if (this.audioReopenFails > 1) this.audioRetryMs = Math.min(this.audioRetryMs * 2, AUDIO_RETRY_MAX_MS); void this.resumeAudioAfterLoad("retry"); }, retry);
@@ -2253,6 +2278,9 @@ const AUDIO_STEADY_GAP_MS = 600;
 const AUDIO_FLUSH_WINDOWS = 2, AUDIO_FLUSH_UNCONFIRMED_WINDOWS = 8, AUDIO_FLUSH_UNCONFIRMED_EVERY_MS = 60_000;
 /** Evidence: our bridge ping unanswered this long, any bridge call pending this long, or a 1 s timer this late. */
 const AUDIO_PING_SLOW_MS = 1500, AUDIO_BRIDGE_PENDING_MS = 3000, AUDIO_TIMER_LATE_MS = 400, AUDIO_PING_EVERY_MS = 2000;
+/** A ping with no reply after this long is a lost reply: counted once as a slow sample, then a new ping is sent. */
+const AUDIO_PING_TIMEOUT_MS = 10_000;
+const NO_PRESSURE = { bridgePendingMs: 0, timerLateMs: 0 };
 export const AUDIO_PING_KEY = "helix.mic.ping";
 /** Flush: microphone closed at least 1 s, re-opened after 0.5 s without an audio event; close repeated at 3 s; given up at 10 s. */
 const AUDIO_FLUSH_MIN_MS = 1000, AUDIO_FLUSH_QUIET_MS = 500, AUDIO_FLUSH_SOFT_MS = 3000, AUDIO_FLUSH_HARD_MS = 10_000, AUDIO_FLUSH_POLL_MS = 100;

@@ -4,7 +4,7 @@
  * A small ring buffer in the WebView's own localStorage, mirrored into the Even bridge storage (v0.11.1).
  * Never records keys, transcript text or provider payloads — only lifecycle facts and error messages.
  */
-import { micProbeState, micProbeWindow } from "./mic-probe";
+import { micProbeCheck, micProbeHealth, micProbeState, micProbeWindow } from "./mic-probe";
 
 const KEY = "helix.diagnostics.v1";
 const MAX = 120;
@@ -138,6 +138,7 @@ function micEvents(): DiagnosticEvent[] {
   if (!micLoaded) { micLoaded = true; try { const raw = storage()?.getItem(MIC_KEY); micLog = mergeEvents(validEvents(raw ? JSON.parse(raw) : []), micLog).slice(-MIC_MAX); } catch { /* start empty */ } }
   return micLog;
 }
+const PRESSURE_CALL_MAX_AGE_MS = 15_000;
 // Main-thread timer lateness, from the 1 s watchdog below (visible page only).
 let lagSum = 0, lagN = 0, lagMax = 0, lateAt = 0, lateMs = 0;
 /**
@@ -146,6 +147,9 @@ let lagSum = 0, lagN = 0, lagMax = 0, lateAt = 0, lateMs = 0;
  */
 export function recordMicWindow(): { mic: string; sdk: string } | undefined {
   try {
+    const before = micProbeHealth(), health = micProbeCheck();
+    // The probe or the log skip stopped working since the last heartbeat: say so once, in the main log.
+    if (health !== before && health !== "ok") recordDiagnostic("mic-probe", health);
     const report = micProbeWindow(lagN ? { avg: lagSum / lagN, max: lagMax } : undefined);
     lagSum = 0; lagN = 0; lagMax = 0;
     if (!report) return undefined;
@@ -163,7 +167,9 @@ export function recordMicWindow(): { mic: string; sdk: string } | undefined {
  */
 export function mainThreadPressure(now = Date.now()): { bridgePendingMs: number; timerLateMs: number } {
   let oldest = now;
-  for (const call of pending.values()) if (call.at < oldest) oldest = call.at;
+  // Only calls issued in the last 15 s: the guard acts within seconds of a backlog, so an older unanswered
+  // call is a hung call (a display write the glasses never acknowledged), not evidence of queued audio.
+  for (const call of pending.values()) if (call.at < oldest && now - call.at <= PRESSURE_CALL_MAX_AGE_MS) oldest = call.at;
   return { bridgePendingMs: now - oldest, timerLateMs: now - lateAt <= 6000 ? lateMs : 0 };
 }
 

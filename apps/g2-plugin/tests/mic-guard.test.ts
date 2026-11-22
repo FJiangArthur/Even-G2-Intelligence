@@ -21,17 +21,22 @@ class HostBridge extends FakeBridge {
   /** false: bridge replies are stuck behind the audio queue (the storage ping is never answered). */
   public repliesPrompt = true;
   public reopenRefused = false;
+  /** The reply to the next storage ping is lost; later ones are answered. */
+  public loseNextPing = false;
+  /** Closing the microphone throws (bridge gone). */
+  public closeThrows = false;
   /** Audio events still queued on the host when the microphone is closed. */
   public backlogOnClose = 0;
   public backlog = 0;
   public readonly micTimes: { open: boolean; at: number }[] = [];
 
   public override async getLocalStorage(key: string): Promise<string> {
-    if (key === AUDIO_PING_KEY && !this.repliesPrompt) return new Promise<string>(() => undefined);
+    if (key === AUDIO_PING_KEY && (!this.repliesPrompt || this.loseNextPing)) { this.loseNextPing = false; return new Promise<string>(() => undefined); }
     return super.getLocalStorage(key);
   }
   public override async audioControl(isOpen: boolean, source?: AudioInputSource): Promise<boolean> {
     await super.audioControl(isOpen, source);
+    if (!isOpen && this.closeThrows) throw new Error("bridge gone");
     this.micTimes.push({ open: isOpen, at: Date.now() });
     if (isOpen && this.reopenRefused) return false;
     if (!isOpen && this.micOpen) this.backlog = this.backlogOnClose;
@@ -266,9 +271,143 @@ describe("on-screen microphone overload guard", () => {
     await t.deliver(45_000, SLOW_MS);
     expect(t.closes()).toBe(1);
     expect(controller.audioPausedForLoad).toBe(false);
-    await t.deliver(30_000, SLOW_MS);
-    expect(t.closes()).toBe(2);
-    expect(controller.audioPausedForLoad).toBe(false); // unconfirmed flushes never escalate
+    // Still slow a minute later with no second signal at any point: this is how the link is, and the
+    // baseline has followed it down. No further flush, and unconfirmed flushes never escalate.
+    await t.deliver(60_000, SLOW_MS);
+    expect(t.closes()).toBe(1);
+    expect(controller.audioPausedForLoad).toBe(false);
+    await controller.dispose();
+  });
+
+  it("baseline: a burst after opening teaches nothing, a slower healthy stream is followed down, and a slide with a backlog signal is not", async () => {
+    // (a) The host hands over buffered frames after the open: 6 s at 125 % of real time, then the normal 42 a second.
+    const burst = await start();
+    burst.pressure.timerLateMs = 900; // an unrelated late timer must not turn a wrong baseline into flushes
+    await burst.deliver(6000, 16);
+    await burst.deliver(40_000, NORMAL_MS);
+    expect(burst.closes()).toBe(0);
+    expect(burst.log("audio-overload")).toEqual([]);
+    await burst.controller.dispose();
+    vi.useRealTimers(); FakeWebSocket.latest = undefined;
+
+    // (b) Healthy at 42 a second, later healthy at 34 a second (no second signal): that is the new normal,
+    // so an overload is then measured against it.
+    const slower = await start();
+    await slower.deliver(8000, NORMAL_MS);
+    await slower.deliver(30_000, 29);
+    expect(slower.closes()).toBe(0);
+    slower.bridge.repliesPrompt = false;
+    for (let i = 0; i < 400 && !slower.controller.audioFlushingForLoad; i++) await slower.deliver(50, 50); // 60 % of the new normal
+    expect(slower.controller.audioFlushingForLoad).toBe(true);
+    expect(slower.log("audio-overload")[0]).toMatch(/\(0\.\d\d of 0\.(?:6[6-9]|70)\)/u);
+    await slower.controller.dispose();
+    vi.useRealTimers(); FakeWebSocket.latest = undefined;
+
+    // (c) Delivery sliding down step by step while bridge calls are stuck: never learned as normal.
+    const slide = await start();
+    await slide.deliver(8000, NORMAL_MS);
+    slide.pressure.bridgePendingMs = 5000;
+    for (const gap of [27, 30, 34]) await slide.deliver(6000, gap);
+    expect(slide.closes()).toBe(1);
+    expect(slide.log("audio-overload")[0]).toMatch(/of 0\.8\d\)/u);
+    await slide.controller.dispose();
+  });
+
+  it("a lost ping reply is one bad sample, not permanent proof of a backlog", async () => {
+    const t = await start();
+    const { bridge, controller } = t;
+    await t.deliver(8000, NORMAL_MS);
+    // Slow link, and the first ping's reply never comes: that one counts, and the flush uses it up.
+    bridge.loseNextPing = true;
+    await t.overload();
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(controller.audioFlushingForLoad).toBe(false);
+    // The next pings are answered at once, so the same slow delivery is no longer "confirmed".
+    await t.deliver(12_000, SLOW_MS);
+    expect(t.closes()).toBe(1);
+    expect(controller.audioPausedForLoad).toBe(false);
+
+    // Lost while no flush can happen (a hold): it times out after 10 s and a new ping is sent.
+    await t.deliver(70_000, NORMAL_MS);
+    await controller.beginHold();
+    bridge.loseNextPing = true;
+    await t.deliver(13_000, SLOW_MS);
+    expect(bridge.loseNextPing).toBe(false); // it was asked, and lost
+    await controller.releaseHold();
+    await t.deliver(8000, NORMAL_MS);
+    await t.deliver(6000, SLOW_MS);
+    expect(t.closes()).toBe(1);
+    expect(controller.audioFlushingForLoad).toBe(false);
+    await controller.dispose();
+  });
+
+  it("dispose stops the guard even when closing the microphone throws, and a flush poll never outlives the controller", async () => {
+    const t = await start();
+    const { bridge, controller } = t;
+    await t.deliver(8000, NORMAL_MS);
+    bridge.repliesPrompt = false;
+    bridge.backlogOnClose = 100_000;
+    await t.overload();
+    bridge.closeThrows = true;
+    await controller.dispose().catch(() => undefined);
+    expect(controller.audioFlushingForLoad).toBe(false);
+    const calls = t.mic().length;
+    await t.deliver(15_000, SLOW_MS); // the host keeps delivering; past the 3 s repeat and the 10 s limit
+    expect(t.mic().length).toBe(calls);
+    expect(controller.audioPausedForLoad).toBe(false);
+  });
+
+  it("re-opens once the session is active again when it was not at the end of a flush", async () => {
+    const t = await start();
+    const { bridge, controller } = t;
+    await t.deliver(8000, NORMAL_MS);
+    bridge.repliesPrompt = false;
+    await t.overload();
+    const client = (controller as unknown as { client: { state: string } }).client;
+    let state = "connecting";
+    Object.defineProperty(client, "state", { configurable: true, get: () => state });
+    const opens = t.opens();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(controller.audioFlushingForLoad).toBe(false);
+    expect(t.opens()).toBe(opens);
+    expect(t.log("audio-resume").at(-1)).toBe("flush · session not active · retry in 5 s");
+    await vi.advanceTimersByTimeAsync(5500); // first retry: still not active, tried again later (not dropped)
+    expect(t.opens()).toBe(opens);
+    expect(controller.audioPausedForLoad).toBe(true);
+    state = "active";
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(t.opens()).toBe(opens + 1);
+    expect(bridge.micOpen).toBe(true);
+    expect(controller.audioPausedForLoad).toBe(false);
+    await controller.dispose();
+  });
+
+  it("an on-screen pause ends when the page comes back from hidden (unlock), not on a glasses event, and tolerates an event without PCM", async () => {
+    const t = await start();
+    const { bridge, controller } = t;
+    await t.deliver(8000, NORMAL_MS);
+    bridge.repliesPrompt = false;
+    bridge.backlogOnClose = 10;
+    for (let i = 0; i < 2000 && !controller.audioPausedForLoad; i++) await t.deliver(SLOW_MS, SLOW_MS);
+    expect(controller.audioPausedForLoad).toBe(true);
+    await vi.advanceTimersByTimeAsync(2000);
+    await controller.resumeFromBackground("foreground-enter");
+    expect(controller.audioPausedForLoad).toBe(true);
+    // Locked and unlocked.
+    t.doc.visibilityState = "hidden";
+    await vi.advanceTimersByTimeAsync(3000);
+    t.doc.visibilityState = "visible";
+    const opens = t.opens();
+    await controller.resumeFromBackground("visible");
+    expect(controller.audioPausedForLoad).toBe(false);
+    expect(t.opens()).toBe(opens + 1);
+    expect(t.log("audio-resume").at(-1)).toMatch(/^visible · .*microphone re-opened$/u);
+    // Still overloaded: caught again, but not within 4 s of that re-open.
+    const reopenedAt = bridge.micTimes.at(-1)!.at;
+    for (let i = 0; i < 2000 && !controller.audioFlushingForLoad && !controller.audioPausedForLoad; i++) await t.deliver(SLOW_MS, SLOW_MS);
+    expect(bridge.micTimes.at(-1)!.open).toBe(false);
+    expect(bridge.micTimes.at(-1)!.at - reopenedAt).toBeGreaterThanOrEqual(4000);
+    expect(() => (controller as unknown as { receiveAudio: (audio: object) => void }).receiveAudio({ source: AudioInputSource.Glasses })).not.toThrow();
     await controller.dispose();
   });
 
