@@ -26,8 +26,8 @@
  *
  * AMBIENT display (default; "always-on" keeps everything above on screen all the time): during a
  * session the glasses are blank. An answer (THEY ASKED / ANSWER / ANSWER KEY, "Thinking…") or a
- * cue of the current mode (concept, lookup, conflict, fact verdict) pops up in the same title +
- * BODY style, pages by itself and disappears. Double-tap (the menu gesture) wakes the full HUD with
+ * cue of the current mode (concept, lookup, conflict, fact verdict, the top suggested question) pops up
+ * in the same title + BODY style, pages by itself and disappears. Double-tap (the menu gesture) wakes the full HUD with
  * the MENU open; double-tap on the menu, or AMBIENT_IDLE_MS without a gesture, blanks it again.
  * The blank page is its own page (no frame border, no images) whose BODY still captures events.
  */
@@ -48,7 +48,7 @@ import {
 } from "@evenrealities/even_hub_sdk";
 import * as conversationSdk from "@helix/conversation-sdk";
 import { MODE_PROFILES, PICKER_MODES, modeProfile, todoShort } from "@helix/conversation-sdk";
-import type { CopilotClaim, CopilotConcept, HudMirror, VerificationResult } from "@helix/conversation-sdk";
+import type { CopilotClaim, CopilotConcept, CopilotSuggestion, HudMirror, VerificationResult } from "@helix/conversation-sdk";
 import { AnswerPager, pageReadingMs, paginateAnswer, type PageLayout } from "./answer-pager";
 import { blankImage, centeredImage, drawBitmap, encodeGrayPng, type GrayImage } from "./glasses-image";
 import { ICONS, MASCOT_FRAMES, modeIcon, textBitmap, type MascotState } from "./pixel-art";
@@ -597,12 +597,39 @@ const CUE_QUEUE = 3, CUE_STALE_MS = 45_000, CUE_PAGES = 3, CUE_PAGES_DETAILED = 
 /** Ambient: "● listening" / "○ paused" shows this long after the mic state changes. */
 const STATUS_CUE_MS = 4000;
 const CUE_TITLE: Readonly<Partial<Record<ItemKind, string>>> = { concept: "CONCEPT", ask: "LOOKUP", conflict: "CHECK", verification: "CHECK", "fact-check": "FACT CHECK", todo: "TO-DO" };
+/**
+ * Ambient suggested question (v0.14): the top one that was not yet said aloud pops up by itself, at most
+ * one every SUGGESTION_CUE_GAP_MS, and stays at least SUGGESTION_CUE_MS so it can be read and said.
+ */
+export const SUGGESTION_CUE_GAP_MS = 20_000;
+export const SUGGESTION_CUE_MS = 10_000;
+/** A transient problem (glasses.notice) shows this long in the status line; the answer stays up. */
+export const NOTICE_MS = 6000;
 /** A cue that pops up on the blank ambient display: body pages, the page shown and when it turns / expires. */
-interface AmbientCue { readonly key: string; readonly title: string; readonly pages: readonly string[]; readonly at: number; page: number; until: number }
+interface AmbientCue { readonly key: string; readonly title: string; readonly pages: readonly string[]; readonly at: number; page: number; until: number;
+  /** Minimum time on the last page (default CUE_LAST_PAGE_MS). */ readonly minMs?: number }
+/** Candidate mode: the wearer is the candidate, so an answer to the interviewer's question is a reply to say. */
+const candidateMode = (mode: string | undefined) => modeProfile(mode).id === "interviewee";
+/** Candidate mode suggestion kinds (SDK: optional `kind`, absent = a question for the wearer to ask). */
+type KindedSuggestion = CopilotSuggestion & { readonly kind?: string };
+const suggestionKindLabels = (conversationSdk as unknown as { SUGGESTION_KIND_LABELS?: Readonly<Record<string, string>> }).SUGGESTION_KIND_LABELS;
+const theyMayAsk = (suggestion: KindedSuggestion) => suggestion.kind === "they-ask";
+const THEY_MAY_ASK_LABEL = (suggestionKindLabels?.["they-ask"] ?? "They may ask").toUpperCase();
+/** The SDK prefixes `why` with the kind in Candidate mode; the title already says it. */
+const suggestionWhy = (suggestion: KindedSuggestion) => oneLine(suggestion.why ?? "").replace(/^(they may ask|ask them)\s*[:\-–—]\s*/iu, "");
+const questionKey = (text: string) => oneLine(text).toLowerCase();
+/** "4m ago" / "1h05m ago" for a finished answer recalled later; "" under a minute. */
+function ageText(ms: number): string {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "";
+  return minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h${pad2(minutes % 60)}m ago`;
+}
 const PARTIAL_ID = "transcript-partial";
 
 interface BodyView { readonly text: string; readonly label: string; readonly position?: string; readonly status?: string; readonly selection?: number }
 type AnswerKind = "answer" | "they" | "self";
+/** What the HUD knew about an answer when it first arrived (it may be shown later, after the one before it). */
+interface AnswerInfo { readonly kind: AnswerKind; readonly question?: string; readonly reply: boolean }
 
 /* ------------------------------------------------------------------ */
 /* HUD                                                                 */
@@ -618,7 +645,15 @@ export class GlassesHud implements GlassesSurface {
   private readonly cursor: Record<HudView, number> = { live: 0, answer: 0, qa: 0, concepts: 0, claims: 0, summary: 0, checks: 0 };
   private returnView?: HudView;
   private lastAnswerKey?: string;
-  private answerKind: AnswerKind = "answer";
+  private readonly answerInfo = new Map<string, AnswerInfo>();
+  /** First time each finished answer was seen (age of a recalled answer). */
+  private readonly answerSeenAt = new Map<string, number>();
+  private notice?: { id: number; text: string; at: number };
+  /** Suggested questions (normalized text) that already popped up or were on screen in the QA view. */
+  private readonly suggestionsCued = new Set<string>();
+  private suggestionCueAt = -SUGGESTION_CUE_GAP_MS;
+  /** When a suggestion held back by the gap may pop up (0 = none waiting). */
+  private suggestionDue = 0;
   private readonly seen = new Map<string, { sig: string; seq: number }>();
   private seq = 0;
   private fresh = 0;
@@ -934,8 +969,8 @@ export class GlassesHud implements GlassesSurface {
   private createPager(): AnswerPager {
     return new AnswerPager(() => {
       if (this.disposed) return;
-      try { this.autoReturn(); this.refresh(); } catch (error) { this.reportRenderError(error); }
-    }, ANSWER_LAYOUT);
+      try { this.followAnswer(); this.refresh(); } catch (error) { this.reportRenderError(error); }
+    }, ANSWER_LAYOUT, () => this.now());
   }
 
   private ingest(): void {
@@ -949,6 +984,7 @@ export class GlassesHud implements GlassesSurface {
     }
     if (ACTIVE.includes(status) && this.sessionStart === undefined) this.sessionStart = now;
     if (glasses.interaction !== this.interaction?.text) this.interaction = glasses.interaction ? { text: glasses.interaction, at: now } : undefined;
+    if (glasses.notice?.id !== this.notice?.id) this.notice = glasses.notice ? { ...glasses.notice, at: now } : undefined;
 
     const snapshot = this.snapshot;
     if (snapshot) {
@@ -970,6 +1006,8 @@ export class GlassesHud implements GlassesSurface {
         else if (!this.finalsSeen.has(item.id)) this.finalsSeen.set(item.id, now);
       }
       while (this.finalsSeen.size > 200) this.finalsSeen.delete(this.finalsSeen.keys().next().value!);
+      for (const item of snapshot.feed) if (item.kind === "answer" && !item.streaming && !this.answerSeenAt.has(item.id)) this.answerSeenAt.set(item.id, now);
+      while (this.answerSeenAt.size > 200) this.answerSeenAt.delete(this.answerSeenAt.keys().next().value!);
       this.settleRequests(snapshot.verifications);
     }
 
@@ -981,21 +1019,31 @@ export class GlassesHud implements GlassesSurface {
     // v0.10 Interviewer mode: the wearer's own questions get an answer key, shown like THEY ASKED.
     const answer = answerVisible(glasses) && (kind !== "self" || this.answerKeys()) ? glasses.answer : undefined;
     if (answer) {
+      // Kind and question are fixed when the answer first arrives: with answers back to back it may
+      // be shown only after the one before it, when `glasses.question` already belongs to a later one.
       const key = `${answer.id ?? answer.questionId ?? "anonymous"}:${glasses.answerResetRevision ?? 0}`;
-      if (!this.lastAnswerKey?.startsWith(`answer:${key}`)) this.answerKind = kind;
-    }
-    this.pager.setLayout(this.answerKind === "answer" ? ANSWER_LAYOUT : THEY_ASKED_LAYOUT);
-    this.pager.update(answer, glasses.answerResetRevision);
-    const revision = glasses.answerResetRevision ?? 0;
-    const key = this.pager.text ? `answer:${answer?.id ?? answer?.questionId ?? "anonymous"}:${revision}`
-      : glasses.manualPending ? `pending:${revision}` : undefined;
+      let info = this.answerInfo.get(key);
+      if (!info) {
+        info = { kind, reply: kind === "they" && candidateMode(glasses.mode), ...(glasses.question?.text ? { question: glasses.question.text } : {}) };
+        this.answerInfo.set(key, info);
+        while (this.answerInfo.size > 12) this.answerInfo.delete(this.answerInfo.keys().next().value!);
+      }
+      this.pager.update({ ...answer, layout: info.kind === "answer" ? ANSWER_LAYOUT : THEY_ASKED_LAYOUT }, glasses.answerResetRevision);
+    } else this.pager.update(undefined, glasses.answerResetRevision);
+    this.followAnswer();
+  }
+
+  /** The ANSWER view follows whichever answer the pager shows now (a new one, or the next waiting one). */
+  private followAnswer(): void {
+    const glasses = this.glasses;
+    const key = this.pager.key ? `answer:${this.pager.key}` : glasses.manualPending ? `pending:${glasses.answerResetRevision ?? 0}` : undefined;
     if (key && key !== this.lastAnswerKey) {
       this.lastAnswerKey = key;
-      if (glasses.manualPending && !this.pager.text) this.answerKind = "answer";
       if (this.viewName !== "answer") { this.returnView = this.viewName; this.viewName = "answer"; }
     }
     this.autoReturn();
   }
+  private shownAnswer(): AnswerInfo { return this.answerInfo.get(this.pager.key ?? "") ?? { kind: "answer", reply: false }; }
 
   /** v0.11: new answers / prompts / concepts / checks since their view was last on screen. */
   private countUnseen(snapshot: PresentationSnapshot): void {
@@ -1008,7 +1056,7 @@ export class GlassesHud implements GlassesSurface {
       }
     };
     add("answer", snapshot.feed.filter(item => item.kind === "answer" && !item.streaming).map(item => item.id));
-    add("qa", snapshot.suggestions.map(item => item.id));
+    add("qa", snapshot.suggestions.filter(item => !item.askedAt).map(item => item.id));
     add("concepts", snapshot.concepts.map(item => item.id));
     add("checks", [...snapshot.conflicts, ...snapshot.verifications, ...snapshot.factChecks, ...snapshot.claims].map(item => item.id));
     const notebook = snapshot.notebook ? `#${snapshot.notebook.todos.map(item => `${item.id}:${item.done}:${item.text}:${item.owner ?? ""}:${item.due ?? ""}`).join("|")}#${snapshot.notebook.notes.length}` : "";
@@ -1045,6 +1093,8 @@ export class GlassesHud implements GlassesSurface {
     this.items = [];
     this.requested.clear();
     this.counted.clear(); this.summarySig = "";
+    this.answerInfo.clear(); this.answerSeenAt.clear(); this.notice = undefined;
+    this.suggestionsCued.clear(); this.suggestionCueAt = -SUGGESTION_CUE_GAP_MS; this.suggestionDue = 0;
     for (const key of RAIL_ROWS) this.unseen[key] = 0;
     this.awakeUntil = 0; this.cue = undefined; this.cueQueue = [];
     if (this.menu) this.closeMenu();
@@ -1118,7 +1168,42 @@ export class GlassesHud implements GlassesSurface {
   /** Reading time of the cue's current page; the last page stays at least CUE_LAST_PAGE_MS. */
   private cueReadMs(cue: AmbientCue): number {
     const ms = pageReadingMs(graphemes(cue.pages[cue.page] ?? "").length);
-    return cue.page + 1 < cue.pages.length ? ms : Math.max(CUE_LAST_PAGE_MS, ms);
+    return cue.page + 1 < cue.pages.length ? ms : Math.max(cue.minMs ?? CUE_LAST_PAGE_MS, ms);
+  }
+
+  /** Cue title of a suggested question: the mode's label, or "THEY MAY ASK" for the other side's likely next question. */
+  private suggestionTitle(suggestion: KindedSuggestion): string {
+    return theyMayAsk(suggestion) ? THEY_MAY_ASK_LABEL : this.askLabel();
+  }
+
+  /**
+   * The top suggested question that was not said aloud yet pops up once, as one page that reads in a
+   * glance: the question first, the reason only when all of it fits under it. It waits in the cue
+   * queue like any cue (never over an answer, dropped when stale) and leaves when the question is asked.
+   */
+  private offerSuggestion(now: number): void {
+    const open = (this.snapshot?.suggestions ?? []).filter(item => !item.askedAt && oneLine(item.question)) as KindedSuggestion[];
+    const live = new Set(open.map(item => `s:${questionKey(item.question)}`));
+    const gone = (cue: AmbientCue) => cue.key.startsWith("s:") && !live.has(cue.key);
+    if (this.cue && gone(this.cue)) this.cue = undefined;
+    this.cueQueue = this.cueQueue.filter(cue => !gone(cue));
+    this.suggestionDue = 0;
+    const top = open[0];
+    if (!top) return;
+    const text = questionKey(top.question), key = `s:${text}`;
+    if (this.suggestionsCued.has(text) || this.cue?.key === key || this.cueQueue.some(cue => cue.key === key)) return;
+    const due = this.suggestionCueAt + SUGGESTION_CUE_GAP_MS;
+    if (now < due) { this.suggestionDue = due; return; }
+    const width = HUD_LINE_WIDTH.body;
+    const question = fitLines(clean(oneLine(top.question)), BODY_LINES, width);
+    const why = suggestionWhy(top);
+    const reason = why ? wrapText(clean(`Why: ${why}`), width) : [];
+    const lines = !reason.length || question.length + reason.length > BODY_LINES ? question
+      : question.length + 1 + reason.length <= BODY_LINES ? [...question, "", ...reason] : [...question, ...reason];
+    this.suggestionCueAt = now;
+    // One suggestion at a time: a newer top one replaces an older one still waiting.
+    this.cueQueue = [...this.cueQueue.filter(cue => !cue.key.startsWith("s:")),
+      { key, title: this.suggestionTitle(top), pages: [lines.join("\n")], at: now, page: 0, until: 0, minMs: SUGGESTION_CUE_MS }].slice(-CUE_QUEUE);
   }
 
   /**
@@ -1133,6 +1218,7 @@ export class GlassesHud implements GlassesSurface {
     if (!ACTIVE.includes(this.glasses.status)) { this.awakeUntil = 0; this.cue = undefined; this.cueQueue = []; return; }
     if (this.awakeUntil && now >= this.awakeUntil) this.sleep();
     if (this.awakeUntil) { this.cue = undefined; this.cueQueue = []; return; }
+    this.offerSuggestion(now);
     if (this.answerBusy()) {
       // An answer has the display: the cue waits and starts over afterwards.
       if (this.cue) { this.cueQueue = [{ ...this.cue, page: 0 }, ...this.cueQueue].slice(0, CUE_QUEUE); this.cue = undefined; }
@@ -1148,6 +1234,12 @@ export class GlassesHud implements GlassesSurface {
       const next = this.cueQueue.shift()!;
       next.page = 0; next.until = now + this.cueReadMs(next);
       this.cue = next;
+      if (next.key.startsWith("s:")) {
+        // Shown: it never pops up again, and the gap to the next suggestion counts from now.
+        this.suggestionsCued.add(next.key.slice(2));
+        if (this.suggestionsCued.size > 200) this.suggestionsCued.delete(this.suggestionsCued.values().next().value!);
+        this.suggestionCueAt = now;
+      }
     }
   }
 
@@ -1159,6 +1251,7 @@ export class GlassesHud implements GlassesSurface {
     const now = this.now();
     const deadlines = [this.awakeUntil, this.cue?.until ?? 0, (this.statusCueAt ?? -STATUS_CUE_MS) + STATUS_CUE_MS,
       this.interaction ? this.interaction.at + 4001 : 0, ...this.cueQueue.map(cue => cue.at + CUE_STALE_MS),
+      this.suggestionDue, this.notice ? this.notice.at + NOTICE_MS : 0,
       this.pageSwapDue() ? this.blockedUntil : 0].filter(time => time > now);
     if (!deadlines.length) return;
     this.ambientTimer = setTimeout(() => {
@@ -1208,10 +1301,12 @@ export class GlassesHud implements GlassesSurface {
     if (answering) this.unseen.answer = 0; // an answer that popped up was seen
     const parts: string[] = [];
     const interaction = this.interactionText(), status = this.glasses.status;
+    // A problem leads the line: it is brief, and the rest is what gets shortened.
+    const problem = this.problemText();
+    if (problem) parts.push(problem);
     if (interaction) parts.push(interaction);
     else if (this.statusCueAt !== undefined && this.now() - this.statusCueAt < STATUS_CUE_MS) parts.push(status === "listening" ? "● listening" : status === "paused" ? "○ paused" : "○ mic off");
     if (pop?.status) parts.push(pop.status);
-    if (this.glasses.error) parts.push(`! ${oneLine(this.glasses.error)}`);
     const statusLine = parts.length ? ellipsize(parts.join(" · "), HUD_LINE_WIDTH.status) : "";
     const title = pop ? ellipsize(`${pop.label}${pop.position ? ` ${pop.position}` : ""}`, HUD_LINE_WIDTH.header) || " " : " ";
     return {
@@ -1221,6 +1316,13 @@ export class GlassesHud implements GlassesSurface {
       body: pop ? fitLines(clean(pop.text), BODY_LINES, HUD_LINE_WIDTH.body).join("\n") || " " : " ",
       caption: " ", mode: " ", views: " ",
     };
+  }
+
+  /** "! message" for a session-ending error, or for NOTICE_MS after a transient problem. */
+  private problemText(): string | undefined {
+    if (this.glasses.error) return `! ${oneLine(this.glasses.error)}`;
+    const notice = this.notice;
+    return notice && this.now() - notice.at < NOTICE_MS ? `! ${oneLine(notice.text)}` : undefined;
   }
 
   /** An auto-shown answer returns to the previous view once it is gone. */
@@ -1293,6 +1395,7 @@ export class GlassesHud implements GlassesSurface {
   private leaveAnswer(target: HudView): void {
     const restoring = target === this.returnView;
     this.pager.dismiss();
+    if (this.pager.text) return; // the next waiting answer took its place
     this.returnView = undefined;
     if (restoring) this.viewName = target; // keep that view's cursor (e.g. the Q&A highlight)
     else this.enter(target, 1);
@@ -1440,7 +1543,8 @@ export class GlassesHud implements GlassesSurface {
 
   /* ---------------- data views ---------------- */
 
-  private suggestions() { return (this.snapshot?.suggestions ?? []).slice(0, CAPS.suggestions); }
+  /** Suggested questions not yet said aloud (asked ones stay on the phone, struck out, until the SDK drops them). */
+  private suggestions(): KindedSuggestion[] { return (this.snapshot?.suggestions ?? []).filter(item => !item.askedAt).slice(0, CAPS.suggestions); }
   private conceptList() { return [...(this.snapshot?.concepts ?? [])].reverse().slice(0, CAPS.concepts); }
   private claimList(): CopilotClaim[] { return [...(this.snapshot?.claims ?? [])].reverse().slice(0, CAPS.claims); }
   private selectedConcept(): CopilotConcept | undefined {
@@ -1490,11 +1594,11 @@ export class GlassesHud implements GlassesSurface {
     return pages;
   }
 
-  private lastAnswerText(): string {
+  private lastAnswer(): FeedItem | undefined {
     const feed: readonly FeedItem[] = this.snapshot?.feed ?? [];
-    const answer = [...feed].reverse().find(item => item.kind === "answer" && !item.streaming && item.body.trim());
-    return answer?.body.trim() ?? "";
+    return [...feed].reverse().find(item => item.kind === "answer" && !item.streaming && item.body.trim());
   }
+  private lastAnswerText(): string { return this.lastAnswer()?.body.trim() ?? ""; }
   private recallPages(): string[] {
     const text = this.lastAnswerText();
     return text ? paginateAnswer(clean(text), ANSWER_LAYOUT) : [];
@@ -1648,11 +1752,17 @@ export class GlassesHud implements GlassesSurface {
     if (this.pager.text) {
       const total = this.pager.pageCount;
       const streaming = this.pager.isStreaming;
-      const they = this.answerKind === "they", key = this.answerKind === "self";
+      const info = this.shownAnswer();
+      const they = info.kind === "they", key = info.kind === "self";
       const page = wrapText(clean(this.pager.text).trim(), HUD_LINE_WIDTH.body);
-      const question = they || key ? ellipsize(`${key ? "You: " : "Q: "}${oneLine(glasses.question?.text ?? "")}`, HUD_LINE_WIDTH.body) : undefined;
-      return { label: they ? "◆ THEY ASKED" : key ? "§ ANSWER KEY" : VIEW_LABEL.answer, position: `${this.pager.pageIndex + 1}/${streaming ? "…" : total}`,
-        status: streaming ? "answering" : this.pager.pageIndex + 1 < total ? "swipe ↓ more" : they ? "answer · tap to close" : key ? "key · tap to close" : "tap to close",
+      const question = they || key ? ellipsize(`${key ? "You: " : "Q: "}${oneLine(info.question ?? "")}`, HUD_LINE_WIDTH.body) : undefined;
+      // "+1": another answer is waiting behind this one. Candidate mode: the answer is a reply to say.
+      const waiting = this.pager.waiting, last = this.pager.pageIndex + 1 >= total;
+      const close = waiting ? "tap: next answer" : this.pager.isCutOff ? "cut off · tap to close"
+        : they ? `${info.reply ? "reply" : "answer"} · tap to close` : key ? "key · tap to close" : "tap to close";
+      return { label: they ? (info.reply ? "◆ YOUR REPLY" : "◆ THEY ASKED") : key ? "§ ANSWER KEY" : VIEW_LABEL.answer,
+        position: `${this.pager.pageIndex + 1}/${streaming ? "…" : total}${waiting ? ` +${waiting}` : ""}`,
+        status: streaming ? "answering" : !last ? "swipe ↓ more" : close,
         text: [...(question ? [question] : []), ...page].join("\n") };
     }
     if (glasses.manualPending) {
@@ -1667,7 +1777,10 @@ export class GlassesHud implements GlassesSurface {
       return { label: VIEW_LABEL.answer, text: "No answer yet.\n\nTap: ask about the last few lines.\nMenu (double-tap): the whole talk." };
     }
     const index = Math.min(this.cursor.answer, pages.length - 1);
-    return { label: VIEW_LABEL.answer, position: `${index + 1}/${pages.length}`, status: "last answer",
+    // A finished answer recalled later is labelled with its age, so it is not read as the current one.
+    const seenAt = this.answerSeenAt.get(this.lastAnswer()?.id ?? "");
+    const age = seenAt === undefined ? "" : ageText(this.now() - seenAt);
+    return { label: VIEW_LABEL.answer, position: `${index + 1}/${pages.length}`, status: age ? `last · ${age}` : "last answer",
       text: wrapText(clean(pages[index]!).trim(), HUD_LINE_WIDTH.body).join("\n") };
   }
 
@@ -1679,12 +1792,15 @@ export class GlassesHud implements GlassesSurface {
         ? "Nothing to say yet.\n\nPrompts for you appear here\nas the talk develops."
         : "Suggestions are off in this mode.\n\nDouble-tap: menu ▶ Mode to change." };
     }
+    // On screen here: these do not pop up again on the ambient display.
+    for (const suggestion of suggestions) this.suggestionsCued.add(questionKey(suggestion.question));
     const selected = Math.min(this.cursor.qa, suggestions.length - 1);
     const room = BODY_LINES - (suggestions.length - 1);
     const lines: string[] = [];
     suggestions.forEach((suggestion, index) => {
       const marker = `${CIRCLED[index] ?? index + 1} `;
-      const question = oneLine(suggestion.question);
+      // Candidate mode: "Q:" marks a question the other side may ask next (tap for a reply to say).
+      const question = `${theyMayAsk(suggestion) ? "Q: " : ""}${oneLine(suggestion.question)}`;
       const lead = hudTextWidth("▶ ");
       if (index === selected) {
         const hang = indent(lead + hudTextWidth(marker));
@@ -1769,12 +1885,13 @@ export class GlassesHud implements GlassesSurface {
       // MENU: the gesture hint matters more than the clock in the narrow status area.
       if (body.status) parts.push(body.status);
     } else {
+      const problem = this.problemText();
+      if (problem) parts.push(problem);
       const interaction = this.interactionText();
       if (interaction) parts.push(interaction);
       else parts.push(this.micText());
       if (body.status) parts.push(body.status);
       else if (this.viewName === "live" && this.fresh > 0) parts.push(`${this.fresh > 9 ? "9+" : this.fresh} new`);
-      if (this.glasses.error) parts.push(`! ${oneLine(this.glasses.error)}`);
     }
     // Without images (no badge) the mode is a text tag that stays visible: the rest is shortened first.
     const mode = modeProfile(this.glasses.mode);
