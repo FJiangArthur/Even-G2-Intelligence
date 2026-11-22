@@ -1830,7 +1830,7 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
             </section>
 
             <section class="config-group" aria-labelledby="diagnostics-title" data-no-persist>
-              <div class="config-group-heading"><h3 id="diagnostics-title">Diagnostics</h3><p>If Helix freezes or disappears, reopen it, then copy this and send it to the developer. It keeps the previous run: lifecycle events, stalls, control names and errors. No keys, no transcripts.</p></div>
+              <div class="config-group-heading"><h3 id="diagnostics-title">Diagnostics</h3><p>If Helix freezes or disappears, reopen it, then copy this and send it to the developer. It keeps the previous run: lifecycle events, stalls, control names, microphone timing and errors. No keys, no transcripts, no audio.</p></div>
               <div class="provider-key-actions">
                 <button id="diagnostics-refresh" class="button button-secondary button-small" type="button">Show log</button>
                 <button id="diagnostics-copy" class="button button-quiet button-small" type="button">Copy</button>
@@ -1843,6 +1843,13 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                 </select>
               </label>
               <p class="field-note">A longer pause puts less load on the glasses link; captions on the glasses update more slowly. Try it if Helix freezes.</p>
+              <label for="mic-source">Microphone
+                <select id="mic-source" data-no-persist>
+                  <option value="glasses">Glasses (default)</option><option value="phone">Phone (untested on hardware)</option>
+                </select>
+              </label>
+              <p class="field-note">Phone listens with this phone's microphone instead of the glasses. It has not been tested on real hardware, needs the Even app's phone-microphone permission, and cannot tell who is speaking. Use it as a fallback, or to see whether a freeze follows the glasses audio.</p>
+              <label class="toggle" for="sdk-audio-log"><input id="sdk-audio-log" type="checkbox" data-no-persist /><span>Let the Even SDK log every audio frame<small>Off by default: the SDK writes each microphone frame to the console, which the Even app forwards to the phone. Turn on only to compare; the log lines "mic" and "mic-sdk" show the cost.</small></span></label>
               <p id="diagnostics-last-exit" class="diagnostics-last-exit" hidden></p>
               <div id="diagnostics-log" class="diagnostics-log" role="log" hidden></div>
             </section>

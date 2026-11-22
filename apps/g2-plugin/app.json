@@ -12,6 +12,10 @@
       "desc": "Capture G2 microphone audio for live Helix transcription and conversation assistance."
     },
     {
+      "name": "phone-microphone",
+      "desc": "Optional: use the phone microphone instead of the glasses microphone when selected in Setup."
+    },
+    {
       "name": "network",
       "desc": "Connect directly from the phone to selected transcription, AI and optional Omi providers.",
       "whitelist": [
