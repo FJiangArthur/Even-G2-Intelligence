@@ -5,7 +5,7 @@ import {
 } from "@evenrealities/even_hub_sdk";
 import { MODE_PROFILES, PICKER_MODES, type CopilotSuggestion, type GatewayEvent } from "@helix/conversation-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AnswerPager, CUT_OFF_MARK, STREAM_STALL_MS, pageReadingMs } from "../src/answer-pager";
+import { AnswerPager, CUT_OFF_MARK, MAX_WAITING_AGE_MS, STREAM_STALL_MS, pageReadingMs } from "../src/answer-pager";
 import { BODY_LINES, GlassesHud, HUD_LINE_WIDTH, NOTICE_MS, SUGGESTION_CUE_GAP_MS, SUGGESTION_CUE_MS, hudTextWidth } from "../src/glasses-hud";
 import type { GlassesRenderBridge } from "../src/glasses-renderer";
 import { modeIcon } from "../src/pixel-art";
@@ -34,6 +34,7 @@ const completed = (answerId: string, questionId: string, text: string, partial?:
   ev({ type: "answer.completed", answerId, questionId, text, ...(partial ? { partial } : {}), context: ctx("Helix", "unknown", "question") });
 const final = (id: string, text: string) => ev({ type: "transcript.final", transcriptId: id, text, context: ctx("Other speaker", "other") });
 const problem = (message: string, fatal = false) => ev({ type: "error", code: fatal ? "provider-authentication" : "conversation-busy", message, retryable: !fatal, fatal });
+const failure = (code: string, message: string) => ev({ type: "error", code, message, retryable: true, fatal: false });
 const at = "2026-11-22T18:00:00.000Z";
 const suggestion = (id: string, text: string, why = "", extra: object = {}) => ({ id, question: text, why, createdAt: at, ...extra }) as CopilotSuggestion;
 
@@ -141,6 +142,55 @@ describe("v0.14 answer pager: answers back to back", () => {
     expect(pager.text).toBe("");
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("drops a waiting answer that is older than the age limit instead of showing it late", () => {
+    vi.useFakeTimers();
+    const pager = new AnswerPager(() => undefined);
+    const long = "Lead time detail. ".repeat(160);
+    pager.update({ id: "a1", text: long, streaming: false }, 0);
+    expect(pager.pageCount).toBeGreaterThan(3);
+    vi.advanceTimersByTime(1000);
+    pager.update({ id: "a2", text: "Second answer.", streaming: false }, 1);
+    expect(pager.waiting).toBe(1);
+    // The wearer keeps paging through the first answer for longer than the age limit.
+    for (let elapsed = 0; elapsed <= MAX_WAITING_AGE_MS; elapsed += 2000) {
+      expect(pager.next() || pager.previous()).toBe(true);
+      vi.advanceTimersByTime(2000);
+      expect(pager.key).toBe("a1:0");
+    }
+    expect(pager.waiting).toBe(0); // too old to announce
+    pager.dismiss();
+    expect(pager.text).toBe("");
+    // The presentation still holds that answer and renders it again: it stays off the glasses.
+    pager.update({ id: "a2", text: "Second answer.", streaming: false }, 1);
+    expect(pager.text).toBe("");
+    // A newer answer shows normally.
+    pager.update({ id: "a3", text: "Third answer.", streaming: false }, 2);
+    expect(pager.text).toBe("Third answer.");
+    vi.advanceTimersByTime(8000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("brings the waiting answer once the wearer stops paging, without waiting for the rest of the current one", () => {
+    vi.useFakeTimers();
+    const pager = new AnswerPager(() => undefined);
+    pager.update({ id: "a1", text: "Lead time detail. ".repeat(160), streaming: false }, 0);
+    expect(pager.pageCount).toBeGreaterThan(3);
+    vi.advanceTimersByTime(1000);
+    pager.update({ id: "a2", text: "Second answer.", streaming: false }, 1);
+    expect(pager.next()).toBe(true); // reading on: the waiting answer does not cut in on the gesture
+    expect(pager.pageIndex).toBe(1);
+    const reading = pageReadingMs([...pager.text.trim()].length);
+    vi.advanceTimersByTime(reading - 1);
+    expect(pager.key).toBe("a1:0");
+    expect(pager.pageIndex).toBe(1);
+    vi.advanceTimersByTime(1);
+    expect(pager.text).toBe("Second answer.");
+    expect(pager.waiting).toBe(0);
+    vi.advanceTimersByTime(8000);
+    expect(pager.text).toBe("");
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 describe("v0.14 presentation: errors and cut-off answers", () => {
@@ -206,6 +256,70 @@ describe("v0.14 presentation: errors and cut-off answers", () => {
     presentation.apply(completed("a2", "q2", "About two thousand dollars."));
     expect(presentation.snapshot().glasses.answer?.partial).toBeUndefined();
     expect(presentation.snapshot().feed.find(entry => entry.id === "a2")?.partial).toBeUndefined();
+  });
+
+  it("ends a streaming answer as cut off when the provider fails mid-stream", () => {
+    const presentation = new ConversationPresentation();
+    presentation.setStatus("listening");
+    presentation.apply(question("q1", "How long is the lead time?"));
+    presentation.apply(delta("a1", "q1", "Twelve to sixteen "));
+    presentation.apply(failure("provider-timeout", "Provider request timed out. Try again."));
+    let snapshot = presentation.snapshot();
+    expect(snapshot.status).toBe("listening");
+    expect(snapshot.glasses.answer).toMatchObject({ id: "a1", text: "Twelve to sixteen ", streaming: false, partial: true });
+    expect(snapshot.glasses.notice?.text).toBe("Provider request timed out. Try again.");
+    const item = snapshot.feed.find(entry => entry.id === "a1")!;
+    expect(item).toMatchObject({ label: "Helix · answer cut off", partial: true, body: "Twelve to sixteen " });
+    expect(item.streaming).toBeFalsy();
+    expect(snapshot.unseen.answers).toBe(1);
+    // The display is free again: a contradicted web check may correct on the glasses.
+    presentation.applyFactCheck({ id: "f1", sessionId: "s", transcriptId: "t1", claim: "It ships in a week.", status: "contradicted",
+      summary: "It ships in twelve weeks.", checkedAt: at, sources: [{ title: "Source", url: "https://example.com/lead-time" }] } as never, true);
+    snapshot = presentation.snapshot();
+    expect(snapshot.glasses.answer?.text).toBe("Correction: It ships in twelve weeks.");
+    expect(snapshot.feed.find(entry => entry.id === "a1")).toMatchObject({ label: "Helix · answer cut off", partial: true });
+  });
+
+  it("does not leave a broken state when the cut-off answer gets more text or completes after all", () => {
+    const presentation = new ConversationPresentation();
+    presentation.setStatus("listening");
+    presentation.apply(question("q1", "How long is the lead time?"));
+    presentation.apply(delta("a1", "q1", "Twelve "));
+    presentation.apply(failure("provider-network", "Direct provider request failed."));
+    expect(presentation.snapshot().glasses.answer).toMatchObject({ streaming: false, partial: true });
+    // The error belonged to another request after all: the stream goes on, with no repeated text.
+    presentation.apply(delta("a1", "q1", "to sixteen "));
+    let snapshot = presentation.snapshot();
+    expect(snapshot.glasses.answer).toMatchObject({ id: "a1", text: "Twelve to sixteen ", streaming: true });
+    expect(snapshot.glasses.answer?.partial).toBeUndefined();
+    expect(snapshot.feed.filter(entry => entry.id === "a1")).toHaveLength(1);
+    expect(snapshot.feed.find(entry => entry.id === "a1")).toMatchObject({ label: "Helix · answering", streaming: true, body: "Twelve to sixteen " });
+    expect(snapshot.feed.find(entry => entry.id === "a1")?.partial).toBeUndefined();
+    presentation.apply(failure("provider-timeout", "Provider request timed out. Try again."));
+    presentation.apply(completed("a1", "q1", "Twelve to sixteen weeks."));
+    snapshot = presentation.snapshot();
+    expect(snapshot.glasses.answer).toMatchObject({ id: "a1", text: "Twelve to sixteen weeks.", streaming: false });
+    expect(snapshot.glasses.answer?.partial).toBeUndefined();
+    const item = snapshot.feed.find(entry => entry.id === "a1")!;
+    expect(item.label).toBe("Helix · answer");
+    expect(item.partial).toBeUndefined();
+    expect(item.streaming).toBeFalsy();
+    expect(snapshot.unseen.answers).toBe(2); // once per cut-off; the completion adds none
+  });
+
+  it("leaves a healthy streaming answer alone for a notice that is not about it", () => {
+    const presentation = new ConversationPresentation();
+    presentation.setStatus("listening");
+    presentation.apply(question("q1", "How long is the lead time?"));
+    presentation.apply(delta("a1", "q1", "Twelve to sixteen "));
+    presentation.apply(problem("Helix is catching up. Pause before speaking again.")); // conversation-busy: the transcription backlog
+    presentation.setStatus("listening", "Background copilot failed."); // copilot failures arrive as a status, not as an SDK error
+    const snapshot = presentation.snapshot();
+    expect(snapshot.glasses.answer).toMatchObject({ id: "a1", streaming: true });
+    expect(snapshot.glasses.answer?.partial).toBeUndefined();
+    expect(snapshot.feed.find(entry => entry.id === "a1")).toMatchObject({ label: "Helix · answering", streaming: true });
+    presentation.apply(completed("a1", "q1", "Twelve to sixteen weeks."));
+    expect(presentation.snapshot().feed.find(entry => entry.id === "a1")?.label).toBe("Helix · answer");
   });
 
   it("does not announce a suggestion that was already asked", () => {
