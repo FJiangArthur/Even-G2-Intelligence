@@ -252,6 +252,17 @@ Customise it with the role and the skills you are hiring for. If you rewrite it,
 
 ---
 
+
+### Candidate
+
+*You are the one being interviewed. Glasses tag `CAND`, questions view `PREP`.*
+
+- **What you see.** When the interviewer asks a question, a reply you could give pops up, written in the first person and titled `YOUR REPLY`. It leads with the direct answer and then one concrete example.
+- **Where the example comes from.** Only from your saved knowledge: put your résumé and the job description in the **Knowledge** tab before the interview. Helix is told never to invent employers, titles, numbers or experience; with nothing relevant saved it gives the structure of a good answer instead of made-up detail. That rule stays in force even if you edit the mode prompt.
+- **Questions view.** Two groups on the phone: **They may ask** (what the interviewer is likely to ask next, so you can prepare) and **Ask them** (one or two good questions for you to ask). A question disappears once it has been said aloud.
+- **Your own questions** are shown but not answered.
+- Mode id in settings and exports: `interviewee` (the older `interview` still maps to it).
+
 ### Partner
 
 *"Personal conversations: listen well, remember what matters. No fact-checking."*
@@ -582,4 +593,4 @@ Customise it to shape the answers you ask for by hand, for example "answer with 
 
 ## Legacy modes
 
-Two older mode ids, `interviewee` and `office-discussion`, remain in the code so that stored settings and the legacy gateway protocol keep working. They are not offered in the picker. If a saved setting still points at one of them, the mode selector on the phone shows **Meeting**.
+One older mode id, `office-discussion`, remains in the code so that stored settings and the legacy gateway protocol keep working. It is not offered in the picker; a saved setting that points at it behaves as **Meeting**. (`interviewee` used to be hidden in the same way; since 0.14.0 it is the **Candidate** mode.)

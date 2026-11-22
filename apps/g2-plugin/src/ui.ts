@@ -1182,8 +1182,8 @@ export class CompanionUi {
       footer.append(verifyButton(item.body, item.id, "answer"));
       article.append(footer);
     }
-    if (item.kind === "question" && item.questionKind === "you") {
-      // The wearer's own question is never auto-answered; offer it explicitly.
+    if (item.kind === "question" && item.questionKind === "you" && !item.answered) {
+      // The wearer's own question is not auto-answered outside Interviewer mode; offer it explicitly.
       const footer = el("div", "message-footer");
       footer.append(el("small", "answer-meta", "Not auto-answered"), actionButton("ask", "Ask Helix", { target: item.body }, "button button-secondary button-small"));
       article.append(footer);

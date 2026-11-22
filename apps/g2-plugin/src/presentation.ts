@@ -32,6 +32,8 @@ export interface FeedItem {
   readonly occurredAt?: string;
   /** Answers: the provider cut it short; the body is what arrived. */
   readonly partial?: boolean;
+  /** Questions: an automatic answer (or answer key) has started for it. */
+  readonly answered?: boolean;
 }
 
 /** Phone tabs. Only the phone shows copilot output; glasses stay answer-first. */
@@ -705,6 +707,10 @@ export class ConversationPresentation {
         const id = event.answerId;
         const previous = this.feed.find((item) => item.id === id)?.body ?? "";
         const text = `${previous}${event.delta}`;
+        if (event.questionId) {
+          const asked = this.feed.find(item => item.id === event.questionId && item.kind === "question");
+          if (asked && !asked.answered) this.upsert({ ...asked, answered: true });
+        }
         this.upsert({ id, kind: "answer", label: "Helix · answering", body: text, streaming: true,
           memorySources: this.memorySources.get(event.questionId ?? "") });
         this.glasses = {
