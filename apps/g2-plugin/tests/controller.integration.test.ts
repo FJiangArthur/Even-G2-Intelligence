@@ -555,4 +555,54 @@ describe("G2 controller integration", () => {
     vi.useRealTimers();
     await controller.dispose();
   });
+  it("v0.12.3 overload while locked: audio arriving slower than it is recorded on a hidden page pauses the microphone; a visible page resumes it", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+    const doc = { visibilityState: "visible" };
+    vi.stubGlobal("document", doc);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], now: Date.UTC(2026, 10, 21, 20, 0, 0) });
+    const bridge = new FakeBridge();
+    const presentation = new ConversationPresentation();
+    const controller = testController(bridge, new GlassesRenderer(bridge), presentation);
+    controller.audioRealtimeGuard = true;
+    await controller.initialize();
+    await controller.connect(form);
+    await controller.startListening();
+    await vi.waitFor(() => expect(presentation.snapshot().status).toBe("listening"));
+    const frame = () => bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array(640).fill(7), source: AudioInputSource.Glasses, speakerRole: AudioSpeakerRole.Other }) });
+    const micCalls = () => bridge.calls.filter(call => call.startsWith("audio:"));
+    // This device delivers 42 frames a second in the foreground (as measured): that is the baseline, not an overload.
+    for (let i = 0; i < 42 * 8; i++) { vi.setSystemTime(Date.now() + 24); frame(); }
+    expect(controller.audioPausedForLoad).toBe(false);
+    const opened = micCalls().length;
+    // Visible but slow (weak link): never paused.
+    for (let i = 0; i < 24 * 10; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(false);
+    for (let i = 0; i < 42 * 4; i++) { vi.setSystemTime(Date.now() + 24); frame(); }
+    // Locked: every event now takes 42 ms, so 24 a second get through.
+    doc.visibilityState = "hidden";
+    for (let i = 0; i < 24 * 5; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(false); // not on the first slow seconds
+    for (let i = 0; i < 24 * 4; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(true);
+    expect(micCalls().slice(opened)).toEqual([`audio:false:${AudioInputSource.Glasses}`]);
+    expect(presentation.snapshot().glasses.interaction).toContain("MIC PAUSED");
+    // A glasses event while still locked does not turn it back on.
+    await controller.resumeFromBackground("foreground-enter");
+    expect(controller.audioPausedForLoad).toBe(true);
+    // Unlock: microphone back on.
+    doc.visibilityState = "visible";
+    vi.setSystemTime(Date.now() + 5000);
+    await controller.resumeFromBackground("visible");
+    expect(controller.audioPausedForLoad).toBe(false);
+    expect(micCalls().at(-1)).toBe(`audio:true:${AudioInputSource.Glasses}`);
+    // Locked again and overloaded again: paused, then the retry timer re-opens it after 30 s.
+    doc.visibilityState = "hidden";
+    for (let i = 0; i < 24 * 9; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(controller.audioPausedForLoad).toBe(false);
+    expect(micCalls().at(-1)).toBe(`audio:true:${AudioInputSource.Glasses}`);
+    vi.useRealTimers();
+    await controller.dispose();
+  });
 });

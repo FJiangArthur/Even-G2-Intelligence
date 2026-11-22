@@ -11,7 +11,8 @@ Report: after locking the phone, captions stop within a minute; on unlock the pa
 - **Batching:** 20 ms frames are handed to the session in ~100 ms batches (one hand-off instead of five promise chains).
 - **Suspension detected without a visibility event:** 15 s without a timer runs the resume path (glasses re-push, microphone re-open, stale socket check) and logs `suspended`.
 - Private builds are still stopped by the Even app shortly after the phone locks (Even docs, Private Testing); staying alive while locked needs a Beta or published build.
-- Not verified on a phone: the reproduction is a simulation of the resume burst.
+- **Overload pause** (from a system log of a real iPhone running 0.11.3 Beta, 2026-11-21): 17 s after the screen locked, every microphone event took 41–47 ms in the backgrounded WebView (0.5–0.8 ms in the foreground), back to back at 100 %, while events kept arriving faster; after unlock the page stayed frozen and blank for 35 s behind that queue. No process was killed. Helix now learns the phone's normal audio delivery rate on screen; on a hidden page, audio below 72 % of it for 6 s stops the glasses microphone ("MIC PAUSED · PHONE BUSY · UNLOCK TO RESUME", `audio-overload` in the log). It comes back when the page is visible, or on a retry after 30 s (doubling to 4 minutes).
+- Not verified on a phone: the resume burst is a simulation, and the overload pause is tested against the measured rates only.
 
 ## v0.13.0 — ambient glasses display, more answer providers, news-backed checks, PDFs, Notes mode, History
 

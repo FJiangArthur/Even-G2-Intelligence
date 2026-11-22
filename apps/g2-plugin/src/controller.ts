@@ -861,7 +861,7 @@ export class G2ConversationController {
 
   private async closeMic(): Promise<void> {
     if (!this.micOn) return;
-    this.micOn = false;
+    this.micOn = false; this.clearAudioPause();
     try {
       if (!await this.bridge.audioControl(false)) throw new Error("G2 refused to stop the microphone");
     } catch (error) { this.micOn = true; throw error; }
@@ -1446,7 +1446,7 @@ export class G2ConversationController {
     this.renderer.dispose(); // Stop display traffic before asynchronous teardown.
     try {
       if (this.micOn) await this.bridge.audioControl(false);
-      this.micOn = false;
+      this.micOn = false; this.clearAudioPause();
       await this.audioDrained();
       await this.releaseClient("shutdown");
       await this.archiveQueue;
@@ -1635,7 +1635,11 @@ export class G2ConversationController {
     this.lastResumeAt = now;
     recordDiagnostic("glasses-repush", reason);
     try { await this.renderer.repush?.(); } catch (error) { console.warn("Helix glasses re-push failed", reason, error); }
-    if (this.micOn && this.client?.state === "active") {
+    const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+    if (this.audioSuspended) {
+      // Paused for load: only a visible page (or the retry timer) turns the microphone back on.
+      if (!hidden) await this.resumeAudioAfterLoad("visible");
+    } else if (this.micOn && this.client?.state === "active") {
       // Android stops the mic while suspended; re-enable with the same source.
       try { await this.bridge.audioControl(true, AudioInputSource.Glasses); } catch (error) { console.warn("Helix mic re-enable failed", error); }
     }
@@ -1716,7 +1720,7 @@ export class G2ConversationController {
     if (state === "active" && !this.micOn) this.presentation.setStatus("connected");
     if (state === "failed") {
       this.presentation.setStatus("failed", "Direct provider connection failed");
-      this.micOn = false;
+      this.micOn = false; this.clearAudioPause();
       this.holding = false;
       void this.bridge.audioControl(false, AudioInputSource.Glasses).catch(() => undefined);
     }
@@ -1743,6 +1747,7 @@ export class G2ConversationController {
     const sampleCount = ((audio.audioPcm as ArrayLike<number> | undefined)?.length ?? 0) >> 1;
     if (sampleCount === 0) return;
     if (this.audioRealtimeGuard) {
+      this.trackAudioLoad(sampleCount);
       // Token bucket at the microphone's own rate (16 kHz, 25 % tolerance, 2 s burst for BLE jitter).
       const now = Date.now();
       this.audioBudget = Math.min(AUDIO_BURST_SAMPLES, this.audioBudget + Math.max(0, now - this.audioBudgetAt) * 20);
@@ -1766,6 +1771,67 @@ export class G2ConversationController {
     // One hand-off per ~100 ms instead of one promise chain per 20 ms frame.
     if (this.audioBatchSamples >= AUDIO_BATCH_SAMPLES) this.flushAudioBatch();
     else this.audioBatchTimer ??= setTimeout(() => this.flushAudioBatch(), 120);
+  }
+
+  // ---- v0.12.3 overload while locked ----
+  // Measured on an iPhone over USB (system log, 2026-11-21): 17 s after the screen locked, every microphone
+  // event took ~42 ms to run in the backgrounded WebView (0.6 ms in the foreground), back to back at 100 %,
+  // while events kept arriving faster than that. The queue grew without bound, captions stopped, and after
+  // unlock the page stayed frozen and blank for 35 s because the "app is in the foreground" message sat behind
+  // the queue. When audio arrives clearly slower than it is recorded while the page is hidden, stop the
+  // microphone so the queue can drain, and try again later or when the page is visible.
+  private audioWindowAt = 0;
+  private audioWindowSamples = 0;
+  private audioLastAt = 0;
+  private audioBaseline = 1;
+  private audioBaselineWindows = 0;
+  private audioSlowWindows = 0;
+  private audioSuspended = false;
+  private audioRetryTimer?: ReturnType<typeof setTimeout>;
+  private audioRetryMs = AUDIO_RETRY_MS;
+  /** True while the microphone is stopped because the phone could not keep up in the background. */
+  public get audioPausedForLoad(): boolean { return this.audioSuspended; }
+
+  private trackAudioLoad(sampleCount: number): void {
+    const now = Date.now();
+    if (now - this.audioLastAt > 5000) { this.audioWindowAt = now; this.audioWindowSamples = 0; this.audioSlowWindows = 0; } // new stream or a gap
+    this.audioLastAt = now;
+    this.audioWindowSamples += sampleCount;
+    const elapsed = now - this.audioWindowAt;
+    if (elapsed < AUDIO_LOAD_WINDOW_MS) return;
+    const ratio = this.audioWindowSamples / 16 / elapsed; // seconds of audio received per second of wall time
+    this.audioWindowAt = now; this.audioWindowSamples = 0;
+    const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+    if (!hidden && ratio > 0.5 && ratio < 1.5) { // learn this device's normal delivery rate while on screen
+      this.audioBaselineWindows++;
+      this.audioBaseline = this.audioBaselineWindows === 1 ? ratio : this.audioBaseline * 0.8 + ratio * 0.2;
+    }
+    const slow = ratio > 0.1 && ratio < this.audioBaseline * 0.72;
+    this.audioSlowWindows = slow ? this.audioSlowWindows + 1 : 0;
+    if (this.audioSlowWindows >= AUDIO_SLOW_WINDOWS && hidden && !this.audioSuspended) this.suspendAudioForLoad(ratio);
+  }
+
+  private suspendAudioForLoad(ratio: number): void {
+    this.audioSuspended = true; this.audioSlowWindows = 0;
+    const retry = this.audioRetryMs;
+    recordDiagnostic("audio-overload", `audio arriving at ${(ratio / this.audioBaseline * 100).toFixed(0)} % of real time while hidden · microphone paused · retry in ${Math.round(retry / 1000)} s`);
+    this.presentation.setInteraction("MIC PAUSED · PHONE BUSY · UNLOCK TO RESUME");
+    void this.bridge.audioControl(false, AudioInputSource.Glasses).catch(() => undefined);
+    clearTimeout(this.audioRetryTimer);
+    this.audioRetryTimer = setTimeout(() => { this.audioRetryMs = Math.min(retry * 2, AUDIO_RETRY_MAX_MS); void this.resumeAudioAfterLoad("retry"); }, retry);
+  }
+
+  private clearAudioPause(): void { clearTimeout(this.audioRetryTimer); this.audioRetryTimer = undefined; this.audioSuspended = false; this.audioSlowWindows = 0; this.audioRetryMs = AUDIO_RETRY_MS; }
+  /** Re-opens the microphone after an overload pause (page visible again, or the retry timer). */
+  private async resumeAudioAfterLoad(reason: "visible" | "retry"): Promise<void> {
+    if (!this.audioSuspended) return;
+    clearTimeout(this.audioRetryTimer); this.audioRetryTimer = undefined;
+    this.audioSuspended = false; this.audioSlowWindows = 0; this.audioLastAt = 0;
+    if (reason === "visible") this.audioRetryMs = AUDIO_RETRY_MS;
+    if (!this.micOn || this.disposed || this.exiting || this.client?.state !== "active") return;
+    recordDiagnostic("audio-resume", reason);
+    this.presentation.setInteraction("LISTENING");
+    try { await this.bridge.audioControl(true, AudioInputSource.Glasses); } catch { /* the next resume tries again */ }
   }
 
   private flushAudioBatch(): void {
@@ -1955,6 +2021,8 @@ function errorMessage(error: unknown): string {
 
 /** Audio intake: frames are handed on in ~100 ms batches; at most 2 s may arrive at once; at most 3 s may wait. */
 const AUDIO_BATCH_SAMPLES = 1600, AUDIO_BURST_SAMPLES = 32_000, AUDIO_MAX_PENDING = 30;
+/** Overload check: 2 s windows; 3 slow windows in a row while hidden pause the microphone; retry after 30 s, doubling to 4 min. */
+const AUDIO_LOAD_WINDOW_MS = 2000, AUDIO_SLOW_WINDOWS = 3, AUDIO_RETRY_MS = 30_000, AUDIO_RETRY_MAX_MS = 240_000;
 /** Live-session history write coalescing window for the phone app (set on G2ConversationController.liveHistoryWriteDelayMs). */
 export const LIVE_HISTORY_WRITE_DELAY_MS = 10_000;
 
