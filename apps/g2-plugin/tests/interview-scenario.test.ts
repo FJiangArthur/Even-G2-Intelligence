@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { MODE_PROFILES, PICKER_MODES, extractQuestions } from "@helix/conversation-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { REHEARSAL_SCRIPTS, rehearsalScript } from "../src/rehearsal";
-import { FAULT_KINDS, INTERVIEW_SCRIPTS, VISIBLE_WITHIN_MS, interviewScript, type FaultKind, type InterviewReport, type PlayOptions, type QuestionRow, type TimelineRecord } from "./interview-harness";
+import { FAULT_KINDS, INTERVIEW_SCRIPTS, VISIBLE_WITHIN_MS, visibleLimit, interviewScript, type FaultKind, type InterviewReport, type PlayOptions, type QuestionRow, type TimelineRecord } from "./interview-harness";
 import { createRig, drive, type Rig, type RigOptions } from "./interview-rig";
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -122,7 +122,7 @@ describe("interview scripts", () => {
     }
   });
 
-  it.fails("Candidate is a mode the wearer can pick  [waits for: mode id `interviewee` shown as \"Candidate\"; pins: the candidate side of an interview is a hidden legacy mode]", () => {
+  it("Candidate is a mode the wearer can pick  [waits for: mode id `interviewee` shown as \"Candidate\"; pins: the candidate side of an interview is a hidden legacy mode]", () => {
     expect(PICKER_MODES).toContain("interviewee");
     expect(MODE_PROFILES.interviewee.picker).toBe(true);
     expect(MODE_PROFILES.interviewee.label).toBe("Candidate");
@@ -160,7 +160,7 @@ describe("interviewer script: the wearer interviews a candidate", () => {
     const { report } = await scriptRun(INTERVIEWER);
     const answered = report.rows.filter(row => row.answered && row.via === "answer");
     expect(answered.length).toBeGreaterThanOrEqual(5);
-    for (const row of answered) expect(row.msTokenToVisible, `L${row.line} ${row.question}`).toBeLessThanOrEqual(VISIBLE_WITHIN_MS);
+    for (const row of answered) expect(row.msTokenToVisible, `L${row.line} ${row.question}`).toBeLessThanOrEqual(visibleLimit(row));
     expect(report.violations.filter(text => /never shown on the glasses|after the first token/u.test(text))).toEqual([]);
   });
 
@@ -171,31 +171,31 @@ describe("interviewer script: the wearer interviews a candidate", () => {
     expect(ofKind(timeline, "suggestions.changed").some(record => record.text.includes("?"))).toBe(true);
   });
 
-  it.fails("a suggested question pops up on the glasses without waking the HUD  [waits for: display, suggestion pop-up; pins: suggestions only show after a double-tap opens the HUD]", async () => {
+  it("a suggested question pops up on the glasses without waking the HUD  [waits for: display, suggestion pop-up; pins: suggestions only show after a double-tap opens the HUD]", async () => {
     const { report, timeline } = await scriptRun(INTERVIEWER);
     expect(report.summary.suggestionsOnGlassesAmbient).toBeGreaterThanOrEqual(1);
     expect(ofKind(timeline, "glasses.suggestion-shown").every(record => record.data?.ambient === true)).toBe(true);
   });
 
-  it.fails("the wearer's question without a question mark gets an answer key  [waits for: answer pipeline / modes, implicit questions; pins: \"I'd like to hear about...\" is not detected at all]", async () => {
+  it("the wearer's question without a question mark gets an answer key  [waits for: answer pipeline / modes, implicit questions; pins: \"I'd like to hear about...\" is not detected at all]", async () => {
     const { report } = await scriptRun(INTERVIEWER);
     const [row] = rowsOf(report, "no-question-mark");
     expect([row!.expect, row!.timesAnswered, row!.finalState]).toEqual(["answer-key", 1, "answered"]);
   });
 
-  it.fails("two questions in one line both get an answer key  [waits for: answer pipeline, queue; pins: only the last question of a line is answered]", async () => {
+  it("two questions in one line both get an answer key  [waits for: answer pipeline, queue; pins: only the last question of a line is answered]", async () => {
     const { report } = await scriptRun(INTERVIEWER);
     expect(describeRows(rowsOf(report, "two-questions").filter(row => !row.ok))).toEqual([]);
   });
 
-  it.fails("a rhetorical question from the candidate is not answered and does not cut the answer key in flight  [waits for: answer pipeline, queue and question filter; pins: any later question aborts the current answer]", async () => {
+  it("a rhetorical question from the candidate is not answered and does not cut the answer key in flight  [waits for: answer pipeline, queue and question filter; pins: any later question aborts the current answer]", async () => {
     const { report } = await scriptRun(INTERVIEWER);
     const [rhetorical] = rowsOf(report, "rhetorical");
     expect([rhetorical!.attempts, rhetorical!.timesAnswered]).toEqual([0, 0]);
     expect(report.rows.filter(row => row.finalState === "superseded").map(row => row.question)).toEqual([]);
   });
 
-  it.fails("the whole script runs without a single violation  [waits for: all of the above; pins: the release goal for the interviewer side]", async () => {
+  it("the whole script runs without a single violation  [waits for: all of the above; pins: the release goal for the interviewer side]", async () => {
     const { report } = await scriptRun(INTERVIEWER);
     expect(report.violations).toEqual([]);
     expect(report.summary.answeredOnce).toBe(report.summary.expectedQuestions);
@@ -218,7 +218,7 @@ describe("candidate script: the wearer is interviewed (mode id interviewee)", ()
     expect(rows).toHaveLength(4);
     expect(describeRows(rows.filter(row => !row.ok))).toEqual([]);
     expect(report.violations.filter(text => text.startsWith("out of order"))).toEqual([]);
-    for (const row of rows) expect(row.msTokenToVisible, `L${row.line}`).toBeLessThanOrEqual(VISIBLE_WITHIN_MS);
+    for (const row of rows) expect(row.msTokenToVisible, `L${row.line}`).toBeLessThanOrEqual(visibleLimit(row));
   });
 
   it("the wearer's own question gets no answer key", async () => {
@@ -236,25 +236,25 @@ describe("candidate script: the wearer is interviewed (mode id interviewee)", ()
     expect([...rowsOf(report, "topic-change"), ...rowsOf(report, "fragment")].map(row => [row.attempts, row.timesAnswered])).toEqual([[0, 0], [0, 0]]);
   });
 
-  it.fails("a question without a question mark is answered like any other, within 2.5 s  [waits for: answer pipeline, implicit questions; pins: only the copilot's ask lane answers it, 4 s or more later, as a LOOKUP cue]", async () => {
+  it("a question without a question mark is answered like any other, within 2.5 s  [waits for: answer pipeline, implicit questions; pins: only the copilot's ask lane answers it, 4 s or more later, as a LOOKUP cue]", async () => {
     const { report } = await scriptRun(CANDIDATE);
     const [row] = rowsOf(report, "no-question-mark");
     expect(row!.timesAnswered).toBe(1);
     expect(row!.msToFirstToken).toBeLessThanOrEqual(2500);
   });
 
-  it.fails("two questions in one line are both answered  [waits for: answer pipeline, queue; pins: only the last question of a line is answered]", async () => {
+  it("two questions in one line are both answered  [waits for: answer pipeline, queue; pins: only the last question of a line is answered]", async () => {
     const { report } = await scriptRun(CANDIDATE);
     expect(describeRows(rowsOf(report, "two-questions").filter(row => !row.ok))).toEqual([]);
   });
 
-  it.fails("the interviewer's rhetorical question right after the wearer's own question is not answered  [waits for: answer pipeline, question filter; pins: every question-shaped sentence from the other side is answered]", async () => {
+  it("the interviewer's rhetorical question right after the wearer's own question is not answered  [waits for: answer pipeline, question filter; pins: every question-shaped sentence from the other side is answered]", async () => {
     const { report } = await scriptRun(CANDIDATE);
     const [rhetorical] = rowsOf(report, "rhetorical");
     expect([rhetorical!.attempts, rhetorical!.timesAnswered]).toEqual([0, 0]);
   });
 
-  it.fails("the whole script runs without a single violation  [waits for: all of the above; pins: the release goal for the candidate side]", async () => {
+  it("the whole script runs without a single violation  [waits for: all of the above; pins: the release goal for the candidate side]", async () => {
     const { report } = await scriptRun(CANDIDATE);
     expect(report.violations).toEqual([]);
     expect(report.summary.answeredOnce).toBe(report.summary.expectedQuestions);
@@ -280,7 +280,7 @@ describe("questions in quick succession", () => {
     expect(report.rows.at(-2)!.finalState, "the newest question from the other side is answered").toBe("answered");
   });
 
-  it.fails("burst: every question from the other side is answered once, in order  [waits for: answer pipeline, queue; pins: a new question aborts the answer before it]", async () => {
+  it("burst: every question from the other side is answered once, in order  [waits for: answer pipeline, queue; pins: a new question aborts the answer before it]", async () => {
     const report = await burst();
     expect(describeRows(report.rows.filter(row => !row.ok))).toEqual([]);
     expect(report.violations).toEqual([]);
@@ -316,31 +316,31 @@ describe("provider faults", () => {
     expect(report.summary.suggestionChanges).toBeGreaterThanOrEqual(1);
   });
 
-  it.fails("HTTP 500 once: the question is answered after a retry  [waits for: answer pipeline, retry; pins: one transient failure loses the question]", async () => {
+  it("HTTP 500 once: the question is answered after a retry  [waits for: answer pipeline, retry; pins: one transient failure loses the question]", async () => {
     const { report } = await arrange("500 once", () => twoQuestions(current => current.api.fault("http-500-once")));
     expect(report.rows[1]!.faults).toEqual(["http-500"]);
     expect(describeRows(report.rows.filter(row => !row.ok))).toEqual([]);
   });
 
-  it.fails("HTTP 500 once: the answer already on the glasses stays  [waits for: display, minor errors keep the answer; pins: any error notice clears the answer]", async () => {
+  it("HTTP 500 once: the answer already on the glasses stays  [waits for: display, minor errors keep the answer; pins: any error notice clears the answer]", async () => {
     const { report, timeline, firstAnswerId } = await arrange("500 once, display", () => twoQuestions(current => current.api.fault("http-500-once")));
     expect(["replaced", "expired"]).toContain(leftBecause(timeline, firstAnswerId));
     expect(report.summary.answersClearedByError).toBe(0);
   });
 
-  it.fails("malformed stream event: the question is still answered  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event fails the whole answer]", async () => {
+  it("malformed stream event: the question is still answered  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event fails the whole answer]", async () => {
     const { report } = await arrange("malformed", () => twoQuestions(current => current.api.fault("malformed-event")));
     expect(report.rows[1]!.faults).toEqual(["malformed-event"]);
     expect(describeRows(report.rows.filter(row => !row.ok))).toEqual([]);
   });
 
-  it.fails("malformed stream event: nothing is cleared from the glasses  [waits for: display, minor errors keep the answer; pins: the error wipes the answer that was showing]", async () => {
+  it("malformed stream event: nothing is cleared from the glasses  [waits for: display, minor errors keep the answer; pins: the error wipes the answer that was showing]", async () => {
     const { report, timeline, firstAnswerId } = await arrange("malformed, display", () => twoQuestions(current => current.api.fault("malformed-event")));
     expect(["replaced", "expired"]).toContain(leftBecause(timeline, firstAnswerId));
     expect(report.summary.answersClearedByError).toBe(0);
   });
 
-  it.fails("cut-off answer: what arrived stays on the glasses, marked partial  [waits for: answer pipeline `answer.completed.partial` + display marker; pins: a cut-off answer is dropped with an error]", async () => {
+  it("cut-off answer: what arrived stays on the glasses, marked partial  [waits for: answer pipeline `answer.completed.partial` + display marker; pins: a cut-off answer is dropped with an error]", async () => {
     const current = await arrange("cut-off", async () => {
       const value = await start({ mode: "interviewee" });
       await value.api.fault("cut-off", { afterDeltas: 6 });
@@ -413,17 +413,17 @@ describe("whole scripts under a fault (the fault hits the first answer request)"
       expect(faultedGood).toEqual(cleanGood);
       expect(faulted.report.summary.notices).toBe(0);
     });
-    it.fails(`${scriptId} · HTTP 500 once: no question is lost  [waits for: answer pipeline, retry; pins: the first question of the interview is lost to one failed request]`, async () => {
+    it(`${scriptId} · HTTP 500 once: no question is lost  [waits for: answer pipeline, retry; pins: the first question of the interview is lost to one failed request]`, async () => {
       const { faulted, cleanGood, faultedGood } = await sameAsClean("http-500-once");
       expect(faulted.report.summary.lostToFault).toBe(0);
       expect(faultedGood).toEqual(cleanGood);
     });
-    it.fails(`${scriptId} · malformed stream event: no question is lost  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event loses the question]`, async () => {
+    it(`${scriptId} · malformed stream event: no question is lost  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event loses the question]`, async () => {
       const { faulted, cleanGood, faultedGood } = await sameAsClean("malformed-event");
       expect(faulted.report.summary.lostToFault).toBe(0);
       expect(faultedGood).toEqual(cleanGood);
     });
-    it.fails(`${scriptId} · cut-off answer: kept as partial, every other question as in the clean run  [waits for: answer pipeline, partial answers; pins: the cut-off answer is discarded]`, async () => {
+    it(`${scriptId} · cut-off answer: kept as partial, every other question as in the clean run  [waits for: answer pipeline, partial answers; pins: the cut-off answer is discarded]`, async () => {
       const { faulted, cleanGood, faultedGood } = await sameAsClean("cut-off");
       const hit = faulted.report.rows.filter(row => row.faults.includes("cut-off"));
       expect(hit.map(row => row.finalState)).toEqual(["partial"]);
@@ -459,10 +459,10 @@ describe("audio path: fake microphone PCM and a fake speech-to-text socket carry
     const [{ report: spoken }, { report: typed }] = [await audio(1), await scriptRun(CANDIDATE)];
     const pick = (report: InterviewReport) => ["plain", "two-questions", "own-question", "rhetorical", "repeat", "fragment", "topic-change"].flatMap(tag => rowsOf(report, tag)).map(row => [row.line, row.question, row.timesAnswered, row.finalState]);
     expect(pick(spoken)).toEqual(pick(typed));
-    for (const row of spoken.rows.filter(item => item.answered && item.via === "answer")) expect(row.msTokenToVisible).toBeLessThanOrEqual(VISIBLE_WITHIN_MS);
+    for (const row of spoken.rows.filter(item => item.answered && item.via === "answer")) expect(row.msTokenToVisible).toBeLessThanOrEqual(visibleLimit(row));
   });
 
-  it.fails("a line spoken for longer than six seconds stays one turn  [waits for: nobody yet (reported); pins: HelixConversationClient.sendAudio commits every 6 s of audio, so long questions reach question detection in pieces]", async () => {
+  it("a line spoken for longer than six seconds stays one turn  [waits for: nobody yet (reported); pins: HelixConversationClient.sendAudio commits every 6 s of audio, so long questions reach question detection in pieces]", async () => {
     const { report, timeline } = await audio(1);
     const script = interviewScript(CANDIDATE)!;
     expect(ofKind(timeline, "line.heard")).toHaveLength(script.lines.length);

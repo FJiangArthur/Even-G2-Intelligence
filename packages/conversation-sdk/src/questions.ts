@@ -106,6 +106,13 @@ export class RecentQuestions {
   clear(): void { this.at.clear(); }
 }
 
+/**
+ * Questions people put to themselves while thinking aloud ("Where do I even start?", "How should I put
+ * it?", "What's the word?") or tag onto a statement ("right?", "you know?"). Nobody wants them answered.
+ */
+const RHETORICAL = /^(?:(?:well|so|um+|uh+|hmm+|oh|okay|ok|gosh|wow|honestly|i mean)[,.\s]+)*(?:where (?:do|would|should|can) i (?:even |really )?(?:start|begin)|how (?:do|should|would|shall|can) i (?:even |best )?(?:put|say|phrase|describe|explain) (?:it|this|that)|what(?:'s| is| was) the (?:right )?(?:word|term|phrase|name)(?: for (?:it|that|this))?|what was i (?:saying|going to say)|where was i|how (?:do|should) i say (?:this|that|it)|what else|what can i say|who knows|you know(?: what i mean)?|right|okay|ok|yeah|no|really|see|make sense|does that make sense|is that fair|you see what i mean|what do you call it|let me think|how to put (?:it|this))[\s?!.…]*$/iu;
+export function isRhetoricalQuestion(text: string): boolean { return RHETORICAL.test(text.trim()); }
+
 function looksLikeUnpunctuatedQuestion(text: string): boolean {
   const cleaned = text
     .replace(/^["'“‘「『（(\s]+/, "")
@@ -187,6 +194,7 @@ export function extractQuestions(input: string, limit = 3): DetectedQuestion[] {
   for (const clause of sentenceClauses(normalizedInput)) {
     const cleaned = clause.text.replace(LEADING_FILLER, "").trim();
     if (!clause.explicitQuestion && !looksLikeUnpunctuatedQuestion(cleaned)) continue;
+    if (isRhetoricalQuestion(cleaned)) continue;
     // "X is hard to order and have a long lead time." is a statement: a bare
     // auxiliary after a conjunction continues the predicate, it is not a new question.
     if (!clause.explicitQuestion && clause.continuation && AUXILIARY_QUESTION_START.test(cleaned)

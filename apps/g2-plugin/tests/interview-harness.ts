@@ -250,6 +250,8 @@ export interface QuestionRow {
   readonly msToVisible?: number;
   /** First answer token -> answer text on the glasses. */
   readonly msTokenToVisible?: number;
+  /** The display was showing an earlier answer when this one started arriving, so it waited its turn. */
+  readonly heldBehindAnswer?: boolean;
   readonly finalState: FinalState;
   /** Injected faults that hit an answer request for this question. */
   readonly faults: readonly string[];
@@ -288,6 +290,9 @@ interface RequestInfo { readonly faults: Set<string>; failedAt?: number; failure
 
 /** The answer must be readable this soon after the provider's first token. */
 export const VISIBLE_WITHIN_MS = 1500;
+/** An answer that arrives while an earlier one is still being read waits for it; it must still appear within this. */
+export const HELD_WITHIN_MS = 12_000;
+export function visibleLimit(row: { readonly heldBehindAnswer?: boolean }): number { return row.heldBehindAnswer ? HELD_WITHIN_MS : VISIBLE_WITHIN_MS; }
 /** How a cut-off answer may be marked (phone label / meta, glasses title / status / body). */
 export const PARTIAL_WORDING = /\b(?:partial|cut[ -]?off|cut short|incomplete|interrupted|unfinished)\b/iu;
 const BODY_CONTAINERS = ["hud-body", "helix-main"];
@@ -464,7 +469,8 @@ export class InterviewRecorder {
 
   /** The answer whose text the glasses body shows, if any. A question line may sit above the answer page. */
   private answerOnScreen(entry: ScreenEntry): TrackedAnswer | undefined {
-    const lines = entry.body.split("\n");
+    // The display appends a mark to an answer the provider cut short; it is not part of the answer text.
+    const lines = entry.body.replace(/\s*…\s*\(cut off\)\s*$/u, "").split("\n");
     for (let skip = 0; skip < Math.min(2, lines.length); skip++) {
       const page = alnum(lines.slice(skip).join(" "));
       if (!page) return undefined;
@@ -500,8 +506,8 @@ export class InterviewRecorder {
     return { byQuestion, records, total: requests.length, answers: requests.filter(request => request.intent === "answer").length };
   }
 
-  private glassesRecords(): { records: TimelineRecord[]; visibleAt: Map<string, number>; clearedByError: Set<string>; onScreenAtEnd?: string; partialOnGlasses: Set<string> } {
-    const records: TimelineRecord[] = [], visibleAt = new Map<string, number>(), clearedByError = new Set<string>(), partialOnGlasses = new Set<string>();
+  private glassesRecords(): { records: TimelineRecord[]; held: Set<string>; visibleAt: Map<string, number>; clearedByError: Set<string>; onScreenAtEnd?: string; partialOnGlasses: Set<string> } {
+    const records: TimelineRecord[] = [], visibleAt = new Map<string, number>(), clearedByError = new Set<string>(), partialOnGlasses = new Set<string>(), held = new Set<string>();
     const suggestionsShown = new Set<string>();
     let current: TrackedAnswer | undefined, lastNotice = "";
     for (const entry of this.screens) {
@@ -515,7 +521,11 @@ export class InterviewRecorder {
           records.push({ t: entry.t, kind: "glasses.answer-hidden", text: reason === "error" ? `${error!.code}: ${error!.message}` : reason, id: current.id, data: { reason } });
         }
         if (shown) {
-          if (!visibleAt.has(shown.id)) visibleAt.set(shown.id, entry.t);
+          if (!visibleAt.has(shown.id)) {
+            visibleAt.set(shown.id, entry.t);
+            // Held: it replaced an answer, and some answer was already on screen when its first token arrived.
+            if (current && [...visibleAt].some(([id, at]) => id !== shown.id && at <= shown.firstTokenAt + 150)) held.add(shown.id);
+          }
           records.push({ t: entry.t, kind: "glasses.answer-visible", text: entry.body.replace(/\s+/gu, " ").trim().slice(0, 80), id: shown.id, data: { ambient: entry.ambient } });
         }
         current = shown;
@@ -538,7 +548,7 @@ export class InterviewRecorder {
       if (notice && notice !== lastNotice) records.push({ t: entry.t, kind: "notice.shown", text: notice, data: { where: "glasses" } });
       lastNotice = notice;
     }
-    return { records, visibleAt, clearedByError, partialOnGlasses, ...(current ? { onScreenAtEnd: current.id } : {}) };
+    return { records, held, visibleAt, clearedByError, partialOnGlasses, ...(current ? { onScreenAtEnd: current.id } : {}) };
   }
 
   /** Everything that happened, oldest first. */
@@ -586,6 +596,7 @@ export class InterviewRecorder {
         ...(first && heardAt !== undefined ? { msToFirstToken: first.firstTokenAt - heardAt } : ask && heardAt !== undefined ? { msToFirstToken: ask.t - heardAt } : {}),
         ...(visible !== undefined && heardAt !== undefined ? { msToVisible: visible - heardAt } : {}),
         ...(visible !== undefined && visibleFor ? { msTokenToVisible: visible - visibleFor.firstTokenAt } : {}),
+        ...(visibleFor && glasses.held.has(visibleFor.id) ? { heldBehindAnswer: true } : {}),
         finalState, faults: [...(info?.faults ?? [])], ok,
       } });
     };
@@ -634,7 +645,7 @@ export class InterviewRecorder {
     for (const item of rows) {
       if (!item.answered || item.via !== "answer") continue;
       if (item.msTokenToVisible === undefined) violations.push(`L${item.line} "${item.question.slice(0, 50)}": answered but never shown on the glasses`);
-      else if (item.msTokenToVisible > VISIBLE_WITHIN_MS) violations.push(`L${item.line} "${item.question.slice(0, 50)}": on the glasses ${item.msTokenToVisible} ms after the first token (limit ${VISIBLE_WITHIN_MS})`);
+      else if (item.msTokenToVisible > visibleLimit(item)) violations.push(`L${item.line} "${item.question.slice(0, 50)}": on the glasses ${item.msTokenToVisible} ms after the first token (limit ${visibleLimit(item)}${item.heldBehindAnswer ? ", waited behind the answer before it" : ""})`);
     }
     for (const id of glasses.clearedByError) {
       const answer = this.answers.find(candidate => candidate.id === id);

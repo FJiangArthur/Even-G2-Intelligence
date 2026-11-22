@@ -49,7 +49,7 @@ interface AnswerJob {
 /** Timers of one running answer: overall deadline and the wait for the first token. */
 interface AnswerClock { dispatch(firstTokenMs: number): void; token(): void; restart(): void }
 /** Waiting automatic answers (beyond the one running), how long one may wait, and the repeat window. */
-const ANSWER_QUEUE_WAITING = 3, ANSWER_QUEUE_MAX_AGE_MS = 20_000, QUESTION_DEDUPE_MS = 90_000;
+const ANSWER_QUEUE_WAITING = 3, ANSWER_QUEUE_MAX_AGE_MS = 20_000, QUESTION_DEDUPE_MS = 10_000;
 const FIRST_TOKEN_TIMEOUT_MS = 15_000, ANSWER_RETRY_DELAY_MS = 400, BUSY_NOTICE_INTERVAL_MS = 10_000;
 /**
  * Interviewer mode with an unattributed speaker (phone microphone, or frames without a direction tag): the

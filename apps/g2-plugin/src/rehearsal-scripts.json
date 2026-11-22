@@ -325,9 +325,7 @@
         "make a write idempotent",
         "retry arrives after the first write",
         "design the ingestion path",
-        "first ninety days"
-      ],
-      "implicitQuestions": [
+        "first ninety days",
         "roll back a release"
       ]
     }
@@ -368,14 +366,12 @@
         "How did you detect it",
         "how long did the backfill take",
         "model the tables",
-        "any questions for me"
+        "any questions for me",
+        "worst data quality incident"
       ],
       "selfQuestions": [
         "detection on our side",
         "on-call rotation organized"
-      ],
-      "implicitQuestions": [
-        "worst data quality incident"
       ]
     }
   }
