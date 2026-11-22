@@ -124,6 +124,8 @@ export interface CopilotSuggestion {
   readonly question: string;
   readonly why: string;
   readonly createdAt: string;
+  /** Set once the wearer (or, in Candidate mode, the other side) has said this question aloud. */
+  readonly askedAt?: string;
 }
 
 /**

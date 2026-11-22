@@ -456,6 +456,8 @@ export interface AnswerCompletedEvent extends GatewayEventBase {
   readonly answerId: string;
   readonly questionId?: string;
   readonly text: string;
+  /** True when the provider cut the answer short; `text` is what arrived before the cut. */
+  readonly partial?: boolean;
   readonly context: ConversationContext;
 }
 
@@ -577,6 +579,7 @@ export function isGatewayEvent(value: unknown): value is GatewayEvent {
       return isIdentifier(candidate.answerId) &&
         isOptionalIdentifier(candidate.questionId) &&
         isBoundedString(candidate.text, 1, MAX_EVENT_TEXT_LENGTH) &&
+        (candidate.partial === undefined || typeof candidate.partial === "boolean") &&
         isConversationContext(candidate.context);
     case "note.suggested":
       return isNoteCandidate(candidate.note) &&
