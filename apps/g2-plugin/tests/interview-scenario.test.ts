@@ -353,7 +353,9 @@ describe("provider faults", () => {
     const timeline = current.api.timeline();
     const [partial] = ofKind(timeline, "answer.partial");
     expect(partial, "answer.completed with partial: true").toBeDefined();
-    expect(partial!.text.split(/\s+/u).length).toBe(6);
+    // The six words that arrived (an added marker such as "…" is fine), not the whole answer.
+    expect(partial!.text.split(/\s+/u).length).toBeGreaterThanOrEqual(6);
+    expect(partial!.text.split(/\s+/u).length).toBeLessThanOrEqual(8);
     // Five seconds after the cut the text is still there, and the wearer can tell it is incomplete.
     expect(current.recorder.answerOnGlasses()).toBe(partial!.id);
     expect(ofKind(timeline, "glasses.answer-hidden")).toEqual([]);

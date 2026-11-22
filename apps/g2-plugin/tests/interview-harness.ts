@@ -594,9 +594,12 @@ export class InterviewRecorder {
       const expect: QuestionRow["expect"] = line.expect ?? "unspecified";
       const needles = line.expect && line.expect !== "none" ? line.questions ?? [line.text] : [];
       for (const needle of needles) {
-        const question = detected.find(candidate => !used.has(candidate.id) && alnum(candidate.text).includes(alnum(needle)));
+        // One detected question may carry two expected ones ("How did you detect it, and how long did it take?"):
+        // an answer to it then counts for both rows.
+        const question = detected.find(candidate => !used.has(candidate.id) && alnum(candidate.text).includes(alnum(needle)))
+          ?? detected.find(candidate => alnum(candidate.text).includes(alnum(needle)));
         if (question) used.add(question.id);
-        add(line, question, question?.text ?? line.text, expect);
+        add(line, question, question?.text ?? (needles.length > 1 ? needle : line.text), expect);
       }
       const rest = detected.filter(question => !used.has(question.id));
       for (const question of rest) { used.add(question.id); add(line, question, question.text, line.expect === undefined ? "unspecified" : "none"); }
