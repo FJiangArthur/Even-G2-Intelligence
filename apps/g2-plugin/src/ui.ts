@@ -42,7 +42,8 @@ import {
 import { icon, mascotMarkup, modeIcon, pixelSvg, pixelText, MASCOT_FRAMES, type IconName, type MascotState } from "./pixel-art";
 import { TAB_DEFINITIONS, defaultTabForHudView, shouldFollowHud, tabFromKey } from "./tabs";
 import { renderNotebook } from "./notebook-panel";
-import type { TodoOp } from "@helix/conversation-sdk";
+import type { TodoOp, CopilotSuggestion } from "@helix/conversation-sdk";
+import * as conversationSdk from "@helix/conversation-sdk";
 
 /* v0.8 glasses mirror contract (glasses agent, src/glasses-mirror.ts). Resolved without a static
  * import so the phone UI builds before that module lands; falls back to a local text mirror. */
@@ -783,7 +784,10 @@ export class CompanionUi {
     this.textarea("instructions").value = config.instructions;
     this.input("locale").value = config.locale;
     this.input("sentence-limit").value = String(config.maxResponseSentences);
-    this.select("conversation-mode").value = modeProfile(config.conversationMode).picker ? config.conversationMode : "general";
+    // The saved mode is shown as itself whenever the picker offers it (Candidate is `interviewee`);
+    // only an id with no option (the legacy `office-discussion` name of Meeting) falls back to Meeting.
+    const modeSelect = this.select("conversation-mode"), savedMode = modeProfile(config.conversationMode).id;
+    modeSelect.value = [...modeSelect.options].some(option => option.value === savedMode) ? savedMode : "general";
     this.showMode(config.conversationMode);
     this.select("response-strategy").value = config.responseStrategy;
     this.select("transcription-provider").value = config.transcriptionProvider;
@@ -1141,7 +1145,7 @@ export class CompanionUi {
   private updateFeedElement(article: HTMLElement, item: FeedItem, meta?: AnswerMeta): void {
     const partial = item.id === "transcript-partial";
     const kind = item.kind === "question" && item.questionKind ? ` question-${item.questionKind}` : "";
-    const className = `message message-${item.kind}${kind}${item.streaming ? " is-streaming" : ""}${partial ? " is-partial" : ""}`;
+    const className = `message message-${item.kind}${kind}${item.streaming ? " is-streaming" : ""}${partial ? " is-partial" : ""}${item.partial ? " is-cut-off" : ""}`;
     if (article.className !== className) article.className = className;
     const ariaLabel = `${item.label} message`;
     if (article.getAttribute("aria-label") !== ariaLabel) {
@@ -1172,13 +1176,14 @@ export class CompanionUi {
       const footer = document.createElement("div"); footer.className = "message-footer";
       const line = answerMetaLine(meta, item.meta);
       if (line) { const metaLine = document.createElement("small"); metaLine.className = "answer-meta"; metaLine.textContent = line; footer.append(metaLine); }
+      if (item.partial) footer.append(el("small", "cut-off-note", CUT_OFF_NOTE));
       const retrieval = retrievalNote(meta);
       if (retrieval) { const note = document.createElement("small"); note.className = "retrieval-note"; note.textContent = retrieval; footer.append(note); }
       footer.append(verifyButton(item.body, item.id, "answer"));
       article.append(footer);
     }
-    if (item.kind === "question" && item.questionKind === "you") {
-      // The wearer's own question is never auto-answered; offer it explicitly.
+    if (item.kind === "question" && item.questionKind === "you" && !item.answered) {
+      // The wearer's own question is not auto-answered outside Interviewer mode; offer it explicitly.
       const footer = el("div", "message-footer");
       footer.append(el("small", "answer-meta", "Not auto-answered"), actionButton("ask", "Ask Helix", { target: item.body }, "button button-secondary button-small"));
       article.append(footer);
@@ -1260,19 +1265,24 @@ export class CompanionUi {
 
   private renderQa(snapshot: PresentationSnapshot, connected: boolean): Node[] {
     const nodes: Node[] = [];
-    // v0.8 kind "ask": questions the wearer could ask the other party.
-    nodes.push(el("h3", "section-label", "Ask them"));
-    if (snapshot.suggestions.length) {
-      nodes.push(el("p", "field-note", "Say these to the other person. Tap to ask Helix instead; hold or use Copy to copy."));
+    // Suggested questions, headed for the mode: "Ask them", "Probes to ask" (Interviewer), or the
+    // "They may ask" / "Ask them" groups of Candidate mode. Asked ones stay struck out until the SDK drops them.
+    for (const group of suggestionGroups(snapshot.glasses.mode, snapshot.suggestions)) {
+      nodes.push(el("h3", "section-label", group.heading));
+      if (!group.items.length) { nodes.push(el("p", "field-note", group.empty)); continue; }
+      nodes.push(el("p", "field-note", group.note));
       const list = el("ul", "card-list suggestion-list");
-      for (const suggestion of snapshot.suggestions) {
-        const row = el("li", "suggestion");
+      for (const suggestion of group.items) {
+        const asked = Boolean(suggestion.askedAt);
+        const row = el("li", `suggestion${asked ? " is-asked" : ""}`);
         const button = actionButton("ask", "", { target: suggestion.question }, "suggestion-button");
         button.dataset.longpress = "copy";
         button.disabled = !connected;
-        button.append(iconNode("question"), el("span", "suggestion-text", suggestion.question));
-        if (suggestion.why) button.append(el("small", "suggestion-why", suggestion.why));
-        button.setAttribute("aria-label", `Ask Helix: ${suggestion.question}`);
+        button.append(iconNode(asked ? "check" : "question"), el("span", "suggestion-text", suggestion.question));
+        const why = suggestionWhyText(suggestion.why);
+        if (asked) button.append(el("small", "suggestion-why suggestion-asked", "Asked"));
+        else if (why) button.append(el("small", "suggestion-why", why));
+        button.setAttribute("aria-label", `${asked ? "Already asked. " : ""}${group.tapLabel}: ${suggestion.question}`);
         const copy = actionButton("copy", "", { target: suggestion.question }, "copy-button");
         copy.innerHTML = `${icon("copy", "icon copy-icon")}<span>Copy</span>`;
         copy.setAttribute("aria-label", `Copy: ${suggestion.question}`);
@@ -1280,10 +1290,8 @@ export class CompanionUi {
         list.append(row);
       }
       nodes.push(list);
-      if (!connected) nodes.push(el("p", "field-note", "Connect to ask Helix a suggested question. Copy works offline."));
-    } else {
-      nodes.push(el("p", "field-note", "Questions worth asking the other person appear here as the conversation develops."));
     }
+    if (snapshot.suggestions.length && !connected) nodes.push(el("p", "field-note", "Connect to ask Helix a suggested question. Copy works offline."));
     // v0.8 kind "answer": questions others asked the wearer (answered on the glasses).
     const asked = snapshot.feed.filter(item => item.kind === "question" && (item.questionKind === "they" || item.questionKind === "you"));
     if (asked.length) {
@@ -2009,6 +2017,60 @@ export function answerMetaLine(meta: AnswerMeta | undefined, fallback?: string):
   return parts.join(" · ");
 }
 
+/** Phone note under an answer the provider cut short (`answer.completed` with `partial`). */
+export const CUT_OFF_NOTE = "Cut off: the provider stopped early. This is what arrived.";
+
+/** One headed group of suggested questions on the Q&A tab. */
+export interface SuggestionGroup {
+  readonly heading: string;
+  /** Shown above the list. */
+  readonly note: string;
+  /** Shown instead of the list while the group is empty. */
+  readonly empty: string;
+  /** What a tap does, for the accessible name ("Ask Helix"). */
+  readonly tapLabel: string;
+  /** Open questions first, the ones already said aloud last. */
+  readonly items: readonly CopilotSuggestion[];
+}
+const SDK_KIND_LABELS = (conversationSdk as unknown as { SUGGESTION_KIND_LABELS?: Readonly<Record<string, string>> }).SUGGESTION_KIND_LABELS;
+const kindLabel = (kind: "they-ask" | "ask-them") => SDK_KIND_LABELS?.[kind] ?? (kind === "they-ask" ? "They may ask" : "Ask them");
+const askedLast = (items: readonly CopilotSuggestion[]) => [...items.filter(item => !item.askedAt), ...items.filter(item => item.askedAt)];
+const labelCase = (text: string) => { const lower = text.trim().toLowerCase(); return lower.charAt(0).toUpperCase() + lower.slice(1); };
+/** Candidate mode: the SDK prefixes `why` with the kind; the group heading already says it. */
+export function suggestionWhyText(why: string | undefined): string {
+  return (why ?? "").replace(/^\s*(they may ask|ask them)\s*[:\-–—]\s*/iu, "").trim();
+}
+
+/**
+ * Q&A tab groups for a mode. Interviewer: probes to ask the candidate. Candidate (`interviewee`):
+ * what the interviewer may ask next and what the candidate could ask, by the SDK's optional `kind`
+ * ("they-ask" | "ask-them", absent = ask-them). Every other mode: one group named by the mode's ask label.
+ */
+export function suggestionGroups(mode: string | undefined, suggestions: readonly CopilotSuggestion[]): SuggestionGroup[] {
+  const profile = modeProfile(mode);
+  const say = "Tap to ask Helix instead; hold or use Copy to copy.";
+  if (profile.id === "interviewee") {
+    const theirs = suggestions.filter(item => (item as { kind?: string }).kind === "they-ask");
+    const mine = suggestions.filter(item => (item as { kind?: string }).kind !== "they-ask");
+    const they: SuggestionGroup = { heading: kindLabel("they-ask"), tapLabel: "Get a reply from Helix", items: askedLast(theirs),
+      note: "Questions the interviewer may ask next. Tap one to get a reply you could give; hold or use Copy to copy.",
+      empty: "Questions the interviewer is likely to ask next appear here as the interview develops." };
+    const ask: SuggestionGroup = { heading: kindLabel("ask-them"), tapLabel: "Ask Helix", items: askedLast(mine),
+      note: `Questions you could ask the interviewer. ${say}`,
+      empty: "Questions worth asking the interviewer appear here as the interview develops." };
+    // Only the groups that have something, in the order the interview needs them; both headings while empty.
+    return theirs.length && !mine.length ? [they] : !theirs.length && mine.length ? [ask] : [they, ask];
+  }
+  if (profile.id === "interviewer") {
+    return [{ heading: "Probes to ask", tapLabel: "Ask Helix", items: askedLast(suggestions),
+      note: `Follow-up probes for the candidate. Say one aloud. ${say}`,
+      empty: "Follow-up probes for the candidate appear here as the interview develops." }];
+  }
+  return [{ heading: labelCase(profile.askLabel) || "Ask them", tapLabel: "Ask Helix", items: askedLast(suggestions),
+    note: `Say these to the other person. ${say}`,
+    empty: "Questions worth asking the other person appear here as the conversation develops." }];
+}
+
 export function retrievalNote(meta: AnswerMeta | undefined): string | undefined {
   if (!meta) return;
   const { searchedEntries, matched, webUsed } = meta.retrieval;
@@ -2033,7 +2095,7 @@ function panelSignature(tab: CompanionTab, snapshot: PresentationSnapshot): stri
   switch (tab) {
     case "concepts": return JSON.stringify([snapshot.concepts, snapshot.feed.filter(item => item.kind === "transcript").map(item => item.id)]);
     case "summary": return JSON.stringify([snapshot.summary ?? null, snapshot.notebook?.todos, snapshot.notebook?.notes, snapshot.glasses.mode, connected]);
-    case "qa": return JSON.stringify([snapshot.suggestions, snapshot.asks, connected,
+    case "qa": return JSON.stringify([snapshot.suggestions, snapshot.asks, connected, modeProfile(snapshot.glasses.mode).id,
       snapshot.feed.filter(item => item.kind === "question").map(item => [item.id, item.questionKind, item.body])]);
     case "checks": return JSON.stringify([snapshotClaims(snapshot), (snapshot as PresentationSnapshot & { verifying?: readonly string[] }).verifying ?? [], snapshot.conflicts, snapshot.verifications, snapshot.factChecks]);
     default: return "";
@@ -2083,6 +2145,7 @@ export function panelScrollTop(metrics: { readonly scrollTop: number; readonly p
 function feedItemSignature(item: FeedItem, meta?: AnswerMeta): string {
   return [
     item.kind,
+    item.partial ? "cut-off" : "",
     item.label,
     item.body,
     item.meta ?? "",

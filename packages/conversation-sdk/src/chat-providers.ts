@@ -7,7 +7,7 @@
  * and upstream error bodies are only inspected to classify, never shown.
  */
 import type { Citation } from "./copilot-types.js";
-import { answerOutputTokens, DirectProviderError, httpFailure, isContextOverflow, parseChatUsage, parseCitation, promptContextFailure, type AnswerRequestOptions, type DirectFetch } from "./direct-providers.js";
+import { answerOutputTokens, DirectProviderError, httpFailure, isContextOverflow, parseChatUsage, parseCitation, parseStreamEvent, promptContextFailure, stoppedAnswerFailure, unreadableStream, type AnswerRequestOptions, type DirectFetch } from "./direct-providers.js";
 import { answerModelInfo, type RawUsage } from "./model-catalog.js";
 import type { AnswerProviderInfo } from "./provider-registry.js";
 
@@ -122,7 +122,10 @@ export async function* chatAnswerStream(fetcher: DirectFetch, provider: AnswerPr
   const response = await providerFetch(fetcher, provider, "/chat/completions", key, body, signal, "answer", model);
   if (!response.body) throw new DirectProviderError("provider-response", `${provider.label} returned no answer stream.`);
   const reader = response.body.getReader(), decoder = new TextDecoder();
-  let buffer = "", completed = false, carriage = "", produced = "", usage: RawUsage | undefined;
+  let buffer = "", completed = false, carriage = "", produced = "", usage: RawUsage | undefined, malformed = 0;
+  // `gap`: an event was skipped after text started, so words may be missing. `cut`: onIncomplete was called.
+  let gap = false, cut = false;
+  const incomplete = () => { if (cut) return; cut = true; try { options.onIncomplete?.(); } catch { /* host callback isolation */ } };
   let sources: Citation[] = [], searchCalls = 0;
   try {
     while (true) {
@@ -137,8 +140,9 @@ export async function* chatAnswerStream(fetcher: DirectFetch, provider: AnswerPr
         const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
         if (!data) continue;
         if (data === "[DONE]") { completed = true; continue; }
-        const event: unknown = JSON.parse(data);
-        if (!isRecord(event)) continue;
+        // One garbled event is skipped; it must not look like a network failure.
+        const event = parseStreamEvent(data);
+        if (!event) { malformed++; gap ||= produced.trim() !== ""; continue; }
         if (event.error) {
           if (isContextOverflow(event.error)) throw promptContextFailure();
           throw new DirectProviderError("provider-response", `${provider.label} could not complete the answer.`);
@@ -154,12 +158,21 @@ export async function* chatAnswerStream(fetcher: DirectFetch, provider: AnswerPr
           if (details.sources.length) sources = details.sources;
           searchCalls = Math.max(searchCalls, details.calls);
         }
-        if (choice?.finish_reason === "length") throw new DirectProviderError("provider-response", "Answer exceeded its length limit. Ask a shorter question, or choose a longer answer length in Setup.");
+        // Stopped by the provider's filter: not a cut-off answer and not a complete one.
+        if (choice?.finish_reason === "content_filter") throw stoppedAnswerFailure(provider.label, "content_filter");
+        if (choice?.finish_reason === "length") {
+          // Cut at the length limit after text streamed: the text so far is the (partial) answer.
+          if (!produced.trim() || !options.onIncomplete) throw new DirectProviderError("provider-response", "Answer exceeded its length limit. Ask a shorter question, or choose a longer answer length in Setup.");
+          incomplete();
+        }
         if (typeof choice?.finish_reason === "string") completed = true;
       }
       if (done) break;
     }
+    if (malformed && !produced.trim()) throw unreadableStream(provider.label);
     if (!completed) throw new DirectProviderError("provider-response", `${provider.label} answer stream ended before completion.`);
+    // Words may be missing where the event was skipped: the answer is shown, marked cut off, and not kept as complete.
+    if (gap) incomplete();
     try { options.onCitations?.(sources); } catch { /* host callback isolation */ }
     try {
       if (usage) options.onUsage?.({ ...usage, webSearchCalls: searchCalls }, true);

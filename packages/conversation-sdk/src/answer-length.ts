@@ -34,7 +34,12 @@ export interface AnswerLengthProfile {
   readonly verdictReasoningTokens: number;
   /** Wording used inside the copilot concept prompt, e.g. "one or two sentences". */
   readonly conceptSentences: string;
+  /** The three labelled parts of an interviewer answer key (modes.ts answerKeyInput), sized for this length. */
+  readonly answerKey: string;
 }
+
+/** An interviewer answer key is always three labelled sentences: "Strong answer:", "Probe:", "Flag:". */
+export const ANSWER_KEY_SENTENCES = 3;
 
 const PROFILES: Readonly<Record<AnswerLength, AnswerLengthProfile>> = Object.freeze({
   brief: Object.freeze({
@@ -44,6 +49,7 @@ const PROFILES: Readonly<Record<AnswerLength, AnswerLengthProfile>> = Object.fre
     lookupSentences: 2, proposeSentences: 2, lookupTokens: 250, lookupReasoningTokens: 1500, lookupChars: 600,
     verdictSentences: "one short sentence", verdictTokens: 350, verdictReasoningTokens: 1500,
     conceptSentences: "one short sentence",
+    answerKey: '"Strong answer:" the 2 most important points a strong answer covers (semicolon-separated, a few words each), "Probe:" one follow-up question of at most 8 words, "Flag:" one red flag in a few words.',
   }),
   standard: Object.freeze({
     id: "standard", label: "Standard", blurb: "Your sentence limit (3 by default).",
@@ -52,6 +58,7 @@ const PROFILES: Readonly<Record<AnswerLength, AnswerLengthProfile>> = Object.fre
     lookupSentences: 3, proposeSentences: 4, lookupTokens: 400, lookupReasoningTokens: 2000, lookupChars: 1200,
     verdictSentences: "one or two sentence", verdictTokens: 500, verdictReasoningTokens: 2000,
     conceptSentences: "one or two sentences",
+    answerKey: '"Strong answer:" the 2-4 points a strong answer covers (semicolon-separated), "Probe:" one follow-up question, "Flag:" one red flag to listen for.',
   }),
   detailed: Object.freeze({
     id: "detailed", label: "Detailed", blurb: "Up to 6 sentences or more (the sentence limit is raised to at least 6), with reasons, numbers or steps. Slower and costs more; the glasses page long answers.",
@@ -60,6 +67,7 @@ const PROFILES: Readonly<Record<AnswerLength, AnswerLengthProfile>> = Object.fre
     lookupSentences: 5, proposeSentences: 6, lookupTokens: 800, lookupReasoningTokens: 3000, lookupChars: 2400,
     verdictSentences: "three or four sentence", verdictTokens: 800, verdictReasoningTokens: 2500,
     conceptSentences: "two to four sentences",
+    answerKey: '"Strong answer:" the 4-6 points a strong answer covers (semicolon-separated, each with the detail or number to listen for), "Probe:" one follow-up question and what it should reveal, "Flag:" one red flag and why it matters.',
   }),
 });
 
@@ -73,11 +81,14 @@ export function answerLengthProfile(value: unknown): AnswerLengthProfile { retur
 /**
  * Sentence cap for a live answer. `base` is the session's "Max answer sentences" (1-10, default 3):
  * Standard uses it as-is, Brief caps it at 2, Detailed raises it to at least 6.
+ * An interviewer answer key (`answerKey`) is never capped below its three labelled sentences;
+ * Brief shortens the parts of the key instead (AnswerLengthProfile.answerKey).
  */
-export function answerSentenceLimit(length: unknown, base: number | undefined): number {
+export function answerSentenceLimit(length: unknown, base: number | undefined, answerKey = false): number {
   const limit = Number.isInteger(base) && base! >= 1 ? Math.min(10, base!) : 3;
   const id = cleanAnswerLength(length);
-  return id === "brief" ? Math.min(limit, 2) : id === "detailed" ? Math.max(limit, 6) : limit;
+  const capped = id === "brief" ? Math.min(limit, 2) : id === "detailed" ? Math.max(limit, 6) : limit;
+  return answerKey ? Math.max(capped, ANSWER_KEY_SENTENCES) : capped;
 }
 
 /** Output-token limit for a live answer. */

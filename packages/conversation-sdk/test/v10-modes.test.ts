@@ -35,14 +35,14 @@ function harness(live: { mode?: ConversationMode; answerQuestions?: boolean } = 
 describe("v0.10 mode profiles", () => {
   it("covers every protocol mode; the picker lists the user modes with short glasses tags", () => {
     for (const mode of CONVERSATION_MODES) expect(MODE_PROFILES[mode].id).toBe(mode);
-    expect(PICKER_MODES).toEqual(["general", "technical", "interviewer", "partner", "negotiation", "learning", "social", "passive", "notes"]);
+    expect(PICKER_MODES).toEqual(["general", "technical", "interviewer", "interviewee", "partner", "negotiation", "learning", "social", "passive", "notes"]);
     for (const mode of PICKER_MODES) {
       const profile = MODE_PROFILES[mode];
       expect(profile.picker).toBe(true);
       expect(profile.short.length).toBeLessThanOrEqual(6);
       expect(profile.askLabel.length).toBeLessThanOrEqual(9);
     }
-    expect(MODE_PROFILES.interviewee.picker).toBe(false);
+    expect(MODE_PROFILES["office-discussion"].picker).toBe(false);
     expect(modeProfile("nonsense").id).toBe("general");
     expect(modeProfile(undefined).id).toBe("general");
   });

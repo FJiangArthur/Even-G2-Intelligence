@@ -2,6 +2,32 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
+## v0.14.0 — interview reliability: Candidate mode, answer queue, suggested questions on the glasses, scenario harness
+
+Nothing in this release was run on real glasses or against a live provider. Numbers come from the scripted interview harness (`apps/g2-plugin/qa/interview.html`, `tests/interview-scenario.test.ts`): the real controller, display and transport on a fake bridge and a fake provider.
+
+Harness result, questions answered exactly once out of those a script expects (typed lines, speed 1):
+
+| Run | 0.13.2 interviewer / candidate | 0.14.0 interviewer / candidate |
+|---|---|---|
+| Clean | 5 of 8 / 6 of 7 | 8 of 8 / 7 of 7 |
+| One failed request (HTTP 500 once) | first question also lost | none lost (one retry) |
+| Cut-off answer | text wiped by the error | kept, marked "cut off" |
+| 6 lines 150 ms apart | 1 of 3 answered | 3 of 3, in order |
+
+- **Candidate mode.** The hidden `interviewee` mode is now a picker mode, **Candidate** (`CAND`): first-person replies to the interviewer's questions, examples only from saved knowledge (résumé, job description), never invented experience. The Q&A panel shows "They may ask" and "Ask them".
+- **Answers queue instead of cancelling each other.** Automatic questions are answered one at a time, in order; every question in a line is answered, not just the last; an interviewer's answer key is no longer cancelled by the candidate's next question. A manual ask still pre-empts. At most 3 wait; one older than 20 s is dropped at its turn.
+- **Long utterances are no longer cut into pieces.** With streaming speech-to-text the client's 6 s segment cap (meant for uploaded audio) ended the turn, so a long question was detected and answered in fragments (22 spoken lines became 33 transcripts in the harness). The transport now owns turn boundaries.
+- **Question detection.** Requests without a question mark ("I'd like to hear about…", "Describe a time…") are detected. Questions people put to themselves ("Where do I even start?", "How should I put it?") are ignored. The same question within 10 s is not answered twice.
+- **Provider faults.** One retry on a network error, 5xx, 408 or 429 before any text arrived; first-token timeout 15 s (30 s for web-grounded answers); a malformed stream event before any text is skipped and an unusable stream is reported as a provider error, not "check your connection"; a cut-off answer is kept as `answer.completed` with `partial: true`.
+- **Glasses.** A new suggested question pops up in ambient display (top one only, never over an answer, at most one per 20 s). Only session-ending errors clear an answer; others show as a 6 s notice. A newer answer waits until the current one has had its reading time (`+1` mark).
+- **Suggested questions** are marked once said aloud and then dropped, expire after 3 minutes, and clear on a mode change. A copilot reply with bad JSON no longer loses that stretch of speech.
+- **Prompts.** With an unknown speaker in Interviewer mode Helix gives a plain answer, never an answer key. The interviewer fairness rule and the Candidate no-invention rule survive a custom mode prompt. Brief length no longer contradicts the three-part answer key. Knowledge search uses the bare question.
+- **Phone.** A wearer question that got an answer key no longer says "Not auto-answered".
+- **After an independent review of the diff (ten findings, all fixed with tests):** a question still queued or streaming counts as a repeat at any age, and the 10 s window runs from when its answer finished; short follow-ups ("Can you give an example?") are answered again once other speech came in between; proactive remarks never take a queue slot from a question; "Give me time to think." and "I want you to take a look at the doc" are no longer read as questions; "What's the term for that?" and "What else?" are no longer treated as rhetorical; an answer with a dropped stream event mid-way is marked cut off; a content-filter stop is reported as a provider error, not as a cut-off answer; an error mid-answer marks that answer cut off on the phone and glasses, where before it stayed "answering"; a glasses answer that waited more than 30 s behind another is dropped from the glasses (it stays in the phone feed).
+
+Device-only gates, not run: suggestion pop-up timing and title widths on G2; speaker separation with the real microphones (everything about who asked depends on it); real model quality of answer keys, candidate replies and suggestions; the 10 s repeat window and the rhetorical-question list against real transcripts.
+
 ## v0.13.2 — microphone: foreground overload guard, per-event probe, non-blocking knowledge search
 
 Report (real iPhone, screen on or locked): 20–60 s after listening starts, captions stop, the phone page stops responding and the phone heats up. A USB system log showed each microphone call going from 0.5–1 ms to 36–47 ms after one long call at the first answer request, with about 25 calls a second served against 42 arriving. **The root cause is not confirmed and nothing in this release was run on a phone.** Evidence: `npm run check` (conversation-sdk 435 tests, gateway 104, g2-plugin 357), Node and JavaScriptCore timings on a Mac, and a desktop-browser simulation (`qa/mic-guard.html`).

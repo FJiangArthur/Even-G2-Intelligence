@@ -1,4 +1,5 @@
 import type { ConversationMode, ResponseStrategy } from "./types.js";
+import { answerLengthProfile } from "./answer-length.js";
 
 /**
  * v0.10 mode profiles: one place that says how Helix behaves in each kind of conversation.
@@ -36,12 +37,30 @@ export interface ModeProfile {
   readonly presets: ModePresets;
   /** False for legacy modes kept only for stored settings and the gateway protocol. */
   readonly picker: boolean;
+  /**
+   * A rule that stays in the answer prompt when the user replaces the mode prompt with their own
+   * (Interviewer fairness, Candidate honesty). The built-in `answer` already states it.
+   */
+  readonly guard?: string;
+  /**
+   * True when suggestions come in two kinds (CopilotSuggestion.kind): questions the other side may
+   * ask next and questions the wearer could ask. Other modes only have the second kind.
+   */
+  readonly suggestionKinds?: boolean;
 }
+
+/** The two kinds of suggestion in Candidate mode, with the panel heading for each. */
+export const SUGGESTION_KINDS = ["they-ask", "ask-them"] as const;
+export type SuggestionKind = typeof SUGGESTION_KINDS[number];
+export const SUGGESTION_KIND_LABELS: Readonly<Record<SuggestionKind, string>> = Object.freeze({ "they-ask": "They may ask", "ask-them": "Ask them" });
+
+const INTERVIEWER_GUARD = "Judge only job-relevant evidence; never comment on age, gender, race, religion, disability, family, nationality, accent or other protected characteristics.";
+const CANDIDATE_GUARD = "Never invent experience, employers, numbers or titles for the wearer; when the saved knowledge has nothing relevant, give a truthful structure (what to cover) instead of made-up specifics.";
 
 const DEFAULT_SUGGESTIONS = "at most 5 useful questions the WEARER could ask the other party next, phrased exactly as the wearer would say them aloud to that person (e.g. 'What lead time are you seeing for the Jetson boards?'), spanning the whole conversation, each with a short why. Never questions for the wearer to answer, and never questions that were already asked or answered in the conversation.";
 const ALL_ON: ModePresets = Object.freeze({ summarize: true, concepts: true, conflicts: true, suggestions: true, implicitAsks: true, webGrounding: true, claims: true, people: true, autoAnswer: true, responseStrategy: "reactive" });
 
-const profile = (value: Omit<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions"> & Partial<Pick<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions">>): ModeProfile =>
+const profile = (value: Omit<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions" | "guard" | "suggestionKinds"> & Partial<Pick<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions" | "guard" | "suggestionKinds">>): ModeProfile =>
   Object.freeze({ picker: true, selfQuestions: "ignore", copilot: "", suggestions: DEFAULT_SUGGESTIONS, ...value });
 
 export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Object.freeze({
@@ -64,7 +83,8 @@ export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Ob
   interviewer: profile({
     id: "interviewer", label: "Interviewer", short: "INTVW", askLabel: "PROBE", selfQuestions: "answer-key",
     blurb: "You run the interview: answer keys for your questions, probes, and evidence on the candidate.",
-    answer: "Support the INTERVIEWER (the wearer), never the candidate. For the interviewer's own questions give an answer key: what a strong answer covers, one probing follow-up and one red flag. For the candidate's questions about the role, answer briefly and only from known context. Judge only job-relevant evidence; never comment on age, gender, race, religion, disability, family, nationality, accent or other protected characteristics.",
+    answer: `Support the INTERVIEWER (the wearer), never the candidate. For the interviewer's own questions give an answer key: what a strong answer covers, one probing follow-up and one red flag. For the candidate's questions about the role, answer briefly and only from known context. ${INTERVIEWER_GUARD}`,
+    guard: INTERVIEWER_GUARD,
     copilot: "The wearer is the interviewer; the other speaker is the candidate. Assess only job-relevant evidence from what the candidate actually said. Never infer or mention protected characteristics (age, gender, race, religion, disability, family status, nationality, accent).",
     suggestions: "at most 5 follow-up probes the INTERVIEWER (wearer) could ask the candidate next, phrased as they would say them aloud: ask for specifics the candidate glossed over, their own contribution versus the team's, numbers and outcomes, trade-offs they chose, and depth on claimed skills. Each with a short why. Never questions already asked or answered.",
     summary: "candidate evidence: concrete strengths and concerns, each tied to what the candidate said (scale, tools, outcomes, ownership); keyFacts are the candidate's checkable claims",
@@ -121,14 +141,18 @@ export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Ob
     summary: "decisions, action items with owners and due dates, open questions and numbers",
     presets: Object.freeze({ summarize: true, concepts: false, conflicts: false, suggestions: false, implicitAsks: false, webGrounding: true, claims: false, people: true, autoAnswer: false, responseStrategy: "reactive", noteTaking: true }),
   }),
-  // Legacy modes: kept for stored settings and the gateway protocol, not offered in the picker.
+  // Candidate keeps the id `interviewee` so stored settings and the legacy `interview` alias keep working.
   interviewee: profile({
-    id: "interviewee", label: "Interviewee", short: "MEET", askLabel: "ASK THEM", picker: false,
-    blurb: "Legacy mode.",
-    answer: "Support the person answering an interview. Give a confident, truthful, first-person-ready response without inventing experience.",
-    summary: "decisions, owners, numbers, dates and open issues",
-    presets: ALL_ON,
+    id: "interviewee", label: "Candidate", short: "CAND", askLabel: "PREP",
+    blurb: "You are being interviewed: answers you can say aloud from your saved résumé, what they may ask next, and questions to ask them.",
+    answer: `The wearer is the CANDIDATE being interviewed; the other speaker is the interviewer. Answer the interviewer's question in the first person, as words the wearer can say aloud: the direct answer first, then one concrete example taken from the saved knowledge and memories supplied below (the wearer keeps their résumé and the job description there). For behavioural questions ("tell me about a time...") give situation, action, result in brief. ${CANDIDATE_GUARD}`,
+    copilot: "The wearer is the candidate in a job interview; the other speaker is the interviewer. Track what the interviewer seems to be evaluating (skills, ownership, judgement, motivation, fit) from the questions they ask. Never invent experience or facts about the wearer.",
+    suggestions: `at most 5 questions of two kinds. kind "they-ask": up to 3 questions the INTERVIEWER is likely to ask next, phrased as the interviewer would say them, so the wearer can prepare; why says what the interviewer would be checking. kind "ask-them": 1 or 2 good questions the CANDIDATE (wearer) could ask the interviewer about the role, team, expectations or next steps, phrased as the wearer would say them aloud; why says what the answer tells the wearer. Never questions already asked or answered.`,
+    summary: "the interview so far: questions the interviewer asked, how each answer went, follow-ups the wearer owes and next steps; keyFacts are facts about the role, team, process and dates",
+    presets: Object.freeze({ ...ALL_ON, implicitAsks: false }),
+    guard: CANDIDATE_GUARD, suggestionKinds: true,
   }),
+  // Legacy mode: kept for stored settings and the gateway protocol, not offered in the picker.
   "office-discussion": profile({
     id: "office-discussion", label: "Meeting", short: "MEET", askLabel: "ASK THEM", picker: false,
     blurb: "Legacy name of Meeting.",
@@ -139,16 +163,20 @@ export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Ob
 });
 
 /** Modes offered in the phone picker and the glasses menu, in display order. */
-export const PICKER_MODES: readonly ConversationMode[] = Object.freeze(["general", "technical", "interviewer", "partner", "negotiation", "learning", "social", "passive", "notes"]);
+export const PICKER_MODES: readonly ConversationMode[] = Object.freeze(["general", "technical", "interviewer", "interviewee", "partner", "negotiation", "learning", "social", "passive", "notes"]);
 
 export function modeProfile(mode: string | undefined): ModeProfile {
   return (mode && Object.prototype.hasOwnProperty.call(MODE_PROFILES, mode) ? MODE_PROFILES[mode as ConversationMode] : undefined) ?? MODE_PROFILES.general;
 }
 
-/** Answer-lane request for the interviewer's own question (Interviewer mode). */
-export function answerKeyInput(question: string): string {
+/**
+ * Answer-lane request for the interviewer's own question (Interviewer mode). The key always has
+ * ANSWER_KEY_SENTENCES labelled sentences; the answer length changes how much each part holds, and
+ * answerSentenceLimit(length, base, true) gives the matching sentence limit for the instructions.
+ */
+export function answerKeyInput(question: string, length?: unknown): string {
   return `ANSWER KEY. The wearer is interviewing a candidate and just asked them: ${JSON.stringify(question.trim())}
-Give the interviewer, in three short sentences: "Strong answer:" the 2-4 points a strong answer covers (semicolon-separated), "Probe:" one follow-up question, "Flag:" one red flag to listen for. Do not answer as the candidate.`;
+Give the interviewer exactly three short labelled sentences: ${answerLengthProfile(length).answerKey} A lower sentence limit in the instructions does not apply to this answer key. Do not answer as the candidate.`;
 }
 export const ANSWER_KEY_PREFIX = "ANSWER KEY.";
 
@@ -164,7 +192,7 @@ export function modeSystemPrompt(
   protectedBasePrompt: string,
   mode: ConversationMode,
   strategy: ResponseStrategy,
-  /** v0.11: the user's own prompt for this mode (replaces the built-in mode instruction). */
+  /** v0.11: the user's own prompt for this mode (replaces the built-in mode instruction; the mode's `guard` rule is kept). */
   customInstruction?: string,
 ): string {
   const strategyInstruction = strategy === "reactive"
@@ -172,9 +200,11 @@ export function modeSystemPrompt(
     : strategy === "proactive"
       ? "Automatically intervene only for useful non-question decisions, actions, blockers, or risks. Detected questions wait for a manual query."
       : "Automatically answer detected questions and also intervene for useful non-question decisions, actions, blockers, or risks.";
+  // A user prompt replaces the built-in instruction but never the mode's guard rule.
+  const custom = customInstruction?.trim().slice(0, 4000).trim(), guard = MODE_PROFILES[mode].guard;
   return [
     protectedBasePrompt.trim(),
-    `Protected conversation mode: ${mode}. ${customInstruction?.trim() ? customInstruction.trim().slice(0, 4000) : MODE_INSTRUCTIONS[mode]}`,
+    `Protected conversation mode: ${mode}. ${custom ? `${custom}${guard ? ` ${guard}` : ""}` : MODE_INSTRUCTIONS[mode]}`,
     `Protected response strategy: ${strategy}. ${strategyInstruction}`,
     "Start with the answer itself in natural spoken language. Omit filler, preambles and coaching phrases such as 'you could say'. If evidence is missing, state uncertainty briefly instead of inventing facts.",
   ].join("\n\n");

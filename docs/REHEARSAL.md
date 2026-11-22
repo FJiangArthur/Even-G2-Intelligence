@@ -19,8 +19,12 @@ All three layers use one source, `apps/g2-plugin/src/rehearsal-scripts.json`. `r
 | `mock-interview-ml` | interview | Perception/ML interview practice: TensorRT and edge deployment questions, the acronym `CDTF`, a request not phrased as a question ("I'd like to hear about a time you dealt with a tight latency budget."), and a self-contradiction (30 FPS, later "about 12 FPS on Orin") |
 | `hardware-planning` | technical | Robot compute planning: an implicit lookup ("Jetson devices are hard to order and have a long lead time right now"), an implicit proposal ("the architecture is 16 GB RAM with a 1 TB SSD"), a budget conflict ($40,000 vs $25,000), and the terms CDTF, NVMe and ROS 2 |
 | `team-standup` | meeting | Decisions, owners, a ship-date change (Friday, then next Wednesday), and questions |
+| `interview-interviewer` | interview | Interview harness (section 4): you interview a backend candidate, mode `interviewer` |
+| `interview-candidate` | interview | Interview harness (section 4): you are the candidate, mode `interviewee` |
 
 Each script has `expectations` (concepts, conflict, lookups, proposes, questions, implicitQuestions). The tests and the harness check results against them.
+
+The two `interview-*` scripts also state an outcome on every line (section 4). They contain lines that must not be answered, so the suites of section 2, which expect every detected question to be answered, leave them out.
 
 ## 1. In-app rehearsal
 
@@ -114,6 +118,101 @@ Behavior:
   - 4: unmet script expectations, only with `--strict`
 
 Options: `--model` (default `DEFAULT_ANSWER_MODEL`), `--copilot-model` (default `DEFAULT_COPILOT_MODEL`), `--mode`, `--no-copilot`, `--no-web`, `--drain-ms`.
+
+## 4. Interview harness (no key, no network)
+
+The interview harness answers one question: in an interview, was each question answered once, in order, and could the wearer read the answer in time. It runs the real app on a fake G2 bridge and the fake provider of section 2, and it can make the provider fail.
+
+| Part | File |
+|---|---|
+| Browser page | `apps/g2-plugin/qa/interview.html`, `qa/interview.ts` |
+| Timeline, report, fake glasses, fake microphone and speech-to-text | `apps/g2-plugin/tests/interview-harness.ts` |
+| The same scenarios under vitest | `apps/g2-plugin/tests/interview-scenario.test.ts`, `tests/interview-rig.ts` |
+| Fault injection | `createFakeOpenAI().injectFault()` in `tests/fake-openai.ts` |
+
+### Run it in a browser
+
+```bash
+npm run build -w @helix/conversation-sdk
+npm run dev -w @helix/g2-plugin
+# open http://localhost:5173/qa/interview.html
+```
+
+The page connects and starts listening by itself. The real app is on top, with its "On your glasses" mirror. The panel below it, in a dashed orange frame marked TEST HARNESS, has the script picker, speed, the fault buttons and the live report.
+
+| URL flag | Meaning |
+|---|---|
+| `?script=interview-interviewer` | Script to select (any id from the table above) |
+| `?mode=interviewee` | Mode to start in. Playing a script switches to the script's own mode |
+| `?speed=4` | Pauses between lines divided by this |
+| `?path=audio` | Speak the lines through the fake microphone and the fake speech-to-text socket instead of typing them |
+| `?fault=http-500-once` | Faults to inject first, comma separated. `slow-first-token:2500`, `cut-off:4` and `burst:6:150` take numbers |
+| `?autoplay=1` | Inject the faults, play the script, then log `INTERVIEW_DONE`. `window.__interviewResult` resolves with the report |
+| `?writeMs=150` | Time one glasses write takes. Default 0 |
+
+From the console:
+
+```js
+await __interview.play("interview-candidate", { speed: 2 })   // resolves with the report
+await __interview.say("How do you test a migration?", "other") // speaker: self | other | unknown
+await __interview.setMode("interviewer")
+await __interview.fault("http-500-once")   // slow-first-token | http-500-once | http-500-always | http-401
+                                           // malformed-event | cut-off | bad-copilot-json | burst | none
+await __interview.burst(6, 150)            // 6 alternating lines, 150 ms apart
+__interview.timeline()                     // ordered records { t, kind, text, id, data }
+__interview.report()                       // per-question rows, violations, summary
+```
+
+### The two scripts
+
+`interview-interviewer` (21 lines) and `interview-candidate` (22 lines) are ordinary interview talk with awkward lines in it. Each line has `expect`: `answer`, `answer-key` (the wearer's own question in Interviewer mode) or `none`. `questions` lists the questions that should each get one answer. `case` names the awkward line:
+
+| case | Line | Expected |
+|---|---|---|
+| `no-question-mark` | "I'd like to hear about…" | answered once |
+| `two-questions` | Two questions in one line | both answered, in order |
+| `rhetorical` | A rhetorical question from the other side right after the wearer's question | not answered |
+| `repeat` | The same question again a few lines later | answered once more |
+| `topic-change` | "Let's move on to system design." | not answered |
+| `fragment` | "And then?" | not answered |
+| `long-question` | Three sentences of context, then the question | answered once |
+| `own-question` (candidate script) | The wearer asks the interviewer something | no answer key |
+
+### Reading the report
+
+One row per expected question, plus one row for every other question the app detected.
+
+| Column | Meaning |
+|---|---|
+| `expect` | `answer`, `answer-key`, `none`, or `unspecified` for a line typed with `say()` |
+| `timesAnswered` | Answers that finished for this question. `attempts` counts answers that produced at least one token |
+| `via` | `answer`, or `copilot-ask` when the line was not detected as a question and the copilot's implicit-ask lane answered it later |
+| `msToFirstToken` | Line heard to first answer token |
+| `msToVisible` | Line heard to answer text in the glasses BODY container |
+| `msTokenToVisible` | First token to answer text on the glasses. More than 1500 ms is a violation |
+| `finalState` | `answered`, `partial` (cut off, kept), `failed` (error), `superseded` (a later answer replaced it before it finished), `not-answered` (detected, never started), `not-detected`, `ignored` (nothing was expected and nothing happened), `streaming` |
+| `faults` | Injected faults that hit a provider request for this question |
+| `ok` | Expected one answer and got exactly one complete answer, or expected none and no answer was started |
+
+`violations` lists every row that is not ok and, across rows: answers out of order, an answer never shown or shown late, an answer that an error cleared from the glasses, a line that was never heard, and, in Interviewer mode, no suggested question popping up on the glasses. `summary` counts them: `answeredOnce`, `missed`, `answeredTwice`, `unexpectedAnswers`, `lostToFault`, `answersClearedByError`, the medians, and the suggestion counts.
+
+The timeline has these kinds: `line.heard`, `question.detected`, `answer.first-token`, `answer.completed`, `answer.partial`, `answer.failed`, `glasses.answer-visible`, `glasses.answer-hidden` (reason `replaced`, `expired`, `error` or `cleared`), `suggestions.changed`, `glasses.suggestion-shown` (with `ambient`: the HUD was not woken), `notice.shown` (phone or glasses), `ask.answered`, `fault.injected`, `mode.changed`. "On the glasses" means the text is in what the fake bridge last received for the BODY container.
+
+### Vitest
+
+```bash
+cd apps/g2-plugin && npx vitest run tests/interview-scenario.test.ts
+INTERVIEW_BASELINE_DIR=/tmp/interview npx vitest run tests/interview-scenario.test.ts -t baseline   # report + timeline JSON per run
+```
+
+The tests use fake timers, so a two-minute script takes about 100 ms and gives the same numbers every time. A plain `it` is behaviour that works. An `it.fails` is behaviour that is still being built; its name says what it waits for and which weakness it pins. When the behaviour arrives, the test starts passing, vitest reports it as failed, and you change `it.fails` to `it`.
+
+### What the interview harness cannot show
+
+- Typed lines skip speech-to-text, turn detection and speaker attribution. `?path=audio` runs turn detection and speaker roles on synthetic noise, with a transcript that is always exact: it says nothing about recognition errors or real voices.
+- The fake provider's answers are templates. Nothing here measures whether an answer is correct or useful, or how a real model reacts to the prompts. First-token time is the fake's configured 400 ms.
+- There are no glasses. A write is "visible" when the fake bridge accepted it; Bluetooth latency, the real font and wrapping, and gestures on hardware are not covered. `?writeMs=` only delays each write.
+- The copilot is the fake's keyword analysis, so suggested questions are canned.
 
 ## What is and is not verified
 

@@ -35,6 +35,32 @@ export interface FakeRecordedRequest {
   aborted?: boolean;
   /** Output text the fake produced. */
   output?: string;
+  /** Fault injected into this request (see FakeOpenAI.injectFault). */
+  fault?: FakeFaultKind;
+  /** HTTP status the fake answered with. */
+  status?: number;
+}
+
+/**
+ * Fault injection (interview harness). A fault applies to the next `times` requests of its intent:
+ *  - "http-error": the request is answered with `status` (default 500) before any work;
+ *  - "slow-first-token": a streamed answer waits `firstTokenMs` (default 4000) before its first delta;
+ *  - "malformed-event": a streamed answer carries one SSE event that is not valid JSON after `afterDeltas` deltas, then continues;
+ *  - "cut-off": a streamed answer stops after `afterDeltas` deltas with response.incomplete (chat: finish_reason "length");
+ *  - "bad-json": a JSON-schema response (the copilot analysis) returns text that does not parse.
+ */
+export type FakeFaultKind = "http-error" | "slow-first-token" | "malformed-event" | "cut-off" | "bad-json";
+export interface FakeFault {
+  readonly kind: FakeFaultKind;
+  /** Requests it applies to. Default "answer"; "bad-json" defaults to any request that asks for a JSON schema. */
+  readonly intent?: FakeIntent | "any";
+  /** How many matching requests it hits. Default 1; Infinity = every request until clearFaults(). */
+  readonly times?: number;
+  /** Let this many matching requests through untouched first. Default 0. */
+  readonly skip?: number;
+  readonly status?: number;
+  readonly firstTokenMs?: number;
+  readonly afterDeltas?: number;
 }
 
 export interface FakeLatency {
@@ -77,6 +103,11 @@ export interface FakeOpenAI {
   setFailure(path: string, status: number | undefined): void;
   byIntent(intent: FakeIntent): FakeRecordedRequest[];
   reset(): void;
+  /** Fault injection for the interview harness; see FakeFault. */
+  injectFault(fault: FakeFault): void;
+  clearFaults(): void;
+  /** Faults that still have requests left to hit. */
+  pendingFaults(): readonly FakeFault[];
 }
 
 const BASE = "https://api.openai.com/v1";
@@ -570,6 +601,20 @@ export function createFakeOpenAI(options: FakeOpenAIOptions = {}): FakeOpenAI {
   const now = options.now ?? (() => Date.now());
   const seenPrefixes = new Set<string>();
   const takeTranscript = () => transcripts.shift() ?? options.fallbackTranscript ?? "";
+  const faults: { fault: FakeFault; left: number; skip: number }[] = [];
+  /** The first pending fault that applies to this request, used up once. */
+  const takeFault = (intent: FakeIntent, stream: boolean, schema: boolean): FakeFault | undefined => {
+    for (const [index, entry] of faults.entries()) {
+      // The copilot analysis is the request with a JSON schema; its classified intent varies with its instructions.
+      const fault = entry.fault, target = fault.intent ?? (fault.kind === "bad-json" ? "any" : "answer");
+      if (target !== "any" && target !== intent) continue;
+      if (fault.kind === "bad-json" ? !schema : fault.kind !== "http-error" && !stream) continue;
+      if (entry.skip > 0) { entry.skip--; continue; }
+      if (--entry.left <= 0) faults.splice(index, 1);
+      return fault;
+    }
+    return undefined;
+  };
 
   const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -589,7 +634,7 @@ export function createFakeOpenAI(options: FakeOpenAIOptions = {}): FakeOpenAI {
       ...(headerValue(init, "authorization") ? { authorization: headerValue(init, "authorization") } : {}), startedAt: now() };
     requests.push(record);
     signal?.addEventListener("abort", () => { record.aborted = true; }, { once: true });
-    const done = (response: Response) => { record.endedAt ??= now(); return response; };
+    const done = (response: Response) => { record.endedAt ??= now(); record.status = response.status; return response; };
 
     if (!url.startsWith(BASE)) return done(new Response("not found", { status: 404 }));
     const forced = failures.get(path);
@@ -609,13 +654,20 @@ export function createFakeOpenAI(options: FakeOpenAIOptions = {}): FakeOpenAI {
       return done(Response.json({ value: `ek_fake_${(++counter).toString(36)}`, expires_at: Math.floor(now() / 1000) + 600, session: body.session ?? {} }));
     }
     if (kind === "unknown") return done(Response.json({ error: { message: "unknown path" } }, { status: 404 }));
+    const fault = takeFault(intent, stream, format !== undefined);
+    if (fault) record.fault = fault.kind;
+    if (fault?.kind === "http-error") {
+      const status = fault.status ?? 500;
+      return done(Response.json({ error: { message: "injected failure", code: status === 401 ? "invalid_api_key" : "fake" } }, { status }));
+    }
 
     const model = typeof body.model === "string" ? body.model : "unknown";
     const conversation = conversationText(body);
     const analysis = analyzeConversation(conversation);
     const answer = answerText(intent, body, analysis);
     const ctx: FillContext = { analysis, intent, answer, target: lastUserText(body) };
-    const output = format ? JSON.stringify(fillSchema(format.schema, format.name ?? "root", ctx)) : answer;
+    const output = fault?.kind === "bad-json" ? "{\"summary\": {\"bullets\": [\"cut"
+      : format ? JSON.stringify(fillSchema(format.schema, format.name ?? "root", ctx)) : answer;
     record.output = output;
     const prefix = `${path}|${model}|${instructionsText(body).slice(0, 200)}`;
     const usage = usageFor(body, output, seenPrefixes.has(prefix), webSearch);
@@ -638,20 +690,51 @@ export function createFakeOpenAI(options: FakeOpenAIOptions = {}): FakeOpenAI {
     }
 
     const encoder = new TextEncoder();
-    const pieces = chunkText(output);
+    const firstTokenMs = fault?.kind === "slow-first-token" ? fault.firstTokenMs ?? 4000 : latency.firstTokenMs;
+    const allPieces = chunkText(output);
+    const cutAt = fault?.kind === "cut-off" ? Math.max(1, Math.min(allPieces.length - 1, fault.afterDeltas ?? 6)) : undefined;
+    const pieces = cutAt === undefined ? allPieces : allPieces.slice(0, cutAt);
+    const malformedAt = fault?.kind === "malformed-event" ? Math.max(1, Math.min(pieces.length, fault.afterDeltas ?? 2)) : undefined;
+    const malformed = { wait: 0, data: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"oop\n\n" };
     const events: { wait: number; data: string }[] = [];
-    if (kind === "responses-stream") {
+    if (cutAt !== undefined) {
+      // The provider stopped early: what arrived is all there is.
+      const partial = pieces.join("");
+      record.output = partial;
+      if (kind === "responses-stream") {
+        events.push({ wait: 0, data: sse({ type: "response.created", response: { id: responseId, status: "in_progress", model } }) });
+        pieces.forEach((delta, index) => events.push({ wait: index === 0 ? firstTokenMs : latency.interTokenMs,
+          data: sse({ type: "response.output_text.delta", item_id: messageId, output_index: 0, content_index: 0, delta }) }));
+        events.push({ wait: 0, data: sse({ type: "response.incomplete", response: { id: responseId, object: "response", status: "incomplete", model,
+          incomplete_details: { reason: "max_output_tokens" },
+          output: [{ type: "message", id: messageId, role: "assistant", status: "incomplete", content: [{ type: "output_text", text: partial, annotations: [] }] }], usage: responsesUsage } }) });
+      } else {
+        const base = { id: responseId, object: "chat.completion.chunk", model };
+        pieces.forEach((content, index) => events.push({ wait: index === 0 ? firstTokenMs : latency.interTokenMs,
+          data: sse({ ...base, choices: [{ index: 0, delta: index === 0 ? { role: "assistant", content } : { content }, finish_reason: null }] }) }));
+        events.push({ wait: 0, data: sse({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "length" }] }) });
+        events.push({ wait: 0, data: "data: [DONE]\n\n" });
+      }
+    } else if (kind === "responses-stream") {
       events.push({ wait: 0, data: sse({ type: "response.created", response: { id: responseId, status: "in_progress", model } }) });
       for (const item of searchItem) events.push({ wait: latency.webSearchMs, data: sse({ type: "response.output_item.done", output_index: 0, item }) });
-      pieces.forEach((delta, index) => events.push({ wait: index === 0 ? latency.firstTokenMs : latency.interTokenMs,
-        data: sse({ type: "response.output_text.delta", item_id: messageId, output_index: searchItem.length, content_index: 0, delta }) }));
+      pieces.forEach((delta, index) => {
+        if (index === malformedAt) events.push(malformed);
+        events.push({ wait: index === 0 ? firstTokenMs : latency.interTokenMs,
+          data: sse({ type: "response.output_text.delta", item_id: messageId, output_index: searchItem.length, content_index: 0, delta }) });
+      });
+      if (malformedAt === pieces.length) events.push(malformed);
       annotations.forEach((annotation, index) => events.push({ wait: 0, data: sse({ type: "response.output_text.annotation.added", item_id: messageId, output_index: searchItem.length, content_index: 0, annotation_index: index, annotation }) }));
       events.push({ wait: 0, data: sse({ type: "response.output_text.done", item_id: messageId, output_index: searchItem.length, content_index: 0, text: output }) });
       events.push({ wait: 0, data: sse({ type: "response.completed", response: completedResponse }) });
     } else {
       const base = { id: responseId, object: "chat.completion.chunk", model };
-      pieces.forEach((content, index) => events.push({ wait: index === 0 ? latency.firstTokenMs : latency.interTokenMs,
-        data: sse({ ...base, choices: [{ index: 0, delta: index === 0 ? { role: "assistant", content } : { content }, finish_reason: null }] }) }));
+      pieces.forEach((content, index) => {
+        if (index === malformedAt) events.push(malformed);
+        events.push({ wait: index === 0 ? firstTokenMs : latency.interTokenMs,
+          data: sse({ ...base, choices: [{ index: 0, delta: index === 0 ? { role: "assistant", content } : { content }, finish_reason: null }] }) });
+      });
+      if (malformedAt === pieces.length) events.push(malformed);
       events.push({ wait: 0, data: sse({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) });
       const includeUsage = (body.stream_options as { include_usage?: boolean } | undefined)?.include_usage === true;
       if (includeUsage) events.push({ wait: 0, data: sse({ ...base, choices: [], usage: chatUsage }) });
@@ -668,6 +751,7 @@ export function createFakeOpenAI(options: FakeOpenAIOptions = {}): FakeOpenAI {
       },
       cancel() { record.endedAt ??= now(); },
     });
+    record.status = 200;
     return new Response(streamBody, { status: 200, headers: { "content-type": "text/event-stream" } });
   };
 
@@ -684,7 +768,10 @@ export function createFakeOpenAI(options: FakeOpenAIOptions = {}): FakeOpenAI {
     pendingTranscripts: () => [...transcripts],
     setFailure(path, status) { if (status === undefined) failures.delete(path); else failures.set(path, status); },
     byIntent: intent => requests.filter(request => request.intent === intent),
-    reset() { requests.length = 0; sockets.length = 0; transcripts.length = 0; seenPrefixes.clear(); Object.assign(latency, ZERO_LATENCY, options.latency); },
+    reset() { requests.length = 0; sockets.length = 0; transcripts.length = 0; seenPrefixes.clear(); faults.length = 0; Object.assign(latency, ZERO_LATENCY, options.latency); },
+    injectFault(fault) { const left = fault.times ?? 1; if (left > 0) faults.push({ fault, left, skip: Math.max(0, fault.skip ?? 0) }); },
+    clearFaults() { faults.length = 0; },
+    pendingFaults: () => faults.map(entry => entry.fault),
   };
 }
 

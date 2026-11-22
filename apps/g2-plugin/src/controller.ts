@@ -2206,6 +2206,8 @@ export class G2ConversationController {
       speaker: kind === "answer" ? "Helix" : event.context.speaker.label,
       metadata: { model: event.context.endpoint.model, provider: event.context.endpoint.provider, endpoint: event.context.endpoint.url,
         promptVersion: event.context.prompt.version, latencyMs: String(event.context.latencyMs.totalMs),
+        // v0.14: an answer the provider cut short is saved as what it is.
+        ...(event.type === "answer.completed" && event.partial ? { partial: "true" } : {}),
         ...(memory?.length ? { memoryEntryIds: JSON.stringify(memory.map(item => item.entry.id)) } : {}) } };
     // v0.13: the title stays the placeholder while live (History shows a derived one); the real title is
     // written from the summary when the session ends, never from the first thing that was said.

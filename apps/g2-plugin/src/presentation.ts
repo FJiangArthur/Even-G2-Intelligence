@@ -30,6 +30,10 @@ export interface FeedItem {
   readonly speakerRole?: SpeakerRole;
   readonly questionKind?: FeedQuestionKind;
   readonly occurredAt?: string;
+  /** Answers: the provider cut it short; the body is what arrived. */
+  readonly partial?: boolean;
+  /** Questions: an automatic answer (or answer key) has started for it. */
+  readonly answered?: boolean;
 }
 
 /** Phone tabs. Only the phone shows copilot output; glasses stay answer-first. */
@@ -185,8 +189,14 @@ function upsertById<T extends { readonly id: string }>(list: T[], item: T, limit
   return { list: next.length > limit ? next.slice(-limit) : next, added: true };
 }
 const ACTIVE_STATUSES = ["connected", "listening", "paused"];
+/** Statuses that end the session (or the attempt): only these clear the glasses answer. */
+const ENDING_STATUSES = ["failed", "stopped", "exited", "ready"];
 
 export type PresentationListener = (snapshot: PresentationSnapshot) => void;
+
+/** SDK error codes that never concern an answer in flight: the transcription-backlog notice, and a
+ * manual ask refused before any answer text. Every other non-fatal code may be the answer's own failure. */
+const NOT_ANSWER_ERROR_CODES: readonly string[] = ["conversation-busy", "context-empty"];
 
 export class ConversationPresentation {
   private status = "ready";
@@ -226,6 +236,7 @@ export class ConversationPresentation {
   // ---- Notes mode: to-do list + running notes ----
   private notebook?: NotebookView;
   private notebookSeq = 0;
+  private noticeSeq = 0;
 
   /**
    * Notes mode: the notebook changed. `confirmation` is the one-line glasses confirmation of a to-do
@@ -360,7 +371,8 @@ export class ConversationPresentation {
   /** Replaces the suggestion list; only ids not shown before count as new. */
   public setSuggestions(items: readonly CopilotSuggestion[]): void {
     const known = new Set(this.suggestions.map(item => item.id));
-    const fresh = items.filter(item => !known.has(item.id));
+    // A suggestion that was already said aloud is not news.
+    const fresh = items.filter(item => !known.has(item.id) && !item.askedAt);
     this.suggestions = structuredClone([...items]);
     this.unseen.qa += fresh.length;
     const first = fresh[0];
@@ -494,6 +506,26 @@ export class ConversationPresentation {
       answerResetRevision: (this.glasses.answerResetRevision ?? 0) + 1 };
   }
 
+  /**
+   * A provider failure mid-stream ends the answer: no `answer.completed` follows it, so without this
+   * the answer would count as streaming until the next one (no cues, no web-check correction, a phone
+   * item stuck on "answering"). The text stays on screen, marked as cut off.
+   *
+   * The SDK error event names no answer or lane, so the code decides (see NOT_ANSWER_ERROR_CODES). If
+   * the error was a transcription failure after all, the answer's next delta or its completion puts
+   * the answer back to its real state: both rebuild the feed item and the glasses answer from scratch.
+   */
+  private cutOffStreamingAnswer(): void {
+    const answer = this.glasses.answer;
+    if (!answer?.streaming) return;
+    const item = answer.id ? this.feed.find(entry => entry.id === answer.id && entry.kind === "answer" && entry.streaming) : undefined;
+    if (item) {
+      this.upsert({ ...item, streaming: false, partial: true, label: "Helix · answer cut off" });
+      this.unseen.answers++;
+    }
+    this.glasses = { ...this.glasses, answer: { ...answer, streaming: false, partial: true } };
+  }
+
   private acceptsAnswer(answerId: string, questionId?: string): boolean {
     if (this.retiredAnswers.has(answerId) || (questionId !== undefined && this.retiredQuestions.has(questionId))) return false;
     if (this.waitingForManual) return false;
@@ -533,16 +565,27 @@ export class ConversationPresentation {
     return () => this.listeners.delete(listener);
   }
 
+  /**
+   * Only a session-ending status clears the glasses answer. An error with any other status is
+   * transient (busy, a failed retry, a copilot failure): the request that was waiting is over, the
+   * answer on screen stays, and the glasses show the message as a brief notice.
+   */
   public setStatus(status: string, error?: string): void {
-    if (error || ["failed", "stopped", "exited", "ready"].includes(status)) {
+    const ending = ENDING_STATUSES.includes(status);
+    if (ending) {
       this.glasses = { ...this.glasses, cue: undefined, manualPending: false };
       this.retireAnswer();
+    } else if (error) {
+      this.glasses = { ...this.glasses, manualPending: false };
+    }
+    if (ending || error) {
       this.manualQuestionId = undefined;
       this.waitingForManual = false;
     }
     this.status = status;
     this.error = error;
-    this.glasses = { ...this.glasses, status, error };
+    this.glasses = { ...this.glasses, status, error: ending ? error : undefined,
+      notice: !ending && error ? { id: ++this.noticeSeq, text: error } : undefined };
     this.emit();
   }
 
@@ -613,7 +656,7 @@ export class ConversationPresentation {
         });
         this.glasses = {
           ...this.glasses,
-          error: undefined,
+          error: undefined, notice: undefined,
         };
         break;
       }
@@ -630,7 +673,7 @@ export class ConversationPresentation {
         });
         this.glasses = {
           ...this.glasses,
-          error: undefined,
+          error: undefined, notice: undefined,
         };
         break;
       }
@@ -678,7 +721,7 @@ export class ConversationPresentation {
           ...this.glasses,
           question,
           answer: undefined,
-          error: undefined,
+          error: undefined, notice: undefined,
         };
         break;
       }
@@ -688,13 +731,17 @@ export class ConversationPresentation {
         const id = event.answerId;
         const previous = this.feed.find((item) => item.id === id)?.body ?? "";
         const text = `${previous}${event.delta}`;
+        if (event.questionId) {
+          const asked = this.feed.find(item => item.id === event.questionId && item.kind === "question");
+          if (asked && !asked.answered) this.upsert({ ...asked, answered: true });
+        }
         this.upsert({ id, kind: "answer", label: "Helix · answering", body: text, streaming: true,
           memorySources: this.memorySources.get(event.questionId ?? "") });
         this.glasses = {
           ...this.glasses,
           question: this.questionFor(event.questionId),
           answer: { id: event.answerId, questionId: event.questionId, text, speaker: "Helix", streaming: true },
-          error: undefined,
+          error: undefined, notice: undefined,
         };
         break;
       }
@@ -706,7 +753,8 @@ export class ConversationPresentation {
         this.upsert({
           id: event.answerId,
           kind: "answer",
-          label: "Helix · answer",
+          label: event.partial ? "Helix · answer cut off" : "Helix · answer",
+          ...(event.partial ? { partial: true } : {}),
           body: event.text,
           meta: `${Math.round(event.context.latencyMs.totalMs)} ms`,
           memorySources: this.memorySources.get(event.questionId ?? ""),
@@ -714,8 +762,8 @@ export class ConversationPresentation {
         this.glasses = {
           ...this.glasses,
           question: this.questionFor(event.questionId),
-          answer: { id: event.answerId, questionId: event.questionId, text: event.text, speaker: "Helix", streaming: false },
-          error: undefined,
+          answer: { id: event.answerId, questionId: event.questionId, text: event.text, speaker: "Helix", streaming: false, ...(event.partial ? { partial: true } : {}) },
+          error: undefined, notice: undefined,
         };
         break;
       }
@@ -738,12 +786,13 @@ export class ConversationPresentation {
             speaker: "Helix",
             delivery: noteDelivery,
           },
-          error: undefined,
+          error: undefined, notice: undefined,
         };
         break;
       }
       case "error":
         this.glasses = { ...this.glasses, interaction: undefined };
+        if (!event.fatal && !NOT_ANSWER_ERROR_CODES.includes(event.code)) this.cutOffStreamingAnswer();
         this.upsert({
           id: event.eventId,
           kind: "error",

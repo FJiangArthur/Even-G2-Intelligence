@@ -285,5 +285,94 @@
         "on-call rotation"
       ]
     }
+  },
+  {
+    "id": "interview-interviewer",
+    "title": "Interview harness · you interview a backend candidate",
+    "kind": "interview",
+    "mode": "interviewer",
+    "lines": [
+      { "speaker": "self", "expect": "none", "text": "Thanks for coming in. I'll run this like a normal backend interview, about forty five minutes." },
+      { "speaker": "other", "expect": "none", "text": "Sounds good, happy to be here." },
+      { "speaker": "self", "expect": "answer-key", "case": "plain", "questions": ["last service you owned"], "text": "Can you walk me through the last service you owned end to end?" },
+      { "speaker": "other", "expect": "none", "text": "Sure. I owned the payments ledger service. It took about two thousand writes per second at peak and we kept the p99 under eighty milliseconds." },
+      { "speaker": "self", "expect": "answer-key", "case": "no-question-mark", "questions": ["roll back a release"], "text": "I'd like to hear about a time you had to roll back a release." },
+      { "speaker": "other", "expect": "none", "text": "Last spring a schema migration locked the ledger table, so I rolled it back within ten minutes and wrote the postmortem." },
+      { "speaker": "self", "expect": "answer-key", "case": "two-questions", "questions": ["make a write idempotent", "retry arrives after the first write"], "pauseMs": 900,
+        "text": "How do you make a write idempotent? And what happens when a retry arrives after the first write already committed?" },
+      { "speaker": "other", "expect": "none", "case": "rhetorical", "text": "Good question. Where do I even start?" },
+      { "speaker": "other", "expect": "none", "text": "Honestly, before that I should say the team was only four people, so everybody did a bit of everything." },
+      { "speaker": "self", "expect": "answer-key", "case": "repeat", "questions": ["make a write idempotent"], "text": "How do you make a write idempotent?" },
+      { "speaker": "other", "expect": "none", "text": "We store an idempotency key with every ledger entry, so a late retry gets the original result back." },
+      { "speaker": "self", "expect": "none", "case": "topic-change", "text": "Let's move on to system design." },
+      { "speaker": "self", "expect": "answer-key", "case": "long-question", "questions": ["design the ingestion path"],
+        "text": "Suppose we have to ingest ten thousand events per second from mobile clients. The data has to be queryable within five seconds, and we cannot lose events when a region goes down. How would you design the ingestion path for that?" },
+      { "speaker": "other", "expect": "none", "text": "I'd put a regional queue in front, acknowledge after the write reaches two zones, and fan out to the query store asynchronously." },
+      { "speaker": "self", "expect": "none", "case": "fragment", "text": "And then?" },
+      { "speaker": "other", "expect": "none", "text": "Then a compaction job merges the segments, and the query layer reads both until the merge is done." },
+      { "speaker": "other", "expect": "answer", "case": "candidate-question", "questions": ["how big the team is"], "text": "Can I ask how big the team is right now?" },
+      { "speaker": "self", "expect": "none", "text": "Eight engineers, with two on call each week." },
+      { "speaker": "self", "expect": "answer-key", "case": "plain", "questions": ["first ninety days"], "text": "What would you want to learn in your first ninety days?" },
+      { "speaker": "other", "expect": "none", "text": "The on-call runbooks and the deploy pipeline, then the ledger reconciliation jobs." },
+      { "speaker": "self", "expect": "none", "text": "Great, that's all from my side. We'll be in touch by Friday." }
+    ],
+    "expectations": {
+      "questions": [
+        "how big the team is"
+      ],
+      "selfQuestions": [
+        "last service you owned",
+        "make a write idempotent",
+        "retry arrives after the first write",
+        "design the ingestion path",
+        "first ninety days",
+        "roll back a release"
+      ]
+    }
+  },
+  {
+    "id": "interview-candidate",
+    "title": "Interview harness · you are the candidate (data platform)",
+    "kind": "interview",
+    "mode": "interviewee",
+    "lines": [
+      { "speaker": "other", "expect": "none", "text": "Thanks for making the time. This is the data platform loop, so I'll mostly ask about pipelines and reliability." },
+      { "speaker": "self", "expect": "none", "text": "Great, thanks for having me." },
+      { "speaker": "other", "expect": "answer", "case": "plain", "questions": ["current pipeline look like"], "text": "What does your current pipeline look like from ingestion to the warehouse?" },
+      { "speaker": "self", "expect": "none", "text": "Events land in Kafka, a Flink job cleans and joins them, and we load hourly partitions into the warehouse." },
+      { "speaker": "other", "expect": "answer", "case": "no-question-mark", "questions": ["worst data quality incident"], "text": "I'd like to hear about the worst data quality incident you have handled." },
+      { "speaker": "self", "expect": "none", "text": "A partner changed a timestamp format without telling us, and a week of revenue rows landed in the wrong day." },
+      { "speaker": "other", "expect": "answer", "case": "two-questions", "questions": ["How did you detect it", "how long did the backfill take"], "text": "How did you detect it? And how long did the backfill take?" },
+      { "speaker": "self", "expect": "none", "case": "own-question", "pauseMs": 900, "text": "Do you mean the detection on our side or when finance noticed?" },
+      { "speaker": "other", "expect": "none", "case": "rhetorical", "text": "Hmm, how should I put it?" },
+      { "speaker": "other", "expect": "none", "text": "On your side, the first signal you had." },
+      { "speaker": "self", "expect": "none", "text": "A row count check on the daily partition fired the next morning, about fourteen hours after the bad load." },
+      { "speaker": "other", "expect": "answer", "case": "repeat", "questions": ["how long did the backfill take"], "text": "And how long did the backfill take?" },
+      { "speaker": "self", "expect": "none", "text": "About two days, because we had to replay a week of events through the join." },
+      { "speaker": "other", "expect": "none", "case": "topic-change", "text": "Let's switch to modeling for a few minutes." },
+      { "speaker": "other", "expect": "answer", "case": "long-question", "questions": ["model the tables"],
+        "text": "Say the product team wants a daily active users metric. Some users have several devices, some events arrive two days late, and deleted accounts have to disappear from history. How would you model the tables so that the number stays correct?" },
+      { "speaker": "self", "expect": "none", "text": "I'd keep an immutable event table, a user dimension with validity ranges, and rebuild the last three days on every run." },
+      { "speaker": "other", "expect": "none", "case": "fragment", "text": "And then?" },
+      { "speaker": "self", "expect": "none", "text": "Then a deletion job rewrites the affected partitions and the metric is recomputed from the events." },
+      { "speaker": "other", "expect": "answer", "case": "plain", "questions": ["any questions for me"], "text": "Do you have any questions for me?" },
+      { "speaker": "self", "expect": "none", "case": "own-question", "text": "Yes. How is the on-call rotation organized for the platform team?" },
+      { "speaker": "other", "expect": "none", "text": "It's weekly, with a primary and a secondary, and we rarely get paged at night." },
+      { "speaker": "other", "expect": "none", "text": "Okay, we're at time. Thanks, I enjoyed this." }
+    ],
+    "expectations": {
+      "questions": [
+        "current pipeline look like",
+        "How did you detect it",
+        "how long did the backfill take",
+        "model the tables",
+        "any questions for me",
+        "worst data quality incident"
+      ],
+      "selfQuestions": [
+        "detection on our side",
+        "on-call rotation organized"
+      ]
+    }
   }
 ]

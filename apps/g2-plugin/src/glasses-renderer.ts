@@ -41,7 +41,8 @@ export interface GlassesConversationState {
   readonly transcript?: AttributedText & { readonly final: boolean };
   /** role/trigger (v0.8): who asked and why it was answered ("manual" | "question" | "proactive"). */
   readonly question?: AttributedText & { readonly confidence?: number; readonly role?: "self" | "other" | "unknown"; readonly trigger?: string };
-  readonly answer?: AttributedText & { readonly streaming: boolean; readonly id?: string; readonly questionId?: string };
+  /** partial (v0.14): the provider cut the answer short; the text is what arrived. */
+  readonly answer?: AttributedText & { readonly streaming: boolean; readonly id?: string; readonly questionId?: string; readonly partial?: boolean };
   readonly answerResetRevision?: number;
   readonly cue?: { readonly id: string; readonly text: string };
   readonly manualPending?: boolean;
@@ -49,7 +50,10 @@ export interface GlassesConversationState {
     readonly id: string;
     readonly delivery: NoteDeliveryState;
   };
+  /** Session-ending failure only (status "failed"); it hides the answer. */
   readonly error?: string;
+  /** v0.14: a transient problem (busy, a failed retry, a copilot failure). Shown briefly; the answer stays up. */
+  readonly notice?: { readonly id: number; readonly text: string };
   readonly interaction?: string;
   /** v0.8 lifecycle: set after a cold start that interrupted a live session; tap resumes. */
   readonly resumePrompt?: string;

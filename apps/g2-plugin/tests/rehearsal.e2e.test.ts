@@ -36,8 +36,12 @@ import { G2ConversationController, type G2BridgePort } from "../src/controller";
 import { GlassesRenderer } from "../src/glasses-renderer";
 import { ConversationPresentation } from "../src/presentation";
 import { DEFAULT_CONFIG } from "../src/config";
-import { REHEARSAL_SCRIPTS, RehearsalPlayer, defaultPauseMs, rehearsalScript, type RehearsalScript } from "../src/rehearsal";
+import { REHEARSAL_SCRIPTS as ALL_REHEARSAL_SCRIPTS, RehearsalPlayer, defaultPauseMs, rehearsalScript, type RehearsalScript } from "../src/rehearsal";
 import { analyzeConversation, createFakeOpenAI, synthSpeechPcm, type FakeOpenAI } from "./fake-openai";
+
+// The two interview-harness scripts hold lines that must NOT all be answered (fragments, rhetorical questions,
+// two questions in one line); tests/interview-scenario.test.ts runs them against their per-line outcomes.
+const REHEARSAL_SCRIPTS = ALL_REHEARSAL_SCRIPTS.filter(script => !script.id.startsWith("interview-"));
 
 const FAKE_KEY = "sk-fake-rehearsal";
 const MODEL = "gpt-4.1-mini"; // priced in model-catalog and within the SDK's known context budgets
@@ -164,7 +168,9 @@ describe("rehearsal scripts", () => {
     for (const script of REHEARSAL_SCRIPTS) {
       const detected = script.lines.flatMap(line => extractQuestions(line.text).map(q => q.text));
       for (const needle of script.expectations.questions ?? []) expect(detected.some(q => q.includes(needle)), `${script.id}: ${needle}`).toBe(true);
-      for (const needle of script.expectations.implicitQuestions ?? []) expect(detected.some(q => q.includes(needle)), `implicit stays implicit: ${needle}`).toBe(false);
+      // v0.14: a request phrased as a wish ("I'd like to hear about a time…") is detected on-device too,
+      // so an interviewer's prompt is answered without waiting for the copilot's implicit-ask pass.
+      for (const needle of script.expectations.implicitQuestions ?? []) expect(detected.some(q => q.includes(needle)), `wish-form request is detected: ${needle}`).toBe(true);
     }
   });
 

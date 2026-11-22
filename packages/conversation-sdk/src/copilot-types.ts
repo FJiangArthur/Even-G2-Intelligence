@@ -124,6 +124,13 @@ export interface CopilotSuggestion {
   readonly question: string;
   readonly why: string;
   readonly createdAt: string;
+  /** Set once the wearer (or, in Candidate mode, the other side) has said this question aloud. */
+  readonly askedAt?: string;
+  /**
+   * Candidate mode only. "they-ask" = a question the interviewer is likely to ask next (panel heading
+   * "They may ask"); "ask-them" = a question the wearer could ask ("Ask them"). Absent = ask-them.
+   */
+  readonly kind?: "they-ask" | "ask-them";
 }
 
 /**
@@ -222,7 +229,7 @@ export interface CopilotCallbacks {
   readonly onSummary?: (summary: CopilotSummary) => void;
   readonly onConcept?: (concept: CopilotConcept) => void;
   readonly onConflict?: (conflict: CopilotConflict) => void;
-  /** Replaces the whole suggestion list (bounded to 5, newest relevance first). */
+  /** Replaces the whole suggestion list (bounded to 5, open ones first, then those just asked). May be empty: suggestions expire and are cleared on a mode change. */
   readonly onSuggestions?: (items: readonly CopilotSuggestion[]) => void;
   /** Called with pending first, then done/failed for the same id. */
   readonly onAsk?: (ask: CopilotAsk) => void;
