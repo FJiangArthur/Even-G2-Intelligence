@@ -325,7 +325,10 @@ export class DirectConversationTransport implements ConversationTransport, Copil
     if (command.type === "audio.commit") {
       if (command.sequence !== runtime.sequence || command.sequence <= runtime.committed) return;
       runtime.committed = command.sequence;
-      if (runtime.realtime) { this.realtimeCommit(runtime, command.speaker); return; }
+      // v0.14: with realtime speech-to-text the transport owns turn boundaries (silence, sentence end, 25 s).
+      // The client's automatic commit is a 6 s segment cap meant for uploaded audio; honouring it here cut
+      // every longer utterance into pieces, so a long question was detected and answered in fragments.
+      if (runtime.realtime) { if (command.reason !== "vad") this.realtimeCommit(runtime, command.speaker); return; }
       const speech = runtime.speech, pcm = new Int16Array(runtime.samples);
       // A generic commit speaker takes the dominant per-frame role since the last commit.
       const speaker = runtime.roles.speaker(command.speaker, runtime.config.speaker);
