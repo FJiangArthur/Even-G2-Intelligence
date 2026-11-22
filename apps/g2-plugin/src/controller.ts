@@ -180,6 +180,8 @@ export class G2ConversationController {
    * flushHistory() (page hidden/frozen), disconnect(), dispose(), deletions and imports.
    */
   public liveHistoryWriteDelayMs = 0;
+  /** Longest an answer waits for the saved-knowledge search before going out without it (0: no limit). */
+  public knowledgeSearchDeadlineMs = 2500;
   // ---- end history write coalescing ----
   private settingsQueue: Promise<void> = Promise.resolve();
   private config: PluginConfig = DEFAULT_CONFIG;
@@ -597,10 +599,16 @@ export class G2ConversationController {
    * Saved-knowledge search for an answer. It runs in slices of a few ms (a whole-archive search in one
    * task froze the page behind queued microphone events). Diagnostics: "memory-search Nx max S s" is how
    * long answers waited for it; "memory-block" counts a slice that held the page for 50 ms or more.
+   * A search that is not done by knowledgeSearchDeadlineMs (cold index, or a page too busy to get its
+   * slices) is given up: that answer goes out without saved knowledge ("memory-search-timeout Nx"),
+   * and the index keeps building for the next one. The blocking search is never used instead.
    */
-  private searchKnowledge(query: string, sessionId: string): Promise<RetrievalStats> {
-    if (!this.localMemoryEnabled) return Promise.resolve({ items: [], searchedEntries: 0, matched: 0 });
-    return this.history.retrieveAsync(query, { excludeSessionId: sessionId, onTiming: timing => this.countKnowledgeWork("memory-search", timing) });
+  private async searchKnowledge(query: string, sessionId: string, signal?: AbortSignal): Promise<RetrievalStats> {
+    if (!this.localMemoryEnabled) return { items: [], searchedEntries: 0, matched: 0 };
+    const result = await this.history.retrieveAsync(query, { excludeSessionId: sessionId, deadlineMs: this.knowledgeSearchDeadlineMs, ...(signal ? { signal } : {}),
+      onTiming: timing => this.countKnowledgeWork("memory-search", timing) });
+    if (result.timedOut) countDiagnostic("memory-search-timeout", this.knowledgeSearchDeadlineMs);
+    return result;
   }
   /** Builds the search index ahead of the first answer (after load and at session start), also in slices. */
   private warmKnowledge(): void {
@@ -712,7 +720,7 @@ export class G2ConversationController {
       retrieveMemoryWithStats: (query, sessionId) => this.localMemoryEnabled
         ? this.history.retrieveWithStats(query, { excludeSessionId: sessionId })
         : { items: [], searchedEntries: 0, matched: 0 },
-      retrieveMemoryAsync: (query, sessionId) => this.searchKnowledge(query, sessionId),
+      retrieveMemoryAsync: (query, sessionId, signal) => this.searchKnowledge(query, sessionId, signal),
       openaiKnowledge: () => this.openaiKnowledgeSource(),
       onUplink: state => countDiagnostic(state === "paused" ? "uplink-pause" : "uplink-resume"),
       copilot: this.copilotCallbacks(session.id),

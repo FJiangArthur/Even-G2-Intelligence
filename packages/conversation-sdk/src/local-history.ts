@@ -1,5 +1,5 @@
 import type { KnowledgeSource } from "./copilot-types.js";
-import { CJK_CHAR, RetrievalIndex, bounded, normalize, runNow, runSliced, terms, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
+import { CJK_CHAR, RetrievalCancelled, RetrievalIndex, bounded, normalize, retrievalClock, runNow, runSliced, terms, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
 import { MAX_SESSION_NOTES, MAX_TODOS, cleanSessionNotes, cleanTodos, sameTodoText, type SessionNote, type TodoItem } from "./todo-list.js";
 
 /** Storage is provided by the phone host; no network or provider credentials are involved. */
@@ -120,7 +120,7 @@ const string = (value: unknown): value is string => typeof value === "string" &&
 const date = (value: unknown): value is string => string(value) && Number.isFinite(Date.parse(value));
 const invalid = () => new Error("Invalid local history data. Existing storage has not been replaced.");
 const copy = <T>(value: T): T => structuredClone(value);
-export { stemTerm, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
+export { RetrievalCancelled, stemTerm, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
 function safeUrl(value: unknown): string | undefined {
   if (!string(value)) return undefined;
   try { const url = new URL(value); if ((url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password) return value; } catch { /* untrusted citation */ }
@@ -245,7 +245,16 @@ function relevance(text: string, queryTerms: string[]): number {
   const found = new Set(terms(text));
   return queryTerms.reduce((n, term) => n + Number(found.has(term) || (CJK_CHAR.test(term) && normalize(text).includes(term))), 0) / queryTerms.length;
 }
-export interface RetrievalStats { items: RetrievedMemory[]; searchedEntries: number; matched: number }
+/** `timedOut`: retrieveAsync gave up at its deadline and nothing was searched (items is empty). Absent otherwise. */
+export interface RetrievalStats { items: RetrievedMemory[]; searchedEntries: number; matched: number; timedOut?: true }
+/** retrieveAsync only: when to give up. Without either the search runs to its end. */
+export interface RetrievalLimits {
+  /** Resolve with { items: [], timedOut: true } after this long, counted from the call (time spent waiting behind an index build included). */
+  deadlineMs?: number;
+  /** Reject and stop the sliced work when aborted. */
+  signal?: AbortSignal;
+  onTiming?: (timing: RetrievalTiming) => void;
+}
 
 /** UTF-8 byte length without allocating (lone surrogates count as U+FFFD, like TextEncoder). */
 function utf8Length(value: string): number {
@@ -805,17 +814,36 @@ export class LocalHistoryStore {
    * The same search and result as retrieveWithStats, without holding the thread: the work (and the
    * index build, when the index is cold) runs in slices of retrievalSliceMs with a yield between them.
    */
-  retrieveAsync(query: string, options: RetrievalOptions & { onTiming?: (timing: RetrievalTiming) => void } = {}): Promise<RetrievalStats> {
-    const index = this.index ??= new RetrievalIndex();
-    return this.sliced(clock => index.search(() => this.state, query, options, clock, copy), options.onTiming);
+  retrieveAsync(query: string, options: RetrievalOptions & RetrievalLimits = {}): Promise<RetrievalStats> {
+    const index = this.index ??= new RetrievalIndex(), signal = options.signal;
+    const deadline = typeof options.deadlineMs === "number" && Number.isFinite(options.deadlineMs) && options.deadlineMs > 0 ? options.deadlineMs : undefined;
+    // An abandoned search stops at its next pause (or never starts), so it cannot keep later ones waiting.
+    const job = { cancelled: false, expires: deadline === undefined ? Number.POSITIVE_INFINITY : retrievalClock() + deadline };
+    const gaveUp = () => job.cancelled || retrievalClock() >= job.expires;
+    const work = (): Promise<RetrievalStats> => this.sliced(clock => index.search(() => this.state, query, options, clock, copy), options.onTiming, gaveUp);
+    if (!signal && deadline === undefined) return work();
+    return new Promise<RetrievalStats>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined, settled = false;
+      const settle = (): boolean => { if (settled) return false; settled = true; job.cancelled = true; if (timer !== undefined) clearTimeout(timer); signal?.removeEventListener("abort", abort); return true; };
+      const abort = () => { if (settle()) reject(signal!.reason ?? new RetrievalCancelled()); };
+      // No answer in time: reply without saved knowledge and keep building the index for the next question.
+      const expire = () => { if (settle()) { void this.warmRetrieval(); resolve({ items: [], searchedEntries: 0, matched: 0, timedOut: true }); } };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (deadline !== undefined) timer = setTimeout(expire, deadline);
+      // The clock is also read at every pause: a timer may run late on a page that is throttled.
+      work().then(result => { if (settle()) resolve(result); }, error => { if (error instanceof RetrievalCancelled && !job.cancelled) expire(); else if (settle()) reject(error); });
+    });
   }
+  /** Size of the search index (0s before it is first used): distinct tokens, entries indexed, bytes of token ids. For diagnostics and tests. */
+  retrievalIndexSize(): { vocabulary: number; entries: number; bytes: number } { return this.index?.size() ?? { vocabulary: 0, entries: 0, bytes: 0 }; }
   /** Builds or completes the search index in slices, off the answer path (after load, at session start). Never rejects. */
   warmRetrieval(onTiming?: (timing: RetrievalTiming) => void): Promise<void> {
     const index = this.index ??= new RetrievalIndex();
     return this.sliced(clock => index.sync(() => this.state, clock), onTiming).catch(() => undefined);
   }
-  private sliced<T>(work: Parameters<typeof runSliced<T>>[0], onTiming?: (timing: RetrievalTiming) => void): Promise<T> {
-    const result = this.searches.then(() => runSliced(work, this.sliceMs, this.pause, onTiming));
+  private sliced<T>(work: Parameters<typeof runSliced<T>>[0], onTiming?: (timing: RetrievalTiming) => void, cancelled?: () => boolean): Promise<T> {
+    const result = this.searches.then(() => runSliced(work, this.sliceMs, this.pause, onTiming, cancelled));
     this.searches = result.catch(() => undefined);
     return result;
   }
