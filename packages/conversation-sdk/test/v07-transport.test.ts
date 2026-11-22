@@ -115,6 +115,28 @@ describe("v0.7 direct transport", () => {
     expect(metas[0]).toMatchObject({ grounded: "memory", retrieval: { searchedEntries: 40, matched: 2, webUsed: false } });
     await client.dispose();
   });
+  it("searches memory through retrieveMemoryAsync when given (no synchronous search), and answers even when it fails", async () => {
+    const old: RetrievedMemory = { entry: { id: "a", sessionId: "old", kind: "transcript", text: "Jetsons have long lead times.", occurredAt: "2026-09-01T00:00:00Z" }, session: { id: "old", source: "helix", title: "Old", startedAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z" }, score: 1 };
+    const sync = vi.fn(() => { throw new Error("the synchronous search must not run"); });
+    let release!: () => void;
+    const retrieveMemoryAsync = vi.fn(async () => { await new Promise<void>(resolve => { release = resolve; }); return { items: [old], searchedEntries: 40, matched: 1 }; });
+    const fetcher = vi.fn(async () => answer("About 12 weeks [M1]."));
+    const { client, metas } = setup(fetcher, { retrieveMemoryAsync, retrieveMemoryWithStats: sync, retrieveMemory: sync });
+    await client.start(config, { openai: "k" }); await client.ask("Jetson lead time?");
+    await vi.waitFor(() => expect(retrieveMemoryAsync).toHaveBeenCalledWith(expect.stringContaining("Jetson lead time?"), config.sessionId));
+    expect(fetcher).not.toHaveBeenCalled(); // the answer request waits for the search, the page does not
+    release();
+    await vi.waitFor(() => expect(metas).toHaveLength(1));
+    expect(JSON.parse((fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].body as string).instructions).toContain("Jetsons have long lead times.");
+    expect(metas[0]).toMatchObject({ grounded: "memory", retrieval: { searchedEntries: 40, matched: 1 } });
+    expect(sync).not.toHaveBeenCalled();
+    await client.dispose();
+    const failing = setup(vi.fn(async () => answer("No record of that.")), { retrieveMemoryAsync: async () => { throw new Error("storage failure"); } });
+    await failing.client.start(config, { openai: "k" }); await failing.client.ask("Jetson lead time?");
+    await vi.waitFor(() => expect(failing.metas).toHaveLength(1));
+    expect(failing.metas[0]).toMatchObject({ grounded: "conversation", retrieval: { searchedEntries: 0, matched: 0 } });
+    await failing.client.dispose();
+  });
   it("injectTranscript runs the post-transcription path without STT: transcript.final, auto answer, copilot submit", async () => {
     const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
       if (url.endsWith("transcriptions")) throw new Error("STT must not be called");

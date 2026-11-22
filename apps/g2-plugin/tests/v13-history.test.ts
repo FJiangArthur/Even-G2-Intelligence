@@ -299,11 +299,13 @@ describe("v0.13 history: removal and the knowledge switch", () => {
     // On: saved sessions are found, with the session they came from (source attribution).
     expect(options.retrieveMemory?.("Orin lead time", live).map(hit => hit.session.title).sort()).toEqual(["Vendor call s1", "Vendor call s2", "Vendor call s3"]);
     expect(options.retrieveMemoryWithStats?.("Orin lead time", live)).toMatchObject({ searchedEntries: 3, matched: 3 });
+    expect(await options.retrieveMemoryAsync?.("Orin lead time", live)).toEqual(options.retrieveMemoryWithStats?.("Orin lead time", live)); // the form the answer path uses
     expect(options.openaiKnowledge?.()).toMatchObject({ vectorStoreId: expect.stringMatching(/^vs_/u) });
     // Off: never read for answers (phone or OpenAI), and not synced.
     await f.controller.setLocalMemoryEnabled(false);
     expect(options.retrieveMemory?.("Orin lead time", live)).toEqual([]);
     expect(options.retrieveMemoryWithStats?.("Orin lead time", live)).toEqual({ items: [], searchedEntries: 0, matched: 0 });
+    expect(await options.retrieveMemoryAsync?.("Orin lead time", live)).toEqual({ items: [], searchedEntries: 0, matched: 0 });
     expect(options.openaiKnowledge?.()).toBeUndefined();
     await expect(f.controller.syncOpenAIKnowledge("setup-key")).rejects.toThrow(/Let the knowledge base read history/u);
     expect(f.controller.knowledgeBase().notice).toMatch(/may not read history/u);

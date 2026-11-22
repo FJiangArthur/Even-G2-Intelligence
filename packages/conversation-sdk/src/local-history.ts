@@ -1,4 +1,5 @@
 import type { KnowledgeSource } from "./copilot-types.js";
+import { CJK_CHAR, RetrievalIndex, bounded, normalize, runNow, runSliced, terms, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
 import { MAX_SESSION_NOTES, MAX_TODOS, cleanSessionNotes, cleanTodos, sameTodoText, type SessionNote, type TodoItem } from "./todo-list.js";
 
 /** Storage is provided by the phone host; no network or provider credentials are involved. */
@@ -88,6 +89,10 @@ export interface LocalHistoryOptions {
   writeDelayMs?: number;
   /** Entries per stored chunk (default HISTORY_CHUNK_ENTRIES). Smaller values are for tests. */
   chunkEntries?: number;
+  /** Longest time retrieveAsync / warmRetrieval keep the thread before yielding (default 5 ms, at most 50; 0 yields at every safe point, for tests). */
+  retrievalSliceMs?: number;
+  /** How they yield (default yieldToHost: one macrotask). For tests. */
+  retrievalYield?: () => Promise<void>;
 }
 interface ShardMeta { bytes: number; entries: number; chunks?: number }
 /** What is stored for one session: its chunks' entry references and byte sizes (unchanged chunks are not rewritten). */
@@ -110,12 +115,12 @@ const METADATA_KEYS = new Set(["model", "provider", "endpoint", "promptVersion",
 export const KNOWLEDGE_SOURCES: readonly KnowledgeSource[] = Object.freeze(["helix", "omi", "obsidian"]);
 const KNOWLEDGE_KEYS = ["summary", "keyFacts", "people", "concepts", "tags"] as const;
 const MAX_KNOWLEDGE_ITEMS = 20, MAX_KNOWLEDGE_CHARS = 500;
-const STOP_WORDS = new Set("a an the and or but is are was were be been being to of in on at for with from by it its this that these those i you we they he she my your our their do does did can could would should what when where who how please me us about as".split(" "));
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const string = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const date = (value: unknown): value is string => string(value) && Number.isFinite(Date.parse(value));
 const invalid = () => new Error("Invalid local history data. Existing storage has not been replaced.");
 const copy = <T>(value: T): T => structuredClone(value);
+export { stemTerm, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
 function safeUrl(value: unknown): string | undefined {
   if (!string(value)) return undefined;
   try { const url = new URL(value); if ((url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password) return value; } catch { /* untrusted citation */ }
@@ -236,49 +241,11 @@ function decode(raw: string): Snapshot {
   if (sessionIds.size !== sessions.length || new Set(entries.map(e => e.id)).size !== entries.length || entries.some(e => !sessionIds.has(e.sessionId))) throw invalid();
   return { version: 1, sessions, entries };
 }
-const normalize = (value: string) => value.normalize("NFKC").toLowerCase();
-const CJK = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+$/u;
-const CJK_CHAR = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]$/u;
-/** Light English suffix folding: "lead times" ~ "lead time", "jetsons" ~ "jetson". */
-export function stemTerm(token: string): string {
-  if (token.length <= 3 || !/^[a-z]+$/.test(token)) return token;
-  if (token.endsWith("'s")) token = token.slice(0, -2);
-  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
-  if (token.endsWith("sses")) return token.slice(0, -2);
-  if (token.endsWith("ing") && token.length > 5) return token.slice(0, -3);
-  if (token.endsWith("ed") && token.length > 4) return token.slice(0, -2);
-  if (token.endsWith("es") && /(?:ch|sh|x|z)es$/.test(token)) return token.slice(0, -2);
-  if (token.endsWith("s") && !token.endsWith("ss") && !token.endsWith("us") && !token.endsWith("is")) return token.slice(0, -1);
-  return token;
-}
-/** Tokens with duplicates (for term frequency). CJK runs become bigrams. */
-function tokenList(value: string): string[] {
-  const separated = normalize(value).replace(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu, " $& ");
-  const tokens = separated.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[\p{L}\p{N}]+/gu) ?? [];
-  return tokens.flatMap(token => {
-    if (CJK.test(token)) { const chars = [...token]; return chars.length === 1 ? chars : chars.slice(0, -1).map((c, i) => c + chars[i + 1]); }
-    return STOP_WORDS.has(token) ? [] : [stemTerm(token)];
-  });
-}
-function terms(value: string): string[] { return [...new Set(tokenList(value))]; }
 function relevance(text: string, queryTerms: string[]): number {
   const found = new Set(terms(text));
   return queryTerms.reduce((n, term) => n + Number(found.has(term) || (CJK_CHAR.test(term) && normalize(text).includes(term))), 0) / queryTerms.length;
 }
-/** Exact stem = 1, shared prefix (>= 4 chars) = 0.7, single CJK char inside a bigram = 1. */
-function matchWeight(query: string, token: string): number {
-  if (query === token) return 1;
-  if (CJK_CHAR.test(query)) return token.includes(query) ? 1 : 0;
-  const [short, long] = query.length <= token.length ? [query, token] : [token, query];
-  return short.length >= 4 && long.length - short.length <= 4 && long.startsWith(short) && /^[\p{L}\p{N}]+$/u.test(short) && !CJK.test(short) ? 0.7 : 0;
-}
-/** Relative evidence weight. Transcript (what was said) outranks generated records. */
-const KIND_WEIGHT: Readonly<Record<HistoryEntry["kind"], number>> = { transcript: 1, answer: 0.6, "fact-check": 0.5, question: 0 };
-const BM25_K1 = 1.2, BM25_B = 0.75, PASSAGE_WIDTH = 600;
 export interface RetrievalStats { items: RetrievedMemory[]; searchedEntries: number; matched: number }
-function bounded(value: number | undefined, fallback: number, max: number): number {
-  return value === undefined ? fallback : Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : fallback;
-}
 
 /** UTF-8 byte length without allocating (lone surrogates count as U+FFFD, like TextEncoder). */
 function utf8Length(value: string): number {
@@ -412,7 +379,15 @@ export class LocalHistoryStore {
   private batch?: Batch;
   private delay: number;
   private flat?: HistoryEntry[];
+  /** Token index of the saved archive for retrieve*; built on first use, then kept in step with every saved change. */
+  private index?: RetrievalIndex;
+  /** Sliced searches and index builds run one after another, so a query behind a cold index waits for the build. */
+  private searches: Promise<unknown> = Promise.resolve();
+  private readonly sliceMs: number;
+  private readonly pause: () => Promise<void>;
   constructor(private readonly storage: HistoryStorage, options: LocalHistoryOptions = {}) {
+    this.sliceMs = bounded(options.retrievalSliceMs, 5, 50);
+    this.pause = typeof options.retrievalYield === "function" ? options.retrievalYield : yieldToHost;
     this.delay = writeDelay(options.writeDelayMs);
     this.chunkEntries = bounded(options.chunkEntries, HISTORY_CHUNK_ENTRIES, 100_000) || HISTORY_CHUNK_ENTRIES;
   }
@@ -815,78 +790,34 @@ export class LocalHistoryStore {
   }
   getEntries(sessionId: string): HistoryEntry[] { return copy([...this.state.entries.get(sessionId) ?? NO_ENTRIES]).sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt) || a.id.localeCompare(b.id)); }
   search(query: string, limit?: number): RetrievedMemory[] { return this.rank(query, false).slice(0, bounded(limit, 50, 500)); }
-  retrieve(query: string, options: { excludeSessionId?: string; limit?: number; maxChars?: number } = {}): RetrievedMemory[] {
+  retrieve(query: string, options: RetrievalOptions = {}): RetrievedMemory[] {
     return this.retrieveWithStats(query, options).items;
   }
-  /** BM25 over the best passage of each eligible entry; returns diagnostics for UI. */
-  retrieveWithStats(query: string, options: { excludeSessionId?: string; limit?: number; maxChars?: number } = {}): RetrievalStats {
-    const limit = bounded(options.limit, 5, 50);
-    let remaining = bounded(options.maxChars, 3000, 20_000);
-    const sessions = new Map(this.state.sessions.map(s => [s.id, s]));
-    const eligible = this.entries().filter(entry => entry.sessionId !== options.excludeSessionId && sessions.has(entry.sessionId) && KIND_WEIGHT[entry.kind] > 0
-      && !(entry.kind === "transcript" && /^(assistant|ai|system|omi summary)$/i.test(entry.speaker?.trim() ?? ""))
-      // Imported Omi overviews are vendor-generated summaries, not evidence.
-      && entry.metadata?.origin !== "omi-summary" && !/^omi summary$/i.test(entry.speaker?.trim() ?? ""));
-    const stats: RetrievalStats = { items: [], searchedEntries: eligible.length, matched: 0 };
-    const queryTerms = terms(query).slice(0, 400);
-    if (!queryTerms.length || !eligible.length) return stats;
-    // Expand each corpus token to the query terms it matches, once per call.
-    const tokensById = new Map(eligible.map(entry => [entry.id, tokenList(entry.text)]));
-    const expansion = new Map<string, [number, number][]>();
-    for (const tokens of tokensById.values()) for (const token of tokens) {
-      if (expansion.has(token)) continue;
-      const matches: [number, number][] = [];
-      queryTerms.forEach((q, i) => { const w = matchWeight(q, token); if (w) matches.push([i, w]); });
-      expansion.set(token, matches);
-    }
-    const df = new Array<number>(queryTerms.length).fill(0);
-    for (const tokens of tokensById.values()) {
-      const seen = new Set<number>();
-      for (const token of tokens) for (const [i] of expansion.get(token)!) seen.add(i);
-      for (const i of seen) df[i]!++;
-    }
-    const n = eligible.length;
-    const idf = df.map(d => Math.log(1 + (n - d + 0.5) / (d + 0.5)));
-    const passageOf = (entry: HistoryEntry, width: number): { text: string; tokens: string[] } => {
-      const all = tokensById.get(entry.id)!;
-      if (entry.text.length <= width) return { text: entry.text, tokens: all };
-      let best = { text: entry.text.slice(0, width), tokens: tokenList(entry.text.slice(0, width)), score: -1 };
-      for (let start = 0; start < entry.text.length; start += Math.max(1, Math.floor(width / 2))) {
-        const text = entry.text.slice(start, start + width), tokens = tokenList(text), hit = new Map<number, number>();
-        for (const token of tokens) for (const [i, w] of expansion.get(token) ?? []) hit.set(i, Math.max(hit.get(i) ?? 0, w));
-        const score = [...hit].reduce((sum, [i, w]) => sum + idf[i]! * w, 0);
-        if (score > best.score) best = { text, tokens, score };
-      }
-      return best;
-    };
-    const lengths = eligible.map(entry => Math.max(1, Math.min(tokensById.get(entry.id)!.length, PASSAGE_WIDTH / 5)));
-    const avgdl = lengths.reduce((a, b) => a + b, 0) / lengths.length;
-    const scored: RetrievedMemory[] = [];
-    for (const entry of eligible) {
-      const selected = passageOf(entry, PASSAGE_WIDTH), tf = new Map<number, number>();
-      for (const token of selected.tokens) for (const [i, w] of expansion.get(token) ?? []) tf.set(i, (tf.get(i) ?? 0) + w);
-      if (!tf.size) continue;
-      const len = Math.max(1, selected.tokens.length);
-      let score = 0;
-      for (const [i, f] of tf) score += idf[i]! * (f * (BM25_K1 + 1)) / (f + BM25_K1 * (1 - BM25_B + BM25_B * len / avgdl));
-      score *= KIND_WEIGHT[entry.kind];
-      // One strong rare-term hit is enough; only zero-score entries are dropped.
-      if (!(score > 0)) continue;
-      const timestamp = Math.max(0, Date.parse(entry.occurredAt));
-      // Small monotonic recency weight resolves equal lexical scores without swamping relevance.
-      scored.push({ entry: copy(entry), session: copy(sessions.get(entry.sessionId)!), score: score + 0.001 * timestamp / (timestamp + 1e12) });
-    }
-    stats.matched = scored.length;
-    scored.sort((a, b) => b.score - a.score || Date.parse(b.entry.occurredAt) - Date.parse(a.entry.occurredAt) || a.entry.id.localeCompare(b.entry.id));
-    if (!remaining || !limit) return stats;
-    for (const hit of scored) {
-      const width = Math.min(PASSAGE_WIDTH, remaining);
-      const selected = passageOf(hit.entry, width);
-      if (!selected.text) continue;
-      hit.entry.text = selected.text; remaining -= selected.text.length; stats.items.push(hit);
-      if (!remaining || stats.items.length >= limit) break;
-    }
-    return stats;
+  /**
+   * BM25 over the best passage of each eligible entry; returns diagnostics for UI. Runs in one go: with
+   * a cold index over a large archive that is a long task, so the live answer path uses retrieveAsync.
+   */
+  retrieveWithStats(query: string, options: RetrievalOptions = {}): RetrievalStats {
+    const index = this.index ??= new RetrievalIndex();
+    return runNow(clock => index.search(() => this.state, query, options, clock, copy));
+  }
+  /**
+   * The same search and result as retrieveWithStats, without holding the thread: the work (and the
+   * index build, when the index is cold) runs in slices of retrievalSliceMs with a yield between them.
+   */
+  retrieveAsync(query: string, options: RetrievalOptions & { onTiming?: (timing: RetrievalTiming) => void } = {}): Promise<RetrievalStats> {
+    const index = this.index ??= new RetrievalIndex();
+    return this.sliced(clock => index.search(() => this.state, query, options, clock, copy), options.onTiming);
+  }
+  /** Builds or completes the search index in slices, off the answer path (after load, at session start). Never rejects. */
+  warmRetrieval(onTiming?: (timing: RetrievalTiming) => void): Promise<void> {
+    const index = this.index ??= new RetrievalIndex();
+    return this.sliced(clock => index.sync(() => this.state, clock), onTiming).catch(() => undefined);
+  }
+  private sliced<T>(work: Parameters<typeof runSliced<T>>[0], onTiming?: (timing: RetrievalTiming) => void): Promise<T> {
+    const result = this.searches.then(() => runSliced(work, this.sliceMs, this.pause, onTiming));
+    this.searches = result.catch(() => undefined);
+    return result;
   }
   private rank(query: string, _evidenceOnly: boolean, excludeSessionId?: string): RetrievedMemory[] {
     const queryTerms = terms(query); if (!queryTerms.length) return [];
