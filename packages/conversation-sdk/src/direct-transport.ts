@@ -90,6 +90,11 @@ export interface DirectConversationOptions {
   /** Preferred over retrieveMemory: also returns diagnostics (LocalHistoryStore.retrieveWithStats). */
   retrieveMemoryWithStats?: (query: string, sessionId: string) => MemoryRetrievalResult;
   /**
+   * Preferred over both: the same result without holding the thread (LocalHistoryStore.retrieveAsync). A search
+   * of a large archive in one task stalls the page long enough for microphone events to pile up behind it.
+   */
+  retrieveMemoryAsync?: (query: string, sessionId: string) => Promise<MemoryRetrievalResult>;
+  /**
    * v0.12 OpenAI knowledge base. When this returns a vector store id, answers first search that store
    * (Retrieval API, the session's OpenAI key) and fall back to the local lookup when the search
    * fails, finds nothing, or takes longer than `knowledgeTimeoutMs` (default 1500 ms).
@@ -555,8 +560,9 @@ export class DirectConversationTransport implements ConversationTransport, Copil
       if (!current()) return;
       if (cloud.length) {
         found = cloud; matched = cloud.length; knowledge = "openai";
-      } else if (this.options.retrieveMemoryWithStats) {
-        const result = this.options.retrieveMemoryWithStats(query, config.sessionId);
+      } else if (this.options.retrieveMemoryAsync || this.options.retrieveMemoryWithStats) {
+        const result = this.options.retrieveMemoryAsync ? await this.options.retrieveMemoryAsync(query, config.sessionId) : this.options.retrieveMemoryWithStats!(query, config.sessionId);
+        if (!current()) return;
         found = Array.isArray(result?.items) ? result.items : [];
         searchedEntries = Number.isFinite(result?.searchedEntries) ? result.searchedEntries : 0;
         matched = Number.isFinite(result?.matched) ? result.matched! : found.length;

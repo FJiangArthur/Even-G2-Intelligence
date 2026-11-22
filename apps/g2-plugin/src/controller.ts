@@ -18,6 +18,8 @@ import {
   type HistorySession,
   type HistoryEntry,
   type RetrievedMemory,
+  type RetrievalStats,
+  type RetrievalTiming,
   type OmiImportOptions,
   type FactCheckResult,
   type ContextInsight,
@@ -591,6 +593,23 @@ export class G2ConversationController {
       case 5: return this.togglePause();
     }
   }
+  /**
+   * Saved-knowledge search for an answer. It runs in slices of a few ms (a whole-archive search in one
+   * task froze the page behind queued microphone events). Diagnostics: "memory-search Nx max S s" is how
+   * long answers waited for it; "memory-block" counts a slice that held the page for 50 ms or more.
+   */
+  private searchKnowledge(query: string, sessionId: string): Promise<RetrievalStats> {
+    if (!this.localMemoryEnabled) return Promise.resolve({ items: [], searchedEntries: 0, matched: 0 });
+    return this.history.retrieveAsync(query, { excludeSessionId: sessionId, onTiming: timing => this.countKnowledgeWork("memory-search", timing) });
+  }
+  /** Builds the search index ahead of the first answer (after load and at session start), also in slices. */
+  private warmKnowledge(): void {
+    if (this.localMemoryEnabled) void this.history.warmRetrieval(timing => { if (timing.slices > 1) this.countKnowledgeWork("memory-index", timing); });
+  }
+  private countKnowledgeWork(name: string, timing: RetrievalTiming): void {
+    countDiagnostic(name, timing.totalMs);
+    if (timing.maxSliceMs >= 50) countDiagnostic("memory-block", timing.maxSliceMs);
+  }
   private cancelInsights(): void {
     (this.transport as (ConversationTransport & { cancelInsights?: () => void }) | undefined)?.cancelInsights?.();
     this.presentation.dismissCue();
@@ -638,6 +657,7 @@ export class G2ConversationController {
     } catch { /* auto-import stays off */ }
     try { await this.history.load(); await this.tidyHistory(); this.setHistoryStatus("History is saved only on this phone."); }
     catch (error) { this.setHistoryStatus(errorMessage(error)); }
+    this.warmKnowledge();
     this.presentation.setStatus("starting");
     this.unsubscribePresentation = this.presentation.subscribe((snapshot) => {
       this.renderer.render(snapshot.glasses, snapshot);
@@ -683,6 +703,7 @@ export class G2ConversationController {
     this.transcriptRevisions.clear();
     this.memoryByQuestion.clear();
     this.manualRevision = 0;
+    this.warmKnowledge(); // the first answer must not wait for (or be stalled by) the search index
     // v0.13: no history record until something is said or answered (archiveEvent / flushSessionKnowledge
     // save it with the first line). Connecting, resuming and reconnecting used to leave an empty
     // "<1 min · 0 · 0" session behind each time.
@@ -691,6 +712,7 @@ export class G2ConversationController {
       retrieveMemoryWithStats: (query, sessionId) => this.localMemoryEnabled
         ? this.history.retrieveWithStats(query, { excludeSessionId: sessionId })
         : { items: [], searchedEntries: 0, matched: 0 },
+      retrieveMemoryAsync: (query, sessionId) => this.searchKnowledge(query, sessionId),
       openaiKnowledge: () => this.openaiKnowledgeSource(),
       onUplink: state => countDiagnostic(state === "paused" ? "uplink-pause" : "uplink-resume"),
       copilot: this.copilotCallbacks(session.id),
