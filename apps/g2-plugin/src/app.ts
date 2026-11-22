@@ -6,16 +6,19 @@ import {
   loadPersistedProviderCredentials,
   persistProviderCredentials,
   providerCredentialsFromForm,
+  providerCredentialsForSession,
   type SessionFormState,
 } from "./config";
 import { G2ConversationController, LIVE_HISTORY_WRITE_DELAY_MS } from "./controller";
 import { GlassesRenderer } from "./glasses-renderer";
-import { GlassesHud, hudViewForTab, resolveGlassesLayout } from "./glasses-hud";
+import { GlassesHud, hudViewForTab, resolveGlassesDisplay, resolveGlassesLayout } from "./glasses-hud";
 import { ConversationPresentation } from "./presentation";
 import { CompanionUi } from "./ui";
 import { RESUME_PROMPT } from "./controller";
 import { REHEARSAL_SCRIPTS } from "./rehearsal";
 import { countDiagnostic, recordDiagnostic, watchLifecycle } from "./diagnostics";
+import { AudioInputSource } from "@evenrealities/even_hub_sdk";
+import { installMicProbe, setSdkAudioLogQuiet } from "./mic-probe";
 
 
 export interface BootstrapOptions {
@@ -32,6 +35,12 @@ export const PHONE_RENDER_MS = 250;
 export const GLASSES_IMAGES_KEY = "helix.glasses.images.v1";
 /** Pause between glasses writes in ms (80 | 250 | 500 | 1000). Stored through the Even bridge. */
 export const GLASSES_WRITE_GAP_KEY = "helix.glasses.write-gap.v1";
+/** Glasses display: "ambient" (default; blank until an answer or cue pops up) or "always-on". Stored through the Even bridge. */
+export const GLASSES_DISPLAY_KEY = "helix.glasses.display.v1";
+/** Microphone: "glasses" (default) or "phone" (AudioInputSource.Phone; untested on hardware). Stored through the Even bridge. */
+export const MIC_SOURCE_KEY = "helix.mic.source.v1";
+/** "on" = let the Even SDK console.log every audio frame again (default: skipped, see mic-probe.ts). Stored through the Even bridge. */
+export const SDK_AUDIO_LOG_KEY = "helix.mic.sdk-log.v1";
 export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebuildPageContainer?: unknown }, options: BootstrapOptions = {}) {
   const [config, providerCredentials] = await Promise.all([
     loadPersistedConfig(bridge),
@@ -45,12 +54,24 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   const writeGap = [80, 250, 500, 1000].includes(savedGap) ? savedGap : 80;
   // v0.11.2: Setup → Diagnostics switch for a text-only glasses display (saved on this phone).
   const pixelArt = await Promise.race([bridge.getLocalStorage(GLASSES_IMAGES_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]) !== "off";
+  const display = resolveGlassesDisplay(await Promise.race([bridge.getLocalStorage(GLASSES_DISPLAY_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]));
   const renderer = resolveGlassesLayout(new URLSearchParams(options.search ?? location.search).get("glasses")) === "hud"
-    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap })
+    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap, display, answerLength: config.answerLength })
     : new GlassesRenderer(bridge, { debounceMs: 120, onError: onGlassesError });
   const controller = new G2ConversationController(bridge, renderer, presentation, ...(options.transportFactory ? [options.transportFactory] as const : []));
   // Battery: batch live-session history saves (one shard + one index write per ~3 s, flushed on hide/stop).
   controller.liveHistoryWriteDelayMs = LIVE_HISTORY_WRITE_DELAY_MS;
+  // Heat / lock screen: accept microphone audio only at its real-time rate (a backlog queued while the
+  // WebView was suspended is dropped, not uploaded). `?audio=all` keeps everything (offline QA replays).
+  controller.audioRealtimeGuard = new URLSearchParams(options.search ?? location.search).get("audio") !== "all";
+  // Microphone timing probe (main.ts installs it before the bridge exists; this covers the QA harnesses) and
+  // the two microphone switches in Setup → Diagnostics.
+  installMicProbe();
+  const [savedMic, savedSdkLog] = await Promise.race([Promise.all([bridge.getLocalStorage(MIC_SOURCE_KEY).catch(() => ""), bridge.getLocalStorage(SDK_AUDIO_LOG_KEY).catch(() => "")]),
+    new Promise<[string, string]>(done => setTimeout(() => done(["", ""]), 1500))]);
+  const micSource = savedMic === AudioInputSource.Phone ? AudioInputSource.Phone : AudioInputSource.Glasses;
+  controller.micSource = micSource;
+  setSdkAudioLogQuiet(savedSdkLog !== "on");
   const ui = new CompanionUi(root, config, providerCredentials, {
     rehearsalScripts: REHEARSAL_SCRIPTS.map(script => ({ id: script.id, title: script.title })),
   });
@@ -65,6 +86,16 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
       void bridge.setLocalStorage(GLASSES_IMAGES_KEY, on ? "on" : "off").catch(() => false);
     });
   }
+  const alwaysOnToggle = root.querySelector<HTMLInputElement>("#glasses-always-on");
+  if (alwaysOnToggle) {
+    alwaysOnToggle.checked = display === "always-on";
+    alwaysOnToggle.addEventListener("change", () => {
+      const next = alwaysOnToggle.checked ? "always-on" : "ambient";
+      recordDiagnostic("glasses-display", next);
+      (renderer as { setDisplay?: (display: "ambient" | "always-on") => void }).setDisplay?.(next);
+      void bridge.setLocalStorage(GLASSES_DISPLAY_KEY, next).catch(() => false);
+    });
+  }
   const gapSelect = root.querySelector<HTMLSelectElement>("#glasses-write-gap");
   if (gapSelect) {
     gapSelect.value = String(writeGap);
@@ -75,7 +106,26 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
       void bridge.setLocalStorage(GLASSES_WRITE_GAP_KEY, String(ms)).catch(() => false);
     });
   }
-  recordDiagnostic("glasses-settings", `pixel art ${pixelArt ? "on" : "off"} · pause ${writeGap} ms`);
+  const micSelect = root.querySelector<HTMLSelectElement>("#mic-source");
+  if (micSelect) {
+    micSelect.value = micSource;
+    micSelect.addEventListener("change", () => {
+      const next = micSelect.value === AudioInputSource.Phone ? AudioInputSource.Phone : AudioInputSource.Glasses;
+      void controller.setMicSource(next).catch(error => presentation.setStatus("failed", error instanceof Error ? error.message : String(error)));
+      void bridge.setLocalStorage(MIC_SOURCE_KEY, next).catch(() => false);
+    });
+  }
+  const sdkLogToggle = root.querySelector<HTMLInputElement>("#sdk-audio-log");
+  if (sdkLogToggle) {
+    sdkLogToggle.checked = savedSdkLog === "on";
+    sdkLogToggle.addEventListener("change", () => {
+      const on = sdkLogToggle.checked;
+      recordDiagnostic("sdk-audio-log", on ? "left on" : "skipped");
+      setSdkAudioLogQuiet(!on);
+      void bridge.setLocalStorage(SDK_AUDIO_LOG_KEY, on ? "on" : "off").catch(() => false);
+    });
+  }
+  recordDiagnostic("glasses-settings", `pixel art ${pixelArt ? "on" : "off"} · pause ${writeGap} ms · display ${display} · mic ${micSource} · SDK audio log ${savedSdkLog === "on" ? "left on" : "skipped"}`);
   // Glasses link changes (connected / disconnected, worn, in case): the usual companions of a slow bridge.
   let lastDevice = "";
   const stopDevice = (bridge as { onDeviceStatusChanged?: (callback: (status: { connectType?: string; isWearing?: boolean; isInCase?: boolean; batteryLevel?: number }) => void) => () => void })
@@ -125,11 +175,17 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
     onShortcut: id => controller.runShortcut(id),
     onAutoExplainTerms: enabled => controller.setAutoExplainTermsEnabled(enabled),
     onClearProviderKeys: () => clearPersistedProviderCredentials(bridge),
-    onSettingsChange: form => controller.saveSettings(form),
+    onSettingsChange: form => {
+      // Answer length also sizes the ambient cue pop-ups on the glasses.
+      (renderer as { setAnswerLength?: (length: string | undefined) => void }).setAnswerLength?.(form.answerLength);
+      return controller.saveSettings(form);
+    },
     onTestKey: (key, model) => controller.testKey(key, model),
+    onTestProviderKey: (provider, key, model) => controller.testProviderKey(provider, key, model),
     onVerify: (target, id) => controller.verify(target, id),
     onVerifyClaim: id => controller.verifyClaim(id), // phone agent: Checks → Claims → Verify
     onRunCopilot: () => controller.runCopilot(),
+    onTodoEdit: op => controller.editTodo(op),
     onTabSeen: tab => presentation.markSeen(tab),
     onTabSelect: tab => { const view = hudViewForTab(tab); if (view) controller.setHudView(view); },
     onModeChange: mode => controller.setMode(mode),
@@ -164,8 +220,10 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   // session or saved on this phone); never sends keys anywhere else, never auto-connects.
   controller.setResumeHandler(async flag => {
     const form = ui.readForm();
-    if (!form.openaiApiKey.trim()) {
-      presentation.setResumePrompt("Add your OpenAI key in Setup, then tap Connect to resume");
+    // Any provider key will do here (a DeepSeek / Qwen / GLM / Kimi session needs no OpenAI key);
+    // Connect itself names the exact key that is missing for the selected providers.
+    if (!providerCredentialsForSession(form)) {
+      presentation.setResumePrompt("Add your provider keys in Setup, then tap Connect to resume");
       ui.selectTab("setup");
       return;
     }
@@ -234,5 +292,7 @@ function mountResumeBanner(host: HTMLElement, onResume: () => void, onDismiss: (
     if (!banner.isConnected) host.prepend(banner);
     banner.hidden = !text;
     resume.textContent = text ?? RESUME_PROMPT;
+    // v0.13 one page scroller: the banner floats at the top of the page; the sticky tab bar sits under it.
+    host.style.setProperty("--banner-h", text ? `${banner.offsetHeight}px` : "0px");
   };
 }

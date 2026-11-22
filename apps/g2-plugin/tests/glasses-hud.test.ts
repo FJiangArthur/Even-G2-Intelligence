@@ -78,7 +78,7 @@ function richPresentation(presentation: ConversationPresentation): void {
 
 async function mount(options: ConstructorParameters<typeof GlassesHud>[1] = {}) {
   const bridge = new FakeBridge();
-  const hud = new GlassesHud(bridge, { tickMs: 0, writeGapMs: 0, captionIntervalMs: 500, ...options });
+  const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0, writeGapMs: 0, captionIntervalMs: 500, ...options });
   const presentation = new ConversationPresentation();
   presentation.subscribe(snapshot => hud.render(snapshot.glasses, snapshot));
   await hud.initialize();
@@ -414,7 +414,7 @@ describe("glasses HUD through the real controller", () => {
       onEvenHubEvent: (callback: (event: EvenHubEvent) => void) => { listener = callback; return () => { listener = undefined; }; },
     });
     const presentation = new ConversationPresentation();
-    const hud = new GlassesHud(bridge, { tickMs: 0 });
+    const hud = new GlassesHud(bridge, { display: "always-on", tickMs: 0 });
     let transport: DirectConversationTransport | undefined;
     const controller = new G2ConversationController(bridge, hud, presentation,
       (options?: DirectConversationOptions) => (transport = new DirectConversationTransport({ ...options, fetch: fake.fetch } as DirectConversationOptions)));

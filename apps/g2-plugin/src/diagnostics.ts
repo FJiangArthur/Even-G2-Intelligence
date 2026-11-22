@@ -4,6 +4,8 @@
  * A small ring buffer in the WebView's own localStorage, mirrored into the Even bridge storage (v0.11.1).
  * Never records keys, transcript text or provider payloads — only lifecycle facts and error messages.
  */
+import { micProbeCheck, micProbeHealth, micProbeState, micProbeWindow } from "./mic-probe";
+
 const KEY = "helix.diagnostics.v1";
 const MAX = 120;
 
@@ -36,16 +38,17 @@ export function readDiagnostics(): DiagnosticEvent[] { return memory ? memory.sl
 
 /** v0.12.1: the heartbeat has its own small key, so the 10 s beat no longer rewrites the whole event log. */
 export const HEARTBEAT_STORE_KEY = "helix.heartbeat.v2";
-let eventsDirty = false, beatDirty = false;
+let eventsDirty = false, beatDirty = false, micDirty = false;
 function flushRemote(): void {
   if (!remote) return;
   if (flushing) { flushAgain = true; return; }
-  if (!eventsDirty && !beatDirty) return;
+  if (!eventsDirty && !beatDirty && !micDirty) return;
   flushing = true;
   const store = remote, writes: Promise<unknown>[] = [];
   try {
     if (eventsDirty) { eventsDirty = false; const payload = JSON.stringify({ events: readDiagnostics() }); writes.push(Promise.resolve().then(() => store.setLocalStorage(DIAGNOSTICS_STORE_KEY, payload))); }
     if (beatDirty) { beatDirty = false; const payload = JSON.stringify(lastHeartbeat ?? null); writes.push(Promise.resolve().then(() => store.setLocalStorage(HEARTBEAT_STORE_KEY, payload))); }
+    if (micDirty) { micDirty = false; const payload = JSON.stringify({ events: micLog }); writes.push(Promise.resolve().then(() => store.setLocalStorage(MIC_STORE_KEY, payload))); }
   } catch { /* unserializable: skip this round */ }
   void Promise.all(writes.map(write => write.catch(() => false))).then(() => {
     flushing = false;
@@ -53,8 +56,8 @@ function flushRemote(): void {
   });
 }
 /** Urgent writes go out now (the next thing may be a hang); the rest are coalesced. */
-function scheduleRemote(urgent: boolean, what: "events" | "beat" = "events"): void {
-  if (what === "events") eventsDirty = true; else beatDirty = true;
+function scheduleRemote(urgent: boolean, what: "events" | "beat" | "mic" = "events"): void {
+  if (what === "events") { eventsDirty = true; if (urgent && micPending) { micPending = 0; micDirty = true; } } else if (what === "beat") beatDirty = true; else micDirty = true;
   if (!remote) return;
   if (urgent) { clearTimeout(flushTimer); flushTimer = undefined; flushRemote(); return; }
   flushTimer ??= setTimeout(() => { flushTimer = undefined; flushRemote(); }, 400);
@@ -65,11 +68,12 @@ function scheduleRemote(urgent: boolean, what: "events" | "beat" = "events"): vo
  * event into it. Call before watchLifecycle. Never throws and never waits more than `timeoutMs`.
  */
 export async function attachDiagnosticsStore(store: DiagnosticsStore, timeoutMs = 1500): Promise<void> {
-  let raw = "", rawBeat = "";
+  let raw = "", rawBeat = "", rawMic = "";
   try {
-    [raw, rawBeat] = await Promise.race([Promise.all([store.getLocalStorage(DIAGNOSTICS_STORE_KEY), store.getLocalStorage(HEARTBEAT_STORE_KEY).catch(() => "")]),
-      new Promise<[string, string]>(done => setTimeout(() => done(["", ""]), timeoutMs))]);
+    [raw, rawBeat, rawMic] = await Promise.race([Promise.all([store.getLocalStorage(DIAGNOSTICS_STORE_KEY), store.getLocalStorage(HEARTBEAT_STORE_KEY).catch(() => ""), store.getLocalStorage(MIC_STORE_KEY).catch(() => "")]),
+      new Promise<[string, string, string]>(done => setTimeout(() => done(["", "", ""]), timeoutMs))]);
   } catch { /* no persisted copy */ }
+  try { micLog = mergeEvents(validEvents(rawMic ? (JSON.parse(rawMic) as { events?: unknown }).events : []), micLog).slice(-MIC_MAX); } catch { /* unreadable microphone log */ }
   try {
     const hb = rawBeat ? JSON.parse(rawBeat) as Partial<Heartbeat> | null : null;
     if (hb && typeof hb.at === "number" && typeof hb.boot === "number") remoteHeartbeat = hb as Heartbeat;
@@ -82,22 +86,27 @@ export async function attachDiagnosticsStore(store: DiagnosticsStore, timeoutMs 
     // <= 0.12.0 kept the heartbeat inside the event payload.
     if (!remoteHeartbeat && hb && typeof hb.at === "number" && typeof hb.boot === "number") remoteHeartbeat = hb as Heartbeat;
   } catch { /* unreadable copy: start fresh */ }
+  memory = mergeEvents(saved, readLocal()).slice(-MAX);
+  remote = store;
+}
+function mergeEvents(a: readonly DiagnosticEvent[], b: readonly DiagnosticEvent[]): DiagnosticEvent[] {
   const seen = new Set<string>(), merged: DiagnosticEvent[] = [];
-  for (const event of [...saved, ...readLocal()].sort((a, b) => a.t < b.t ? -1 : a.t > b.t ? 1 : 0)) {
+  for (const event of [...a, ...b].sort((x, y) => x.t < y.t ? -1 : x.t > y.t ? 1 : 0)) {
     const id = `${event.t}|${event.kind}|${event.detail ?? ""}`;
     if (!seen.has(id)) { seen.add(id); merged.push(event); }
   }
-  memory = merged.slice(-MAX);
-  remote = store;
+  return merged;
 }
 /** Test hook: forget the attached store and in-memory copy. */
 export function resetDiagnosticsForTest(): void {
   remote = undefined; memory = undefined; remoteHeartbeat = undefined; lastHeartbeat = undefined; previousExit = null;
   clearTimeout(flushTimer); flushTimer = undefined; flushing = false; flushAgain = false; eventsDirty = false; beatDirty = false; taps.length = 0; pending.clear(); io.clear(); slowLogged.clear();
+  micLog = []; micLoaded = true; micDirty = false; micPending = 0; lagSum = 0; lagN = 0; lagMax = 0; lateAt = 0; lateMs = 0;
 }
 
 const SECRETISH = /\b(?:sk|rk|pk|ek)-[A-Za-z0-9_-]{8,}|\bBearer\s+\S+/gu;
-const URGENT = /^(?:error|unhandledrejection|stall|bridge-stuck|bridge-slow|startup-failed|previous-page)/u;
+// audio-overload / audio-flush / audio-resume: the page may hang or be killed right after, so they go out at once.
+const URGENT = /^(?:error|unhandledrejection|stall|bridge-stuck|bridge-slow|startup-failed|previous-page|audio-(?:overload|flush|resume))/u;
 
 export function recordDiagnostic(kind: string, detail?: string): void {
   try {
@@ -112,8 +121,56 @@ export function recordDiagnostic(kind: string, detail?: string): void {
 
 export function clearDiagnostics(): void {
   if (memory) memory = [];
-  try { storage()?.removeItem(KEY); } catch { /* ignore */ }
+  micLog = []; micLoaded = true; micDirty = true; micPending = 0;
+  try { storage()?.removeItem(KEY); storage()?.removeItem(MIC_KEY); } catch { /* ignore */ }
   scheduleRemote(true);
+}
+
+// ---- v0.13.2 microphone timing log ----
+// Two lines per 10 s heartbeat while audio events arrive (see mic-probe.ts for what they measure). Kept in
+// their own ring so three minutes of them cannot push lifecycle events out of the main log, and written to
+// the Even bridge storage only every third heartbeat (a bridge write is itself load on a busy phone).
+const MIC_KEY = "helix.diagnostics.mic.v1";
+export const MIC_STORE_KEY = "helix.diagnostics.mic.v2";
+const MIC_MAX = 40, MIC_REMOTE_EVERY = 3;
+let micLog: DiagnosticEvent[] = [], micLoaded = false, micPending = 0;
+function micEvents(): DiagnosticEvent[] {
+  if (!micLoaded) { micLoaded = true; try { const raw = storage()?.getItem(MIC_KEY); micLog = mergeEvents(validEvents(raw ? JSON.parse(raw) : []), micLog).slice(-MIC_MAX); } catch { /* start empty */ } }
+  return micLog;
+}
+const PRESSURE_CALL_MAX_AGE_MS = 15_000;
+// Main-thread timer lateness, from the 1 s watchdog below (visible page only).
+let lagSum = 0, lagN = 0, lagMax = 0, lateAt = 0, lateMs = 0;
+/**
+ * Closes the microphone timing window and logs it (`mic` and `mic-sdk` lines). The heartbeat calls this
+ * every 10 s; returns the lines for tests. Nothing is written when no audio event arrived.
+ */
+export function recordMicWindow(): { mic: string; sdk: string } | undefined {
+  try {
+    const before = micProbeHealth(), health = micProbeCheck();
+    // The probe or the log skip stopped working since the last heartbeat: say so once, in the main log.
+    if (health !== before && health !== "ok") recordDiagnostic("mic-probe", health);
+    const report = micProbeWindow(lagN ? { avg: lagSum / lagN, max: lagMax } : undefined);
+    lagSum = 0; lagN = 0; lagMax = 0;
+    if (!report) return undefined;
+    const t = new Date().toISOString();
+    micLog = [...micEvents(), { t, kind: "mic", detail: report.mic.slice(0, 300) }, { t, kind: "mic-sdk", detail: report.sdk.slice(0, 300) }].slice(-MIC_MAX);
+    try { storage()?.setItem(MIC_KEY, JSON.stringify(micLog)); } catch { /* the persisted copy still gets it */ }
+    if (++micPending >= MIC_REMOTE_EVERY) { micPending = 0; scheduleRemote(false, "mic"); }
+    return report;
+  } catch { return undefined; /* diagnostics must never break the app */ }
+}
+/**
+ * Evidence that the main thread or the Even bridge is backed up right now: the age of the oldest
+ * unanswered bridge call, and the worst timer lateness in the last 6 s. Used by the microphone guard
+ * as a second signal next to the audio delivery rate.
+ */
+export function mainThreadPressure(now = Date.now()): { bridgePendingMs: number; timerLateMs: number } {
+  let oldest = now;
+  // Only calls issued in the last 15 s: the guard acts within seconds of a backlog, so an older unanswered
+  // call is a hung call (a display write the glasses never acknowledged), not evidence of queued audio.
+  for (const call of pending.values()) if (call.at < oldest && now - call.at <= PRESSURE_CALL_MAX_AGE_MS) oldest = call.at;
+  return { bridgePendingMs: now - oldest, timerLateMs: now - lateAt <= 6000 ? lateMs : 0 };
 }
 
 // ---- v0.11.1 hang evidence: last taps, main-thread stalls, Even bridge calls that never return ----
@@ -168,7 +225,7 @@ export function monitorBridge<T extends object>(bridge: T): T {
       if (typeof value !== "function" || typeof property !== "string") return value;
       return (...args: unknown[]) => {
         const result = (value as (...a: unknown[]) => unknown).apply(target, args);
-        if (!result || typeof (result as PromiseLike<unknown>).then !== "function" || args[0] === DIAGNOSTICS_STORE_KEY || args[0] === HEARTBEAT_STORE_KEY) return result;
+        if (!result || typeof (result as PromiseLike<unknown>).then !== "function" || args[0] === DIAGNOSTICS_STORE_KEY || args[0] === HEARTBEAT_STORE_KEY || args[0] === MIC_STORE_KEY) return result;
         const id = ++callId, at = Date.now();
         pending.set(id, { method: property, at });
         const settle = () => {
@@ -194,7 +251,7 @@ export function monitorBridge<T extends object>(bridge: T): T {
 // every 10 s (and on visibility changes, taps and stalls), also mirrored into the Even bridge storage.
 export const HEARTBEAT_KEY = "helix.heartbeat.v1";
 export const HEARTBEAT_MS = 10_000;
-export const STALL_TICK_MS = 1000, STALL_MIN_MS = 1500;
+export const STALL_TICK_MS = 1000, STALL_MIN_MS = 1500, SUSPEND_GAP_MS = 15_000;
 interface Heartbeat { at: number; boot: number; visible: boolean; hiddenAt?: number; clean?: boolean; state?: string; taps?: string; stalls?: number; maxStall?: number; bridge?: string; io?: string }
 /** Verdict on the previous page load; null until read (the UI may ask before watchLifecycle runs). */
 let previousExit: string | undefined | null = null;
@@ -250,8 +307,10 @@ export function diagnosticsReport(): string {
     ...(previousExit ? [`previous page: ${previousExit}`] : []),
     `log storage: ${remote ? "Even bridge + WebView" : "WebView only"}${lastHeartbeat?.stalls ? ` · stalls this run: ${lastHeartbeat.stalls}, longest ${((lastHeartbeat.maxStall ?? 0) / 1000).toFixed(1)} s` : ""}${bridgeHealth() ? ` · Even bridge: ${bridgeHealth()}` : ""}`,
     ...(memory ? [`js heap: ${(memory.usedJSHeapSize / 1048576).toFixed(1)} MB of ${(memory.jsHeapSizeLimit / 1048576).toFixed(0)} MB`] : []),
+    `microphone: ${micProbeState()}`,
     "",
-    ...readDiagnostics().map(e => `${e.t}  ${e.kind}${e.detail ? `  ${e.detail}` : ""}`),
+    // The `mic` / `mic-sdk` lines (one pair per 10 s while audio arrives) are merged in by time.
+    ...mergeEvents(readDiagnostics(), micEvents()).map(e => `${e.t}  ${e.kind}${e.detail ? `  ${e.detail}` : ""}`),
   ];
   return lines.join("\n");
 }
@@ -277,13 +336,27 @@ export function watchLifecycle(handlers: { onResume: (reason: string) => void; o
       ...(trail ? { taps: trail } : {}), ...(stalls ? { stalls, maxStall } : {}), ...(bridge ? { bridge } : {}), ...(glassesIo ? { io: glassesIo } : {}) }, urgent);
   };
   beat();
-  const heartbeat = setInterval(() => beat(), HEARTBEAT_MS);
+  const heartbeat = setInterval(() => { recordMicWindow(); beat(); }, HEARTBEAT_MS);
   // Main-thread stall timer: a 1 s tick that arrives late while the page is on screen means the page
   // could not handle taps or scrolling for that long. Late ticks after a background stay are ignored.
+  let lastSuspendResume = 0;
   let lastTick = Date.now(), visibleSince = document.visibilityState === "visible" ? boot : Number.POSITIVE_INFINITY, stuckReported = 0;
   const watchdog = setInterval(() => {
     const now = Date.now(), late = now - lastTick - STALL_TICK_MS, since = lastTick;
     lastTick = now;
+    // No timer for 15 s or more: the WebView was suspended (phone locked, app in the background). Sockets and
+    // the glasses page may be stale, so run the resume path even if no visibility event arrives. Once a minute at most.
+    if (late >= SUSPEND_GAP_MS && now - lastSuspendResume > 60_000) {
+      lastSuspendResume = now;
+      recordDiagnostic("suspended", `${Math.round(late / 1000)} s without running · ${document.visibilityState}`);
+      try { handlers.onResume("timer-gap"); } catch { /* resume is best effort */ }
+    }
+    // Every on-screen tick's lateness feeds the microphone timing line and the microphone guard.
+    if (late < SUSPEND_GAP_MS && document.visibilityState === "visible" && visibleSince <= since) {
+      const lag = Math.max(0, late);
+      lagSum += lag; lagN += 1; if (lag > lagMax) lagMax = lag;
+      if (lag >= 200 && (now - lateAt > 6000 || lag >= lateMs)) { lateAt = now; lateMs = lag; }
+    }
     // Timers arriving 0.2-1.5 s late: the page is struggling (heavy work, or the phone is throttling a hot app).
     if (late >= 200 && late < STALL_MIN_MS && document.visibilityState === "visible" && visibleSince <= since) countDiagnostic("timer-late", late);
     if (late >= STALL_MIN_MS && document.visibilityState === "visible" && visibleSince <= since) {

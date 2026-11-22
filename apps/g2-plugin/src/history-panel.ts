@@ -1,14 +1,31 @@
-import type { HistoryEntry, HistorySession, RetrievedMemory } from "@helix/conversation-sdk";
+import { sessionRecap, type HistoryEntry, type HistorySession, type RetrievedMemory } from "@helix/conversation-sdk";
 import type { G2ConversationController, HistoryState } from "./controller";
 import { icon, type IconName } from "./pixel-art";
+import { browserTransferEnv, exportFile } from "./file-transfer";
+import { renderNotebook } from "./notebook-panel";
 
 export function safeSourceUrl(value: string): string | undefined {
   if (/[\u0000- \u007f]/u.test(value)) return;
   try { const url = new URL(value); if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password && url.hostname) return url.href; } catch { /* untrusted source */ }
 }
-export function sourceLink(source: { url: string; title: string }): HTMLAnchorElement | undefined {
+/** "2026-11-17" -> "17 Nov 2026" for a source chip; undefined for anything that is not a plain date. */
+export function sourceDateLabel(publishedAt: string | undefined): string | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(publishedAt ?? "");
+  if (!match) return;
+  const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(match[2]) - 1];
+  return month ? `${Number(match[3])} ${month} ${match[1]}` : undefined;
+}
+export function sourceLink(source: { url: string; title: string; publishedAt?: string; dateSource?: string; site?: string }): HTMLAnchorElement | undefined {
   const href = safeSourceUrl(source.url); if (!href) return;
   const link = document.createElement("a"); link.href = href; link.textContent = source.title || href;
+  // News search: show when the page was published, and say where that date came from.
+  const date = sourceDateLabel(source.publishedAt);
+  if (date) {
+    const stamp = document.createElement("span"); stamp.className = "source-date";
+    stamp.textContent = ` · ${source.site ? `${source.site} · ` : ""}${date}`;
+    stamp.title = source.dateSource === "model" ? "Date reported by the model for this page" : "Publication date from the search results";
+    link.append(stamp);
+  }
   link.target = "_blank"; link.rel = "noopener noreferrer"; return link;
 }
 export function memoryEntryIds(entry: HistoryEntry): string[] {
@@ -157,7 +174,7 @@ export function cleanTranscript(entries: readonly HistoryEntry[]): TranscriptLin
     } else if (entry.kind === "question") {
       const label = (entry.speaker ?? "").trim();
       if (/^local context$/iu.test(label) || /^whole conversation$/iu.test(label)) {
-        lines.push({ speaker: "You", text: /^local/iu.test(label) ? "asked Helix about the last minute" : "asked Helix about the whole conversation", kind: "request", entryIds: [entry.id] });
+        lines.push({ speaker: "You", text: /^local/iu.test(label) ? "asked Helix about the last few sentences" : "asked Helix about the whole conversation", kind: "request", entryIds: [entry.id] });
         continue;
       }
       const text = cleanLineText(raw);
@@ -200,30 +217,111 @@ export function formatDuration(startIso: string, endIso: string): string {
 export const SOURCE_LABEL: Readonly<Record<KnowledgeSourceId, string>> = { helix: "Helix", omi: "Omi", obsidian: "Obsidian" };
 export const SOURCE_ICON: Readonly<Record<KnowledgeSourceId, IconName>> = { helix: "glasses", omi: "ring", obsidian: "gem" };
 
-/** Display title: cleaned, and the placeholder "Helix · <ISO>" becomes "Helix session · Nov 5, 7:00 PM". */
-export function sessionTitle(session: HistorySession): string {
-  const title = cleanLineText(session.title) || "Untitled session";
-  return /^Helix · \d{4}-/u.test(title) ? `Helix session · ${formatSessionDate(session.startedAt)}` : title;
+/** Local calendar day of a session, for grouping: "2026-11-19". */
+export function sessionDayKey(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
+/** Day heading: "Today", "Yesterday", else "Mon, Nov 16" (with the year when it is not this year). */
+export function formatSessionDay(iso: string, now: number = Date.now()): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "Undated";
+  const today = new Date(now), yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (sessionDayKey(iso) === sessionDayKey(today.toISOString())) return "Today";
+  if (sessionDayKey(iso) === sessionDayKey(yesterday.toISOString())) return "Yesterday";
+  return date.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric", ...(date.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }) });
+}
+export function formatSessionTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
+
+/**
+ * Display title. v0.13: the generated title when the session has one, an imported title as it came,
+ * and otherwise a title derived on the phone from the summary or the transcript's topic words: never
+ * the first thing that was said, and never the "Helix · <ISO time>" placeholder.
+ */
+export function sessionTitle(session: HistorySession, entries: readonly HistoryEntry[] = []): string {
+  return cleanLineText(sessionRecap(session, entries).title) || "Untitled session";
+}
+
+/** A PDF added in Knowledge (pdf-knowledge.ts, id "pdf:..."): a document in the knowledge base, not a conversation. */
+export function isDocumentSession(session: Pick<HistorySession, "id">): boolean { return session.id.startsWith("pdf:"); }
 
 /** Session list card data (pure, testable). */
 export interface SessionCardView {
-  readonly id: string; readonly title: string; readonly source: KnowledgeSourceId; readonly date: string; readonly duration: string;
-  readonly summary: string; readonly people: string[]; readonly lines: number; readonly answers: number;
+  readonly id: string; readonly title: string; readonly source: KnowledgeSourceId;
+  /** "Nov 19, 12:00 PM" · day key for grouping · "12:00 PM" · "6 min". */
+  readonly date: string; readonly day: string; readonly time: string; readonly duration: string;
+  /** One-to-two line summary of the conversation ("" when nothing is known). */
+  readonly summary: string;
+  /** Who wrote title + summary: the summary model, the phone (fallback), or the import. */
+  readonly origin: "model" | "fallback" | "imported";
+  readonly people: string[];
+  /** Speaker turns in the transcript, and answers Helix gave. */
+  readonly lines: number; readonly answers: number;
+  /** "10 speaker turns · 2 Helix answers": what the two numbers count. */
+  readonly counts: string;
+  readonly startedAt: string;
+  /** True for a PDF document: listed under "Documents", not under the day it was added. */
+  readonly document?: boolean;
 }
 export function sessionCard(session: HistorySession, entries: readonly HistoryEntry[]): SessionCardView {
   const knowledge = sessionKnowledge(session, entries);
   const lines = cleanTranscript(entries);
   const times = entries.map(entry => entry.occurredAt).filter(Boolean).sort();
   const start = times[0] ?? session.startedAt, end = times.at(-1) ?? session.updatedAt;
-  const speech = lines.filter(line => line.kind === "speech");
-  const summary = knowledge.summary.slice(0, 2).join(" ") || speech.slice(0, 2).map(line => `${line.speaker}: ${line.text}`).join(" ");
+  const speech = lines.filter(line => line.kind === "speech"), answers = lines.filter(line => line.kind === "helix").length;
+  const recap = sessionRecap(session, entries);
+  const document = isDocumentSession(session);
+  // A PDF is described by what pdf-knowledge.ts stored about it ("PDF document, 12 pages, parsed on this phone"), not as an unsummarised talk.
+  const summary = cleanLineText(document ? session.overview?.trim() || (session.keyFacts?.[0] ?? "") : recap.overview);
+  const todos = session.todos ?? [], notes = session.notes ?? [];
   return {
-    id: session.id, title: sessionTitle(session),
-    source: sessionSource(session), date: formatSessionDate(session.startedAt), duration: formatDuration(start, end),
-    summary: summary.length > 220 ? `${summary.slice(0, 217).trimEnd()}…` : summary,
-    people: knowledge.people.map(person => person.name), lines: speech.length, answers: lines.filter(line => line.kind === "helix").length,
+    id: session.id, title: cleanLineText(recap.title) || "Untitled session",
+    source: sessionSource(session), date: formatSessionDate(session.startedAt), day: sessionDayKey(session.startedAt), time: formatSessionTime(session.startedAt),
+    duration: document ? "" : formatDuration(start, end),
+    summary: summary.length > 240 ? `${summary.slice(0, 237).trimEnd()}…` : summary, origin: recap.origin,
+    people: knowledge.people.map(person => person.name), lines: speech.length, answers,
+    counts: document ? plural(entries.length, "passage")
+      : `${plural(speech.length, "speaker turn")} · ${plural(answers, "Helix answer")}${todos.length ? ` · ${plural(todos.length, "to-do")} (${todos.filter(item => !item.done).length} open)` : ""}${notes.length ? ` · ${plural(notes.length, "note")}` : ""}`,
+    startedAt: session.startedAt,
+    ...(document ? { document } : {}),
   };
+}
+/** Day key and label of the group that holds PDF documents (after the conversations). */
+export const DOCUMENTS_GROUP = "documents";
+/** Conversations newest first by start time, in day groups; PDF documents follow in one "Documents" group (pure). */
+export function groupSessionCards<T extends { readonly day: string; readonly startedAt: string; readonly document?: boolean }>(cards: readonly T[], now: number = Date.now()): { day: string; label: string; cards: T[] }[] {
+  const groups: { day: string; label: string; cards: T[] }[] = [];
+  const sorted = [...cards].sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt)), documents = sorted.filter(card => card.document);
+  for (const card of sorted) {
+    if (card.document) continue;
+    const last = groups.at(-1);
+    if (last?.day === card.day) last.cards.push(card);
+    else groups.push({ day: card.day, label: formatSessionDay(card.startedAt, now), cards: [card] });
+  }
+  if (documents.length) groups.push({ day: DOCUMENTS_GROUP, label: "Documents", cards: documents });
+  return groups;
+}
+/** Where a session's title and summary came from, for the session view (model, prompt version and time are kept as provenance). */
+export function recapProvenance(session: HistorySession): string {
+  const recap = session.recap;
+  if (recap?.origin === "model") return `Summary by ${recap.model ?? "the summary model"} · ${formatSessionDate(recap.generatedAt)}${recap.promptVersion ? ` · ${recap.promptVersion}` : ""}`;
+  if (isDocumentSession(session)) return "PDF document · added in Knowledge";
+  if (sessionSource(session) !== "helix") return `Imported from ${SOURCE_LABEL[sessionSource(session)]}`;
+  return recap ? `Title made on this phone · ${formatSessionDate(recap.generatedAt)} · no AI summary yet` : "Title made on this phone · no AI summary yet";
+}
+/** What "Let the knowledge base read history" does, in one line (pure). */
+export function historyKnowledgeNote(on: boolean, openai: boolean): string {
+  // One switch for everything that is saved (config useLocalMemory): conversations and what was imported in Knowledge.
+  const scope = " It covers everything saved here: your conversations and what you imported in Knowledge (Omi, Obsidian notes, PDFs).";
+  if (!on) return `Off: saved sessions are never read for answers and are not synced to OpenAI. They stay on this phone.${scope}`;
+  return (openai
+    ? "On: each question is searched in your synced OpenAI knowledge base (the phone is the fallback), and up to 5 short matching passages with their session title, speaker and time are sent to your answer provider with the question."
+    : "On: for each answer Helix searches saved sessions on this phone and sends up to 5 short matching passages with their session title, speaker and time to your answer provider with the question.") + scope;
 }
 
 /** v0.11 AI cues: what Helix said in a session, each answer with the question that triggered it. */
@@ -234,7 +332,7 @@ export function sessionCues(entries: readonly HistoryEntry[]): SessionCue[] {
   for (const entry of entries) {
     if (entry.kind === "question") {
       const label = (entry.speaker ?? "").trim();
-      question = /^local context$/iu.test(label) ? "You asked about the last minute" : /^whole conversation$/iu.test(label) ? "You asked about the whole conversation" : cleanLineText(entry.text ?? "") || undefined;
+      question = /^local context$/iu.test(label) ? "You asked about the last few sentences" : /^whole conversation$/iu.test(label) ? "You asked about the whole conversation" : cleanLineText(entry.text ?? "") || undefined;
     } else if (entry.kind === "answer") {
       const text = cleanLineText(entry.text ?? "");
       if (text) cues.push({ kind: "answer", text, ...(question ? { question } : {}) });
@@ -264,7 +362,7 @@ export function sessionMindmap(session: HistorySession, entries: readonly Histor
     { kind: "concepts", label: "Concepts", children: knowledge.concepts.map(concept => concept.term) },
     { kind: "questions", label: "Questions", children: questions.map(short) },
   ];
-  return { label: sessionTitle(session), children: branches.filter(branch => branch.children.length) };
+  return { label: sessionTitle(session, entries), children: branches.filter(branch => branch.children.length) };
 }
 
 /* ------------------------------------------------------------------------- panel */
@@ -280,6 +378,23 @@ const button = (label: string, className: string, iconName?: IconName): HTMLButt
   if (iconName) node.append(iconSpan(iconName, "button-icon"));
   node.append(element("span", label, "button-label")); return node;
 };
+
+/**
+ * In-page confirmation for a destructive action (never window.confirm: a native dialog can block the
+ * Even WebView). The safe choice comes first and takes focus; Escape cancels.
+ */
+export function confirmBar(message: string, confirmLabel: string, onConfirm: () => void, onCancel: () => void): HTMLElement {
+  const bar = element("div", undefined, "confirm-bar"); bar.setAttribute("role", "alertdialog"); bar.setAttribute("aria-label", confirmLabel);
+  const text = element("p", message, "confirm-text");
+  const keep = button("Keep", "button button-secondary button-small confirm-cancel");
+  const go = button(confirmLabel, "button button-small confirm-go", "cross");
+  keep.addEventListener("click", onCancel); go.addEventListener("click", onConfirm);
+  bar.addEventListener("keydown", event => { if (event.key === "Escape") { event.stopPropagation(); onCancel(); } });
+  const row = element("div", undefined, "confirm-actions"); row.append(keep, go);
+  bar.append(text, row);
+  queueMicrotask(() => { if (bar.isConnected) { keep.focus({ preventScroll: true }); bar.scrollIntoView?.({ block: "nearest" }); } });
+  return bar;
+}
 
 export interface HistoryPanelOptions {
   readonly onAsk?: (question: string) => void | Promise<void>;
@@ -314,20 +429,70 @@ export class HistoryPanel {
   private listSignature?: string;
   private notice = "";
 
+  // ---- v0.13: knowledge toggle, select-to-remove and in-page confirmation ----
+  private readonly knowledgeToggle = element("input");
+  private readonly knowledgeNote = element("p", undefined, "field-note history-knowledge-note");
+  private readonly selectButton = button("Select", "button button-quiet button-small history-select");
+  private readonly selectBar = element("div", undefined, "history-select-bar");
+  private readonly confirmSlot = element("div", undefined, "history-confirm-slot");
+  /** Select mode: the ids ticked for removal (undefined = not selecting). */
+  private picked?: Set<string>;
+
   constructor(root: HTMLElement, private readonly controller: G2ConversationController, private readonly options: HistoryPanelOptions = {}) {
     this.panel.className = "history-panel"; this.panel.id = "history-panel";
     this.panel.setAttribute("aria-label", "Saved sessions");
-    const privacy = element("p", "Sessions stay on this phone. Deleting a session removes it from local retrieval. Memory toggles, imports and exports are in Knowledge.", "field-note");
+    const privacy = element("p", "Sessions stay on this phone. Open one to export it or remove it; imports and exports are in Knowledge. PDFs you added are listed last, under Documents.", "field-note");
+    // The same setting as Knowledge → "Use saved knowledge in answers" (config useLocalMemory): one switch, shown in both tabs.
+    const knowledge = element("section", undefined, "history-knowledge");
+    this.knowledgeToggle.type = "checkbox"; this.knowledgeToggle.id = "history-knowledge-read";
+    const toggleLabel = element("label", undefined, "toggle"); toggleLabel.htmlFor = this.knowledgeToggle.id;
+    const toggleText = element("span", "Let the knowledge base read history");
+    toggleText.append(element("small", "Answers can use and cite your saved sessions and imported documents, so Helix gets smarter as you go"));
+    toggleLabel.append(this.knowledgeToggle, toggleText);
+    this.knowledgeNote.id = "history-knowledge-note"; this.knowledgeToggle.setAttribute("aria-describedby", this.knowledgeNote.id);
+    this.knowledgeToggle.addEventListener("change", () => { void controller.setLocalMemoryEnabled(this.knowledgeToggle.checked); });
+    knowledge.append(toggleLabel, this.knowledgeNote);
     this.status.id = "history-status"; this.status.className = "field-note history-status"; this.status.setAttribute("role", "status"); this.status.setAttribute("aria-live", "polite");
     this.search.type = "search"; this.search.id = "history-search"; this.search.placeholder = "Search English or 中文 history";
     const searchLabel = element("label", "Search sessions", "sr-only"); searchLabel.htmlFor = this.search.id;
     this.search.addEventListener("input", () => { this.listSignature = undefined; this.renderList(); });
+    const tools = element("div", undefined, "history-tools");
+    this.selectButton.id = "history-select"; this.selectButton.setAttribute("aria-pressed", "false");
+    this.selectButton.addEventListener("click", () => this.setSelecting(!this.picked));
+    tools.append(this.search, this.selectButton);
+    this.selectBar.hidden = true;
     this.list.className = "card-list session-list"; this.detail.className = "history-detail"; this.detail.hidden = true;
     this.listView.className = "history-list-view";
-    this.listView.append(privacy, searchLabel, this.search, this.status, this.list);
+    this.listView.append(privacy, knowledge, searchLabel, tools, this.selectBar, this.confirmSlot, this.status, this.list);
     this.panel.append(this.listView, this.detail);
     root.append(this.panel);
     this.unsubscribe = controller.subscribeHistory(state => this.render(state));
+  }
+  private setSelecting(on: boolean): void {
+    this.picked = on ? new Set() : undefined;
+    this.confirmSlot.replaceChildren();
+    this.selectButton.setAttribute("aria-pressed", String(on));
+    this.selectButton.querySelector(".button-label")!.textContent = on ? "Done" : "Select";
+    this.listSignature = undefined; this.rows.clear(); this.renderList();
+  }
+  private renderSelectBar(): void {
+    const count = this.picked?.size ?? 0;
+    this.selectBar.hidden = !this.picked;
+    if (!this.picked) { this.selectBar.replaceChildren(); return; }
+    const remove = button(count ? `Remove ${count}` : "Remove", "button button-secondary button-small history-remove-picked", "cross");
+    remove.disabled = !count;
+    remove.addEventListener("click", () => {
+      const ids = [...this.picked ?? []];
+      this.confirmSlot.replaceChildren(confirmBar(`Remove ${plural(ids.length, "session")} from this phone? Their transcripts, answers, summaries, to-dos and notes (for a PDF: its text) are deleted and cannot be restored.`,
+        `Remove ${ids.length}`, () => { this.confirmSlot.replaceChildren(); this.removeSessions(ids, () => this.setSelecting(false)); }, () => this.confirmSlot.replaceChildren()));
+    });
+    this.selectBar.replaceChildren(element("span", count ? `${count} selected` : "Tap the sessions to remove", "field-note"), remove);
+  }
+  /** Confirmed removal: every store, the retrieval index and the OpenAI knowledge base (see controller.removeHistorySessions). */
+  private removeSessions(ids: readonly string[], done: () => void): void {
+    this.setNotice(`Removing ${plural(ids.length, "session")}…`);
+    void this.controller.removeHistorySessions(ids, this.options.openaiKey?.() ?? "")
+      .then(result => { done(); this.setNotice(result.message); }, error => this.setNotice(error instanceof Error ? error.message : String(error)));
   }
   public dispose(): void { this.unsubscribe(); clearTimeout(this.renderTimer); this.panel.remove(); }
   public focusSearch(): void { this.back(); this.search.scrollIntoView?.({ block: "center" }); this.search.focus({ preventScroll: true }); }
@@ -359,6 +524,8 @@ export class HistoryPanel {
   private readonly cards = new Map<string, { stamp: string; card: SessionCardView }>();
   private render(state: HistoryState): void {
     this.status.textContent = this.notice || state.status;
+    this.knowledgeToggle.checked = state.useLocalMemory;
+    this.knowledgeNote.textContent = historyKnowledgeNote(state.useLocalMemory, state.knowledge.source === "openai" && state.knowledge.synced > 0);
     if (this.hidden()) { this.dirty = true; return; }
     if (this.renderTimer !== undefined) return;
     const wait = this.lastRender + RENDER_INTERVAL_MS - Date.now();
@@ -379,42 +546,73 @@ export class HistoryPanel {
     const query = this.search.value.trim();
     const hits = query ? this.controller.searchHistory(query) : [];
     // Include title-only imported conversations, which have no searchable entry.
-    const all = this.controller.listHistorySessions(), live = new Set(all.map(session => session.id));
+    // v0.13: a Helix record with nothing in it is not a conversation (earlier versions saved one per Connect).
+    const all = this.controller.listHistorySessions().filter(session => this.controller.historySessionHasContent(session)), live = new Set(all.map(session => session.id));
     for (const id of this.cards.keys()) if (!live.has(id)) { this.cards.delete(id); this.rows.delete(id); }
-    const sessions = all.filter(session => !query || session.title.normalize("NFKC").toLowerCase().includes(query.normalize("NFKC").toLowerCase()) || hits.some(hit => hit.session.id === session.id));
-    const cards = sessions.map(session => {
+    if (this.picked) for (const id of this.picked) if (!live.has(id)) this.picked.delete(id);
+    const liveId = this.controller.liveSessionId(), wanted = query.normalize("NFKC").toLowerCase();
+    const cards = all.map(session => {
       const stamp = `${this.controller.historyEntryCount(session.id)}|${JSON.stringify(session)}`, cached = this.cards.get(session.id);
       if (cached?.stamp === stamp) return cached.card;
       const card = sessionCard(session, this.controller.openHistorySession(session.id)?.entries ?? []);
       this.cards.set(session.id, { stamp, card });
       return card;
-    });
-    const signature = JSON.stringify([query, cards, hits.map(hit => hit.entry.id)]);
+    }).filter(card => !query || `${card.title}\n${card.summary}`.normalize("NFKC").toLowerCase().includes(wanted) || hits.some(hit => hit.session.id === card.id));
+    const states = cards.map(card => [card.id === liveId, this.controller.sessionSummaryPending(card.id), this.picked?.has(card.id) ?? null]);
+    const groups = groupSessionCards(cards);
+    const signature = JSON.stringify([query, groups.map(group => group.label), cards, states, hits.map(hit => hit.entry.id)]);
     if (signature === this.listSignature) return;
     this.listSignature = signature;
+    this.renderSelectBar();
     // Keyed rows: only sessions whose row data changed are rebuilt (the live session, once a second).
     const items: HTMLElement[] = [];
-    for (const card of cards) {
-      const hit = hits.find(found => found.session.id === card.id)?.entry.id;
-      const rowSignature = JSON.stringify([card, hit]), existing = this.rows.get(card.id);
-      if (existing?.signature === rowSignature) { items.push(existing.node); continue; }
-      const item = element("li", undefined, "session-item");
-      const open = element("button", undefined, `card session-card source-${card.source}`); open.type = "button";
-      open.dataset.sessionId = card.id;
-      // v0.11: one compact row per session (title, when, how long, counts); details are in the tabs.
-      open.classList.add("session-row");
-      const main = element("span", undefined, "row-main");
-      main.append(element("strong", card.title, "card-title"), element("span", [card.date, card.duration].filter(Boolean).join(" · "), "session-meta"));
-      open.append(iconSpan(SOURCE_ICON[card.source]), main,
-        element("span", `${card.lines} · ${card.answers}`, "session-counts"), element("span", undefined, "row-chevron"));
-      open.title = `${card.lines} line${card.lines === 1 ? "" : "s"} · ${card.answers} answer${card.answers === 1 ? "" : "s"}`;
-      open.setAttribute("aria-label", `${card.title}, ${SOURCE_LABEL[card.source]}, ${card.date}${card.duration ? `, ${card.duration}` : ""}`);
-      open.addEventListener("click", () => this.open(card.id, hit));
-      item.append(open); items.push(item);
-      this.rows.set(card.id, { signature: rowSignature, node: item });
+    for (const group of groups) {
+      const heading = element("li", undefined, "session-day"); heading.setAttribute("role", "presentation");
+      heading.append(element("h3", group.label, "session-day-label"), element("span", plural(group.cards.length, group.day === DOCUMENTS_GROUP ? "document" : "session"), "session-day-count"));
+      items.push(heading);
+      for (const card of group.cards) {
+        const hit = hits.find(found => found.session.id === card.id)?.entry.id;
+        const isLive = card.id === liveId, summarising = this.controller.sessionSummaryPending(card.id), picked = this.picked?.has(card.id);
+        const rowSignature = JSON.stringify([card, hit, isLive, summarising, picked ?? null]), existing = this.rows.get(card.id);
+        if (existing?.signature === rowSignature) { items.push(existing.node); continue; }
+        items.push(this.sessionRow(card, { hit, isLive, summarising, picked }));
+        this.rows.set(card.id, { signature: rowSignature, node: items.at(-1)! });
+      }
     }
     this.list.replaceChildren(...items);
-    if (!sessions.length) this.list.append(element("li", query ? "No matching sessions." : "No saved sessions yet. Connect and talk, or import from Omi or Obsidian in Knowledge.", "field-note"));
+    if (!cards.length) this.list.append(element("li", query ? "No matching sessions." : "No saved sessions yet. Connect and talk, or import from Omi or Obsidian in Knowledge.", "field-note"));
+  }
+  /** One session card: title, when and how long, a one-to-two line summary, and labelled counts. */
+  private sessionRow(card: SessionCardView, state: { hit?: string | undefined; isLive: boolean; summarising: boolean; picked?: boolean | undefined }): HTMLElement {
+    const item = element("li", undefined, "session-item");
+    const open = element("button", undefined, `card session-card source-${card.source}`); open.type = "button";
+    open.dataset.sessionId = card.id;
+    const head = element("span", undefined, "session-head");
+    if (state.picked !== undefined) { const tick = element("span", undefined, `session-tick${state.picked ? " is-on" : ""}`); tick.setAttribute("aria-hidden", "true"); head.append(tick); }
+    else head.append(iconSpan(SOURCE_ICON[card.source]));
+    head.append(element("strong", card.title, "card-title"));
+    if (state.isLive) head.append(element("span", "Live", "status-pill pill-live"));
+    else if (state.summarising) head.append(element("span", "Summarising…", "status-pill"));
+    else if (card.document) head.append(element("span", "PDF", "source-badge badge-pdf"));
+    else if (card.source !== "helix") head.append(element("span", SOURCE_LABEL[card.source], `source-badge badge-${card.source}`));
+    const when = element("span", [card.date, card.duration].filter(Boolean).join(" · "), "session-meta");
+    open.append(head, when);
+    if (card.summary) open.append(element("span", card.summary, "session-summary"));
+    open.append(element("span", card.counts, "session-counts"));
+    const label = `${card.title}, ${card.document ? "PDF document" : SOURCE_LABEL[card.source]}, ${card.date}${card.duration ? `, ${card.duration}` : ""}, ${card.counts}`;
+    if (state.picked !== undefined) {
+      open.setAttribute("aria-pressed", String(state.picked)); open.setAttribute("aria-label", `${state.picked ? "Selected" : "Select"}: ${label}`);
+      open.addEventListener("click", () => {
+        if (!this.picked) return;
+        if (this.picked.has(card.id)) this.picked.delete(card.id); else this.picked.add(card.id);
+        this.confirmSlot.replaceChildren(); this.listSignature = undefined; this.renderList();
+      });
+    } else {
+      open.setAttribute("aria-label", label);
+      open.addEventListener("click", () => this.open(card.id, state.hit));
+    }
+    item.append(open);
+    return item;
   }
   private renderDetail(): void {
     if (!this.selected) return;
@@ -426,7 +624,7 @@ export class HistoryPanel {
       const original = this.controller.historySessionOfEntry(id);
       if (original) originals.set(id, original);
     }
-    const signature = JSON.stringify([this.detailTab, record, this.selectedEntry, record?.entries.flatMap(entry => memoryEntryIds(entry).map(id => originals.get(id)))]);
+    const signature = JSON.stringify([this.detailTab, record, this.selectedEntry, this.controller.sessionSummaryPending(this.selected), record?.entries.flatMap(entry => memoryEntryIds(entry).map(id => originals.get(id)))]);
     if (signature === this.detailSignature) return;
     this.detailSignature = signature;
     this.listView.hidden = true; this.detail.hidden = false;
@@ -439,8 +637,13 @@ export class HistoryPanel {
     const knowledge = sessionKnowledge(session, entries);
     const head = element("header", undefined, "detail-head");
     const titleRow = element("div", undefined, "card-head");
-    titleRow.append(iconSpan(SOURCE_ICON[card.source]), element("h3", card.title, "detail-title"), element("span", SOURCE_LABEL[card.source], `source-badge badge-${card.source}`));
-    head.append(titleRow, element("p", [card.date, card.duration, `${card.lines} lines`].filter(Boolean).join(" · "), "session-meta"));
+    titleRow.append(iconSpan(SOURCE_ICON[card.source]), element("h3", card.title, "detail-title"),
+      card.document ? element("span", "PDF", "source-badge badge-pdf") : element("span", SOURCE_LABEL[card.source], `source-badge badge-${card.source}`));
+    // v0.13: the session view leads with when it was, its summary and where that summary came from.
+    head.append(titleRow, element("p", [formatSessionDay(session.startedAt), card.time, card.duration].filter(Boolean).join(" · "), "session-meta"),
+      element("p", card.counts, "session-counts"));
+    if (card.summary) head.append(element("p", card.summary, "detail-overview"));
+    head.append(element("p", this.controller.sessionSummaryPending(session.id) ? "Writing the summary…" : recapProvenance(session), "field-note detail-provenance"));
     this.detail.append(head);
 
     // Export / send
@@ -448,15 +651,19 @@ export class HistoryPanel {
     const exportButton = button("Export .md", "button button-secondary button-small", "download");
     const copyButton = button("Copy Markdown", "button button-secondary button-small", "copy");
     const omiButton = button("Send to Omi", "button button-secondary button-small", "send");
-    const remove = button("Delete", "button button-quiet button-small", "cross");
-    const support = card.source === "omi" ? { supported: false, reason: "This session came from Omi, so it is already there." } : this.controller.omiExportSupport();
+    const remove = button("Remove", "button button-quiet button-small detail-remove", "cross");
+    const support = card.source === "omi" ? { supported: false, reason: "This session came from Omi, so it is already there." }
+      : card.document ? { supported: false, reason: "PDF documents are not sent to Omi." } : this.controller.omiExportSupport();
     omiButton.disabled = !support.supported;
     if (!support.supported) omiButton.title = support.reason;
     const markdown = () => this.controller.sessionMarkdown(session.id) ?? "";
     exportButton.addEventListener("click", () => {
-      const result = downloadFile(markdownFileName(card.title, session.startedAt), markdown(), "text/markdown");
-      this.setNotice(result.ok ? `Saved ${result.name}. If nothing downloaded, use Copy Markdown.` : "Downloads are blocked here. Use Copy Markdown instead.");
-      if (result.link) this.detail.querySelector(".detail-actions")?.append(result.link);
+      // v0.13: share sheet -> browser download -> clipboard -> Markdown preview, and the notice says which one happened.
+      const text = markdown();
+      void exportFile<HTMLAnchorElement>({ name: markdownFileName(card.title, session.startedAt), content: text, type: "text/markdown", text }, browserTransferEnv(copyToClipboard)).then(result => {
+        this.setNotice(result.method === "view" ? "Saving and copying are both blocked here. Open “Markdown for Obsidian” below and select the text." : result.message);
+        if (result.link) this.detail.querySelector(".detail-actions")?.append(result.link);
+      });
     });
     copyButton.addEventListener("click", () => { void copyToClipboard(markdown()).then(ok => this.setNotice(ok ? "Markdown copied. Paste it into a new Obsidian note." : "Copy was blocked. Open the Markdown preview below and select the text.")); });
     omiButton.addEventListener("click", () => {
@@ -464,13 +671,16 @@ export class HistoryPanel {
       void this.controller.exportSessionsToOmi([session.id], this.options.omiKey?.() ?? "").then(result => this.setNotice(result.message), error => this.setNotice(error instanceof Error ? error.message : String(error)))
         .finally(() => { omiButton.disabled = !support.supported; });
     });
+    // v0.13: confirmation is part of the page (a native confirm dialog can block the Even WebView).
+    const confirmSlot = element("div", undefined, "history-confirm-slot");
     remove.addEventListener("click", () => {
-      if (window.confirm(`Delete “${card.title}” from this phone and local retrieval?`)) {
-        void this.controller.deleteHistorySession(session.id).then(() => this.back()).catch(() => {});
-      }
+      const what = card.document ? "The PDF’s text is deleted from the knowledge base (answers can no longer use it) and cannot be restored."
+        : `Its transcript, answers and summary${session.todos?.length || session.notes?.length ? ", and its to-dos and notes," : ""} are deleted and cannot be restored.`;
+      confirmSlot.replaceChildren(confirmBar(`Remove “${card.title}” from this phone? ${what}`,
+        card.document ? "Remove document" : "Remove session", () => { confirmSlot.replaceChildren(); this.removeSessions([session.id], () => this.back()); }, () => { confirmSlot.replaceChildren(); remove.focus({ preventScroll: true }); }));
     });
     actions.append(exportButton, copyButton, omiButton, remove);
-    this.detail.append(actions);
+    this.detail.append(actions, confirmSlot);
     if (!support.supported) this.detail.append(element("p", support.reason, "field-note"));
 
     // v0.11 tabs: Summary · AI cues · Transcript · Mindmap
@@ -514,6 +724,13 @@ export class HistoryPanel {
         for (const fact of knowledge.keyFacts) list.append(element("li", fact, "fact-row fact-text"));
         section("Key facts", "coin").append(list);
       }
+      // Notes mode: the session's to-do list (editable once the session has ended) and running notes.
+      if (session.todos?.length || session.notes?.length) {
+        const live = this.controller.liveSessionId() === session.id;
+        pane.append(renderNotebook({ todos: session.todos ?? [], notes: session.notes ?? [] },
+          op => { void this.controller.editTodo(op, session.id).then(() => { this.detailSignature = undefined; this.renderDetail(); }, error => this.setNotice(error instanceof Error ? error.message : String(error))); },
+          { editable: !live, readOnlyNote: "This session is live. Edit its to-dos in the Summary tab." }));
+      }
       if (knowledge.people.length) {
         const chips = element("div", undefined, "chip-row");
         for (const person of knowledge.people) {
@@ -525,7 +742,7 @@ export class HistoryPanel {
         }
         section("People", "people").append(chips);
       }
-      if (!hasKnowledge) pane.append(element("p", lines.some(line => line.kind === "speech")
+      if (!hasKnowledge && !session.todos?.length && !session.notes?.length) pane.append(element("p", lines.some(line => line.kind === "speech")
         ? "No summary was saved for this session. Generate one from the transcript (one small model call with your OpenAI key)." : "Nothing was said in this session.", "field-note"));
       if (lines.some(line => line.kind === "speech")) pane.append(generate(hasKnowledge ? "Regenerate summary" : "Generate summary"));
     } else if (this.detailTab === "cues") {
@@ -621,6 +838,8 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * @deprecated v0.13: use exportFile() from ./file-transfer, which falls back to the share sheet,
+ * the clipboard or an in-page view and reports which one happened. This always reports ok.
  * Blob + object-URL download. Also returns a visible link the wearer can tap, because the Even
  * App WebView may ignore programmatic downloads. The URL is revoked after a minute.
  */

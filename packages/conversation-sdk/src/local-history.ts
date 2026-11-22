@@ -1,4 +1,6 @@
 import type { KnowledgeSource } from "./copilot-types.js";
+import { CJK_CHAR, RetrievalCancelled, RetrievalIndex, bounded, normalize, retrievalClock, runNow, runSliced, terms, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
+import { MAX_SESSION_NOTES, MAX_TODOS, cleanSessionNotes, cleanTodos, sameTodoText, type SessionNote, type TodoItem } from "./todo-list.js";
 
 /** Storage is provided by the phone host; no network or provider credentials are involved. */
 export interface HistoryStorage {
@@ -11,7 +13,27 @@ export interface HistorySession {
   id: string; source: KnowledgeSource; title: string; startedAt: string; updatedAt: string;
   /** v0.8 session knowledge (all optional; <= 20 items of <= 500 chars each). */
   summary?: string[]; keyFacts?: string[]; people?: SessionPerson[]; concepts?: string[]; tags?: string[];
+  /** Notes mode: the session's to-do list (<= 60 items) and running notes (<= 80), saved with the session. */
+  todos?: TodoItem[]; notes?: SessionNote[];
+  /** v0.13 post-conversation recap: a one-to-two sentence summary shown on the History card (<= 500 chars). */
+  overview?: string;
+  /** When the session ended (Stop / disconnect). Absent for interrupted and imported sessions. */
+  endedAt?: string;
+  /** Provenance of `title` + `overview` (+ `summary` when the model wrote it). Absent: the title is not a generated one. */
+  recap?: SessionRecapMeta;
+  /** Id of the session this one continues after an interruption (tap to resume). Merged by mergeSession. */
+  continues?: string;
 }
+/** Who wrote a session's title/overview and when. `fallback` = derived on the phone without a model call. */
+export interface SessionRecapMeta {
+  origin: "model" | "fallback"; generatedAt: string;
+  model?: string; provider?: string; endpoint?: string; promptVersion?: string; latencyMs?: number;
+}
+/** Recap fields of a session, set together by updateSessionRecap. Absent fields keep the stored value. */
+export type SessionRecap = Partial<Pick<HistorySession, "title" | "overview" | "endedAt" | "recap">>;
+const RECAP_KEYS = ["overview", "endedAt", "recap", "continues"] as const;
+/** Notes-mode fields of a session. In updateSessionNotebook and upsertSession, an absent field keeps the stored value; [] clears it. */
+export type SessionNotebookData = Pick<HistorySession, "todos" | "notes">;
 /** Knowledge fields of a session. In updateSessionKnowledge and upsertSession, an absent field keeps the stored value; [] clears it. */
 export type SessionKnowledge = Pick<HistorySession, "summary" | "keyFacts" | "people" | "concepts" | "tags">;
 export interface PersonAggregate {
@@ -67,6 +89,10 @@ export interface LocalHistoryOptions {
   writeDelayMs?: number;
   /** Entries per stored chunk (default HISTORY_CHUNK_ENTRIES). Smaller values are for tests. */
   chunkEntries?: number;
+  /** Longest time retrieveAsync / warmRetrieval keep the thread before yielding (default 5 ms, at most 50; 0 yields at every safe point, for tests). */
+  retrievalSliceMs?: number;
+  /** How they yield (default yieldToHost: one macrotask). For tests. */
+  retrievalYield?: () => Promise<void>;
 }
 interface ShardMeta { bytes: number; entries: number; chunks?: number }
 /** What is stored for one session: its chunks' entry references and byte sizes (unchanged chunks are not rewritten). */
@@ -89,12 +115,12 @@ const METADATA_KEYS = new Set(["model", "provider", "endpoint", "promptVersion",
 export const KNOWLEDGE_SOURCES: readonly KnowledgeSource[] = Object.freeze(["helix", "omi", "obsidian"]);
 const KNOWLEDGE_KEYS = ["summary", "keyFacts", "people", "concepts", "tags"] as const;
 const MAX_KNOWLEDGE_ITEMS = 20, MAX_KNOWLEDGE_CHARS = 500;
-const STOP_WORDS = new Set("a an the and or but is are was were be been being to of in on at for with from by it its this that these those i you we they he she my your our their do does did can could would should what when where who how please me us about as".split(" "));
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const string = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const date = (value: unknown): value is string => string(value) && Number.isFinite(Date.parse(value));
 const invalid = () => new Error("Invalid local history data. Existing storage has not been replaced.");
 const copy = <T>(value: T): T => structuredClone(value);
+export { RetrievalCancelled, stemTerm, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
 function safeUrl(value: unknown): string | undefined {
   if (!string(value)) return undefined;
   try { const url = new URL(value); if ((url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password) return value; } catch { /* untrusted citation */ }
@@ -138,9 +164,48 @@ function cleanKnowledge(value: Record<string, unknown>): SessionKnowledge {
   }
   return result;
 }
+const NOTEBOOK_KEYS = ["todos", "notes"] as const;
+/** Validated to-dos and notes present in `value` (invalid items are dropped, not fatal). */
+function cleanNotebook(value: Record<string, unknown>): SessionNotebookData {
+  const result: SessionNotebookData = {};
+  const todos = value.todos === undefined ? undefined : cleanTodos(value.todos), notes = value.notes === undefined ? undefined : cleanSessionNotes(value.notes);
+  if (todos) result.todos = todos;
+  if (notes) result.notes = notes;
+  return result;
+}
+function cleanRecapMeta(value: unknown): SessionRecapMeta | undefined {
+  if (!record(value) || (value.origin !== "model" && value.origin !== "fallback") || !date(value.generatedAt)) return undefined;
+  const result: SessionRecapMeta = { origin: value.origin, generatedAt: value.generatedAt };
+  for (const key of ["model", "provider", "promptVersion"] as const) { const text = knowledgeText(value[key]).slice(0, 120); if (text) result[key] = text; }
+  const endpoint = safeUrl(value.endpoint);
+  if (endpoint) { const url = new URL(endpoint); url.search = ""; url.hash = ""; result.endpoint = url.toString(); }
+  if (typeof value.latencyMs === "number" && Number.isFinite(value.latencyMs) && value.latencyMs >= 0) result.latencyMs = Math.min(Math.round(value.latencyMs), 3_600_000);
+  return result;
+}
+/** Validated v0.13 recap fields present in `value` (invalid shapes are dropped, not fatal). */
+function cleanRecap(value: Record<string, unknown>): Pick<HistorySession, typeof RECAP_KEYS[number]> {
+  const result: Pick<HistorySession, typeof RECAP_KEYS[number]> = {};
+  const overview = knowledgeText(value.overview); if (overview) result.overview = overview;
+  if (date(value.endedAt)) result.endedAt = value.endedAt;
+  const recap = cleanRecapMeta(value.recap); if (recap) result.recap = recap;
+  if (string(value.continues) && value.continues.length <= 2048) result.continues = value.continues;
+  return result;
+}
+/**
+ * One notebook list of a session (`into`) and of its continuation (`from`, the later state, which
+ * started from a copy of `into`). `from` wins; an earlier item it no longer has was removed there and
+ * stays removed, unless it was added or edited on the saved session after the continuation started.
+ * `from` undefined: the continuation never changed the list.
+ */
+function mergeNotebookList<T extends { id: string; text: string }>(into: readonly T[] | undefined, from: readonly T[] | undefined, stamp: (item: T) => string, fromStartedAt: string, max: number): T[] | undefined {
+  if (from === undefined) return into ? [...into] : undefined;
+  const cut = Date.parse(fromStartedAt), ids = new Set(from.map(item => item.id));
+  const kept = (into ?? []).filter(item => !ids.has(item.id) && Date.parse(stamp(item)) > cut && !from.some(other => sameTodoText(other.text, item.text)));
+  return [...kept, ...from].slice(-max);
+}
 function cleanSession(value: unknown): HistorySession {
   if (!record(value) || !string(value.id) || !KNOWLEDGE_SOURCES.includes(value.source as KnowledgeSource) || typeof value.title !== "string" || !date(value.startedAt) || !date(value.updatedAt)) throw invalid();
-  return { id: value.id, source: value.source as KnowledgeSource, title: value.title, startedAt: value.startedAt, updatedAt: value.updatedAt, ...cleanKnowledge(value) };
+  return { id: value.id, source: value.source as KnowledgeSource, title: value.title, startedAt: value.startedAt, updatedAt: value.updatedAt, ...cleanKnowledge(value), ...cleanNotebook(value), ...cleanRecap(value) };
 }
 function cleanEntry(value: unknown): HistoryEntry {
   if (!record(value) || !string(value.id) || !string(value.sessionId) || typeof value.kind !== "string" || !["transcript", "question", "answer", "fact-check"].includes(value.kind) || !string(value.text) || !date(value.occurredAt)) throw invalid();
@@ -176,48 +241,19 @@ function decode(raw: string): Snapshot {
   if (sessionIds.size !== sessions.length || new Set(entries.map(e => e.id)).size !== entries.length || entries.some(e => !sessionIds.has(e.sessionId))) throw invalid();
   return { version: 1, sessions, entries };
 }
-const normalize = (value: string) => value.normalize("NFKC").toLowerCase();
-const CJK = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+$/u;
-const CJK_CHAR = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]$/u;
-/** Light English suffix folding: "lead times" ~ "lead time", "jetsons" ~ "jetson". */
-export function stemTerm(token: string): string {
-  if (token.length <= 3 || !/^[a-z]+$/.test(token)) return token;
-  if (token.endsWith("'s")) token = token.slice(0, -2);
-  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
-  if (token.endsWith("sses")) return token.slice(0, -2);
-  if (token.endsWith("ing") && token.length > 5) return token.slice(0, -3);
-  if (token.endsWith("ed") && token.length > 4) return token.slice(0, -2);
-  if (token.endsWith("es") && /(?:ch|sh|x|z)es$/.test(token)) return token.slice(0, -2);
-  if (token.endsWith("s") && !token.endsWith("ss") && !token.endsWith("us") && !token.endsWith("is")) return token.slice(0, -1);
-  return token;
-}
-/** Tokens with duplicates (for term frequency). CJK runs become bigrams. */
-function tokenList(value: string): string[] {
-  const separated = normalize(value).replace(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu, " $& ");
-  const tokens = separated.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[\p{L}\p{N}]+/gu) ?? [];
-  return tokens.flatMap(token => {
-    if (CJK.test(token)) { const chars = [...token]; return chars.length === 1 ? chars : chars.slice(0, -1).map((c, i) => c + chars[i + 1]); }
-    return STOP_WORDS.has(token) ? [] : [stemTerm(token)];
-  });
-}
-function terms(value: string): string[] { return [...new Set(tokenList(value))]; }
 function relevance(text: string, queryTerms: string[]): number {
   const found = new Set(terms(text));
   return queryTerms.reduce((n, term) => n + Number(found.has(term) || (CJK_CHAR.test(term) && normalize(text).includes(term))), 0) / queryTerms.length;
 }
-/** Exact stem = 1, shared prefix (>= 4 chars) = 0.7, single CJK char inside a bigram = 1. */
-function matchWeight(query: string, token: string): number {
-  if (query === token) return 1;
-  if (CJK_CHAR.test(query)) return token.includes(query) ? 1 : 0;
-  const [short, long] = query.length <= token.length ? [query, token] : [token, query];
-  return short.length >= 4 && long.length - short.length <= 4 && long.startsWith(short) && /^[\p{L}\p{N}]+$/u.test(short) && !CJK.test(short) ? 0.7 : 0;
-}
-/** Relative evidence weight. Transcript (what was said) outranks generated records. */
-const KIND_WEIGHT: Readonly<Record<HistoryEntry["kind"], number>> = { transcript: 1, answer: 0.6, "fact-check": 0.5, question: 0 };
-const BM25_K1 = 1.2, BM25_B = 0.75, PASSAGE_WIDTH = 600;
-export interface RetrievalStats { items: RetrievedMemory[]; searchedEntries: number; matched: number }
-function bounded(value: number | undefined, fallback: number, max: number): number {
-  return value === undefined ? fallback : Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : fallback;
+/** `timedOut`: retrieveAsync gave up at its deadline and nothing was searched (items is empty). Absent otherwise. */
+export interface RetrievalStats { items: RetrievedMemory[]; searchedEntries: number; matched: number; timedOut?: true }
+/** retrieveAsync only: when to give up. Without either the search runs to its end. */
+export interface RetrievalLimits {
+  /** Resolve with { items: [], timedOut: true } after this long, counted from the call (time spent waiting behind an index build included). */
+  deadlineMs?: number;
+  /** Reject and stop the sliced work when aborted. */
+  signal?: AbortSignal;
+  onTiming?: (timing: RetrievalTiming) => void;
 }
 
 /** UTF-8 byte length without allocating (lone surrogates count as U+FFFD, like TextEncoder). */
@@ -352,7 +388,15 @@ export class LocalHistoryStore {
   private batch?: Batch;
   private delay: number;
   private flat?: HistoryEntry[];
+  /** Token index of the saved archive for retrieve*; built on first use, then kept in step with every saved change. */
+  private index?: RetrievalIndex;
+  /** Sliced searches and index builds run one after another, so a query behind a cold index waits for the build. */
+  private searches: Promise<unknown> = Promise.resolve();
+  private readonly sliceMs: number;
+  private readonly pause: () => Promise<void>;
   constructor(private readonly storage: HistoryStorage, options: LocalHistoryOptions = {}) {
+    this.sliceMs = bounded(options.retrievalSliceMs, 5, 50);
+    this.pause = typeof options.retrievalYield === "function" ? options.retrievalYield : yieldToHost;
     this.delay = writeDelay(options.writeDelayMs);
     this.chunkEntries = bounded(options.chunkEntries, HISTORY_CHUNK_ENTRIES, 100_000) || HISTORY_CHUNK_ENTRIES;
   }
@@ -571,7 +615,9 @@ export class LocalHistoryStore {
       const index = draft.sessions.findIndex(s => s.id === clean.id), sessions = draft.writableSessions();
       if (index < 0) { sessions.push(clean); return; }
       const old = sessions[index]!, merged: HistorySession = { ...clean };
-      for (const key of KNOWLEDGE_KEYS) if (merged[key] === undefined && old[key] !== undefined) (merged as unknown as Record<string, unknown>)[key] = old[key];
+      for (const key of [...KNOWLEDGE_KEYS, ...NOTEBOOK_KEYS, ...RECAP_KEYS]) if (merged[key] === undefined && old[key] !== undefined) (merged as unknown as Record<string, unknown>)[key] = old[key];
+      // A generated title (it has a recap) is not replaced by the live placeholder of the same session.
+      if (old.recap && !clean.recap) merged.title = old.title;
       sessions[index] = merged;
     });
   }
@@ -592,6 +638,81 @@ export class LocalHistoryStore {
         if (value.length) (session as unknown as Record<string, unknown>)[key] = value; else delete session[key];
       }
       draft.writableSessions()[index] = session;
+    });
+  }
+  /**
+   * Notes mode: sets the to-do list and/or running notes of an existing session (validated and bounded).
+   * Absent fields are kept, [] clears. Does not change updatedAt or entries.
+   */
+  async updateSessionNotebook(id: string, patch: SessionNotebookData): Promise<void> {
+    if (!record(patch)) throw new Error("Session notebook must be an object.");
+    const clean = cleanNotebook(patch as Record<string, unknown>);
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === id);
+      if (index < 0) throw new Error("Cannot update the notebook of a session that is not saved.");
+      const session: HistorySession = { ...draft.sessions[index]! };
+      for (const key of NOTEBOOK_KEYS) {
+        const value = clean[key];
+        if (value === undefined) continue;
+        // A continuation keeps an emptied list as []: mergeSession must know it was emptied, not untouched.
+        if (value.length || session.continues) (session as unknown as Record<string, unknown>)[key] = value; else delete session[key];
+      }
+      draft.writableSessions()[index] = session;
+    });
+  }
+  /**
+   * v0.13: sets the generated title, overview, end time and their provenance on an existing session.
+   * Absent fields are kept; an empty title is ignored. Does not change updatedAt or entries.
+   */
+  async updateSessionRecap(id: string, patch: SessionRecap): Promise<void> {
+    if (!record(patch)) throw new Error("Session recap must be an object.");
+    const clean = cleanRecap(patch as Record<string, unknown>), title = knowledgeText(patch.title).slice(0, 120);
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === id);
+      if (index < 0) throw new Error("Cannot update the recap of a session that is not saved.");
+      draft.writableSessions()[index] = { ...draft.sessions[index]!, ...(title ? { title } : {}), ...clean };
+    });
+  }
+  /**
+   * v0.13: sessions with nothing in them (no entries, no summary/key facts/people/concepts, no to-dos/notes), newest first.
+   * Unreadable shards are not empty: their entries are only unavailable. Neither is a continuation
+   * that emptied its notebook (todos/notes stored as []): merging it is what removes those items.
+   */
+  emptySessionIds(source?: KnowledgeSource): string[] {
+    return this.listSessions().filter(s => (!source || s.source === source) && !this.corrupt.has(s.id) && !this.entryCount(s.id)
+      && !s.summary?.length && !s.keyFacts?.length && !s.people?.length && !s.concepts?.length && !s.todos?.length && !s.notes?.length && !(s.continues && (s.todos || s.notes))).map(s => s.id);
+  }
+  /**
+   * v0.13: moves every entry of `fromId` into `intoId` and removes `fromId` (one conversation that was
+   * split by an interruption). The target keeps its id and title, spans both time ranges, and gets the
+   * union of the knowledge fields and one notebook (the continuation's to-dos and notes are the later
+   * state: nothing is lost or listed twice); its generated recap is dropped because it no longer covers the session.
+   */
+  mergeSession(fromId: string, intoId: string): Promise<void> {
+    return this.mutate(draft => {
+      const from = draft.sessions.find(s => s.id === fromId), intoIndex = draft.sessions.findIndex(s => s.id === intoId);
+      if (!from || intoIndex < 0 || fromId === intoId) throw new Error("Cannot merge sessions that are not saved.");
+      if (this.corrupt.has(fromId)) throw invalid(); // an unreadable shard stays as stored
+      const into = draft.sessions[intoIndex]!, moved = [...draft.list(fromId)];
+      const target = draft.writableList(intoId);
+      draft.dropList(fromId);
+      for (const entry of moved) { target.push({ ...entry, sessionId: intoId }); draft.setOwner(entry.id, intoId); }
+      const merged: HistorySession = { ...into,
+        startedAt: Date.parse(from.startedAt) < Date.parse(into.startedAt) ? from.startedAt : into.startedAt,
+        updatedAt: Date.parse(from.updatedAt) > Date.parse(into.updatedAt) ? from.updatedAt : into.updatedAt };
+      for (const key of KNOWLEDGE_KEYS) {
+        const joined = key === "people" ? cleanPeople([...(into.people ?? []), ...(from.people ?? [])]) : cleanStrings([...(into[key] ?? []), ...(from[key] ?? [])]);
+        if (joined?.length) (merged as unknown as Record<string, unknown>)[key] = joined; else delete merged[key];
+      }
+      const todos = mergeNotebookList(into.todos, from.todos, item => item.updatedAt, from.startedAt, MAX_TODOS);
+      const notes = mergeNotebookList(into.notes, from.notes, item => item.createdAt, from.startedAt, MAX_SESSION_NOTES);
+      if (todos?.length) merged.todos = todos; else delete merged.todos;
+      if (notes?.length) merged.notes = notes; else delete merged.notes;
+      delete merged.overview; delete merged.recap; delete merged.endedAt;
+      if (from.endedAt) merged.endedAt = from.endedAt;
+      const sessions = draft.writableSessions();
+      sessions[intoIndex] = merged;
+      sessions.splice(sessions.findIndex(s => s.id === fromId), 1);
     });
   }
   /** v0.8 People tab: people across all sessions, merged by normalized name, most mentioned first. */
@@ -642,6 +763,28 @@ export class LocalHistoryStore {
       }
     });
   }
+  /**
+   * v0.13: stores a whole document (session + all of its entries) as ONE save, replacing an earlier
+   * copy of the same session id. All or nothing: when the save fails (for example the 5 MiB cap),
+   * neither the new session nor a half-written one exists and the earlier copy is untouched.
+   */
+  async replaceSession(session: HistorySession, entries: HistoryEntry[]): Promise<void> {
+    if (!Array.isArray(entries)) throw invalid();
+    const clean = cleanSession(session), cleaned = [...new Map(entries.map(cleanEntry).map(entry => [entry.id, entry])).values()];
+    if (cleaned.some(entry => entry.sessionId !== clean.id)) throw new Error("Cannot save history entries without their session.");
+    return this.mutate(draft => {
+      const index = draft.sessions.findIndex(s => s.id === clean.id), sessions = draft.writableSessions();
+      if (index < 0) sessions.push(clean); else sessions[index] = clean;
+      draft.dropList(clean.id);
+      const list = draft.writableList(clean.id);
+      for (const entry of cleaned) {
+        // Entry ids are archive-wide: an id saved under another session moves here.
+        const owner = draft.ownerOf(entry.id);
+        if (owner !== undefined && owner !== clean.id) { const from = draft.writableList(owner), i = from.findIndex(e => e.id === entry.id); if (i >= 0) from.splice(i, 1); }
+        list.push(entry); draft.setOwner(entry.id, clean.id);
+      }
+    });
+  }
   listSessions(): HistorySession[] { return copy([...this.state.sessions]).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.id.localeCompare(b.id)); }
   /** One session without copying the whole archive (listSessions clones every session). */
   getSession(sessionId: string): HistorySession | undefined { const found = this.state.sessions.find(session => session.id === sessionId); return found ? copy(found) : undefined; }
@@ -656,78 +799,53 @@ export class LocalHistoryStore {
   }
   getEntries(sessionId: string): HistoryEntry[] { return copy([...this.state.entries.get(sessionId) ?? NO_ENTRIES]).sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt) || a.id.localeCompare(b.id)); }
   search(query: string, limit?: number): RetrievedMemory[] { return this.rank(query, false).slice(0, bounded(limit, 50, 500)); }
-  retrieve(query: string, options: { excludeSessionId?: string; limit?: number; maxChars?: number } = {}): RetrievedMemory[] {
+  retrieve(query: string, options: RetrievalOptions = {}): RetrievedMemory[] {
     return this.retrieveWithStats(query, options).items;
   }
-  /** BM25 over the best passage of each eligible entry; returns diagnostics for UI. */
-  retrieveWithStats(query: string, options: { excludeSessionId?: string; limit?: number; maxChars?: number } = {}): RetrievalStats {
-    const limit = bounded(options.limit, 5, 50);
-    let remaining = bounded(options.maxChars, 3000, 20_000);
-    const sessions = new Map(this.state.sessions.map(s => [s.id, s]));
-    const eligible = this.entries().filter(entry => entry.sessionId !== options.excludeSessionId && sessions.has(entry.sessionId) && KIND_WEIGHT[entry.kind] > 0
-      && !(entry.kind === "transcript" && /^(assistant|ai|system|omi summary)$/i.test(entry.speaker?.trim() ?? ""))
-      // Imported Omi overviews are vendor-generated summaries, not evidence.
-      && entry.metadata?.origin !== "omi-summary" && !/^omi summary$/i.test(entry.speaker?.trim() ?? ""));
-    const stats: RetrievalStats = { items: [], searchedEntries: eligible.length, matched: 0 };
-    const queryTerms = terms(query).slice(0, 400);
-    if (!queryTerms.length || !eligible.length) return stats;
-    // Expand each corpus token to the query terms it matches, once per call.
-    const tokensById = new Map(eligible.map(entry => [entry.id, tokenList(entry.text)]));
-    const expansion = new Map<string, [number, number][]>();
-    for (const tokens of tokensById.values()) for (const token of tokens) {
-      if (expansion.has(token)) continue;
-      const matches: [number, number][] = [];
-      queryTerms.forEach((q, i) => { const w = matchWeight(q, token); if (w) matches.push([i, w]); });
-      expansion.set(token, matches);
-    }
-    const df = new Array<number>(queryTerms.length).fill(0);
-    for (const tokens of tokensById.values()) {
-      const seen = new Set<number>();
-      for (const token of tokens) for (const [i] of expansion.get(token)!) seen.add(i);
-      for (const i of seen) df[i]!++;
-    }
-    const n = eligible.length;
-    const idf = df.map(d => Math.log(1 + (n - d + 0.5) / (d + 0.5)));
-    const passageOf = (entry: HistoryEntry, width: number): { text: string; tokens: string[] } => {
-      const all = tokensById.get(entry.id)!;
-      if (entry.text.length <= width) return { text: entry.text, tokens: all };
-      let best = { text: entry.text.slice(0, width), tokens: tokenList(entry.text.slice(0, width)), score: -1 };
-      for (let start = 0; start < entry.text.length; start += Math.max(1, Math.floor(width / 2))) {
-        const text = entry.text.slice(start, start + width), tokens = tokenList(text), hit = new Map<number, number>();
-        for (const token of tokens) for (const [i, w] of expansion.get(token) ?? []) hit.set(i, Math.max(hit.get(i) ?? 0, w));
-        const score = [...hit].reduce((sum, [i, w]) => sum + idf[i]! * w, 0);
-        if (score > best.score) best = { text, tokens, score };
-      }
-      return best;
-    };
-    const lengths = eligible.map(entry => Math.max(1, Math.min(tokensById.get(entry.id)!.length, PASSAGE_WIDTH / 5)));
-    const avgdl = lengths.reduce((a, b) => a + b, 0) / lengths.length;
-    const scored: RetrievedMemory[] = [];
-    for (const entry of eligible) {
-      const selected = passageOf(entry, PASSAGE_WIDTH), tf = new Map<number, number>();
-      for (const token of selected.tokens) for (const [i, w] of expansion.get(token) ?? []) tf.set(i, (tf.get(i) ?? 0) + w);
-      if (!tf.size) continue;
-      const len = Math.max(1, selected.tokens.length);
-      let score = 0;
-      for (const [i, f] of tf) score += idf[i]! * (f * (BM25_K1 + 1)) / (f + BM25_K1 * (1 - BM25_B + BM25_B * len / avgdl));
-      score *= KIND_WEIGHT[entry.kind];
-      // One strong rare-term hit is enough; only zero-score entries are dropped.
-      if (!(score > 0)) continue;
-      const timestamp = Math.max(0, Date.parse(entry.occurredAt));
-      // Small monotonic recency weight resolves equal lexical scores without swamping relevance.
-      scored.push({ entry: copy(entry), session: copy(sessions.get(entry.sessionId)!), score: score + 0.001 * timestamp / (timestamp + 1e12) });
-    }
-    stats.matched = scored.length;
-    scored.sort((a, b) => b.score - a.score || Date.parse(b.entry.occurredAt) - Date.parse(a.entry.occurredAt) || a.entry.id.localeCompare(b.entry.id));
-    if (!remaining || !limit) return stats;
-    for (const hit of scored) {
-      const width = Math.min(PASSAGE_WIDTH, remaining);
-      const selected = passageOf(hit.entry, width);
-      if (!selected.text) continue;
-      hit.entry.text = selected.text; remaining -= selected.text.length; stats.items.push(hit);
-      if (!remaining || stats.items.length >= limit) break;
-    }
-    return stats;
+  /**
+   * BM25 over the best passage of each eligible entry; returns diagnostics for UI. Runs in one go: with
+   * a cold index over a large archive that is a long task, so the live answer path uses retrieveAsync.
+   */
+  retrieveWithStats(query: string, options: RetrievalOptions = {}): RetrievalStats {
+    const index = this.index ??= new RetrievalIndex();
+    return runNow(clock => index.search(() => this.state, query, options, clock, copy));
+  }
+  /**
+   * The same search and result as retrieveWithStats, without holding the thread: the work (and the
+   * index build, when the index is cold) runs in slices of retrievalSliceMs with a yield between them.
+   */
+  retrieveAsync(query: string, options: RetrievalOptions & RetrievalLimits = {}): Promise<RetrievalStats> {
+    const index = this.index ??= new RetrievalIndex(), signal = options.signal;
+    const deadline = typeof options.deadlineMs === "number" && Number.isFinite(options.deadlineMs) && options.deadlineMs > 0 ? options.deadlineMs : undefined;
+    // An abandoned search stops at its next pause (or never starts), so it cannot keep later ones waiting.
+    const job = { cancelled: false, expires: deadline === undefined ? Number.POSITIVE_INFINITY : retrievalClock() + deadline };
+    const gaveUp = () => job.cancelled || retrievalClock() >= job.expires;
+    const work = (): Promise<RetrievalStats> => this.sliced(clock => index.search(() => this.state, query, options, clock, copy), options.onTiming, gaveUp);
+    if (!signal && deadline === undefined) return work();
+    return new Promise<RetrievalStats>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined, settled = false;
+      const settle = (): boolean => { if (settled) return false; settled = true; job.cancelled = true; if (timer !== undefined) clearTimeout(timer); signal?.removeEventListener("abort", abort); return true; };
+      const abort = () => { if (settle()) reject(signal!.reason ?? new RetrievalCancelled()); };
+      // No answer in time: reply without saved knowledge and keep building the index for the next question.
+      const expire = () => { if (settle()) { void this.warmRetrieval(); resolve({ items: [], searchedEntries: 0, matched: 0, timedOut: true }); } };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (deadline !== undefined) timer = setTimeout(expire, deadline);
+      // The clock is also read at every pause: a timer may run late on a page that is throttled.
+      work().then(result => { if (settle()) resolve(result); }, error => { if (error instanceof RetrievalCancelled && !job.cancelled) expire(); else if (settle()) reject(error); });
+    });
+  }
+  /** Size of the search index (0s before it is first used): distinct tokens, entries indexed, bytes of token ids. For diagnostics and tests. */
+  retrievalIndexSize(): { vocabulary: number; entries: number; bytes: number } { return this.index?.size() ?? { vocabulary: 0, entries: 0, bytes: 0 }; }
+  /** Builds or completes the search index in slices, off the answer path (after load, at session start). Never rejects. */
+  warmRetrieval(onTiming?: (timing: RetrievalTiming) => void): Promise<void> {
+    const index = this.index ??= new RetrievalIndex();
+    return this.sliced(clock => index.sync(() => this.state, clock), onTiming).catch(() => undefined);
+  }
+  private sliced<T>(work: Parameters<typeof runSliced<T>>[0], onTiming?: (timing: RetrievalTiming) => void, cancelled?: () => boolean): Promise<T> {
+    const result = this.searches.then(() => runSliced(work, this.sliceMs, this.pause, onTiming, cancelled));
+    this.searches = result.catch(() => undefined);
+    return result;
   }
   private rank(query: string, _evidenceOnly: boolean, excludeSessionId?: string): RetrievedMemory[] {
     const queryTerms = terms(query); if (!queryTerms.length) return [];
@@ -744,11 +862,16 @@ export class LocalHistoryStore {
     return result.sort((a, b) => b.score - a.score || Date.parse(b.entry.occurredAt) - Date.parse(a.entry.occurredAt) || a.entry.id.localeCompare(b.entry.id));
   }
   /** Drops the session from the index, then clears its shard. */
-  deleteSession(id: string): Promise<void> {
+  deleteSession(id: string): Promise<void> { return this.deleteSessions([id]); }
+  /** v0.13: drops several sessions in one save (one index write), then clears their shards. */
+  deleteSessions(ids: readonly string[]): Promise<void> {
+    const wanted = [...new Set(ids)];
     return this.mutate(draft => {
-      const index = draft.sessions.findIndex(s => s.id === id);
-      if (index >= 0) draft.writableSessions().splice(index, 1);
-      draft.dropList(id);
+      for (const id of wanted) {
+        const index = draft.sessions.findIndex(s => s.id === id);
+        if (index >= 0) draft.writableSessions().splice(index, 1);
+        draft.dropList(id);
+      }
     });
   }
   /** Single-file export in the v1 snapshot format ({ version: 1, sessions, entries }). */

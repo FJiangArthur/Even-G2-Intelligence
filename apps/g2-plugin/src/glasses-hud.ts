@@ -23,6 +23,13 @@
  *
  * Glyph widths and the 27 px line pitch were measured on the official
  * evenhub-simulator 0.9.5 font. Physical-glasses font acceptance is separate.
+ *
+ * AMBIENT display (default; "always-on" keeps everything above on screen all the time): during a
+ * session the glasses are blank. An answer (THEY ASKED / ANSWER / ANSWER KEY, "Thinking…") or a
+ * cue of the current mode (concept, lookup, conflict, fact verdict) pops up in the same title +
+ * BODY style, pages by itself and disappears. Double-tap (the menu gesture) wakes the full HUD with
+ * the MENU open; double-tap on the menu, or AMBIENT_IDLE_MS without a gesture, blanks it again.
+ * The blank page is its own page (no frame border, no images) whose BODY still captures events.
  */
 import { recordDiagnostic } from "./diagnostics";
 import {
@@ -40,9 +47,9 @@ import {
   TextContainerUpgrade,
 } from "@evenrealities/even_hub_sdk";
 import * as conversationSdk from "@helix/conversation-sdk";
-import { MODE_PROFILES, PICKER_MODES, modeProfile } from "@helix/conversation-sdk";
+import { MODE_PROFILES, PICKER_MODES, modeProfile, todoShort } from "@helix/conversation-sdk";
 import type { CopilotClaim, CopilotConcept, HudMirror, VerificationResult } from "@helix/conversation-sdk";
-import { AnswerPager, paginateAnswer, type PageLayout } from "./answer-pager";
+import { AnswerPager, pageReadingMs, paginateAnswer, type PageLayout } from "./answer-pager";
 import { blankImage, centeredImage, drawBitmap, encodeGrayPng, type GrayImage } from "./glasses-image";
 import { ICONS, MASCOT_FRAMES, modeIcon, textBitmap, type MascotState } from "./pixel-art";
 import type { GlassesConversationState, GlassesRenderBridge } from "./glasses-renderer";
@@ -59,6 +66,18 @@ export const DEFAULT_GLASSES_LAYOUT: GlassesLayout = "hud";
 export function resolveGlassesLayout(value?: string | null): GlassesLayout {
   return value === "answers-only" ? "answers-only" : DEFAULT_GLASSES_LAYOUT;
 }
+
+/**
+ * "ambient" (default): blank during a session; answers and cues pop up and disappear, the full
+ * HUD shows only after the menu gesture. "always-on": the full HUD is always on screen.
+ */
+export type GlassesDisplay = "ambient" | "always-on";
+export const DEFAULT_GLASSES_DISPLAY: GlassesDisplay = "ambient";
+export function resolveGlassesDisplay(value?: string | null): GlassesDisplay {
+  return value === "always-on" ? "always-on" : DEFAULT_GLASSES_DISPLAY;
+}
+/** Ambient display: the woken HUD blanks again this long after the last gesture. */
+export const AMBIENT_IDLE_MS = 20_000;
 
 export type HudView = "live" | "answer" | "qa" | "concepts" | "claims" | "summary" | "checks";
 export const HUD_VIEWS: readonly HudView[] = Object.freeze(["live", "answer", "qa", "concepts", "claims", "summary", "checks"]);
@@ -125,6 +144,12 @@ export interface GlassesHudOptions {
   readonly writeGapMs?: number;
   /** Mascot follows each answer (thinking / speaking). Default false: images change only on a switch. */
   readonly mascotAnimation?: boolean;
+  /** Setup → Answer length ("brief" | "standard" | "detailed"); "detailed" lets an ambient cue use more pages. */
+  readonly answerLength?: string;
+  /** Ambient (default) or always-on display; see GlassesDisplay. */
+  readonly display?: GlassesDisplay;
+  /** Ambient display: idle time after which the woken HUD blanks again. Default AMBIENT_IDLE_MS; at least 1000 ms. */
+  readonly ambientIdleMs?: number;
 }
 
 /**
@@ -140,7 +165,7 @@ export interface HudFrame {
 /** Gesture map, for phone help text and docs. Ring and temple share these gestures. */
 export const GESTURE_MAP: readonly { readonly gesture: string; readonly action: string }[] = Object.freeze([
   { gesture: "Tap", action: "context action: next answer page, ask the highlighted question, verify the highlighted claim or concept" },
-  { gesture: "Double-tap", action: "open / close the glasses menu (answer the whole conversation, verify, jump to a view, pause)" },
+  { gesture: "Double-tap", action: "open / close the glasses menu (answer the whole conversation, verify, jump to a view, pause); with the ambient display it wakes the HUD, and on the menu it hides the HUD again" },
   { gesture: "Hold", action: "push to talk; release to send" },
   { gesture: "Swipe ↑ / ↓", action: "previous / next view or page; in the menu: move the highlight" },
 ]);
@@ -464,7 +489,7 @@ function rightAlign(text: string, width: number): string {
   return `${" ".repeat(Math.max(0, Math.floor((width - hudTextWidth(line)) / hudGlyphWidth(" "))))}${line}`;
 }
 
-type ItemKind = "concept" | "conflict" | "ask" | "verification" | "fact-check" | "fact" | "suggestion";
+type ItemKind = "concept" | "conflict" | "ask" | "verification" | "fact-check" | "fact" | "suggestion" | "todo";
 interface HudItem {
   readonly key: string;
   readonly sig: string;
@@ -473,6 +498,21 @@ interface HudItem {
   readonly live: string;
   /** CHECKS card form, when the item is a check. */
   readonly check?: string;
+  /** Verdicts: the dated source line shown at the end of the ambient pop-up ("Src: reuters.com · 2026-11-18 · +2"). */
+  readonly source?: string;
+}
+
+/** "web check", or "news check" when the search was biased to recent reporting (Setup → news search). */
+const checkKind = (result: { recency?: string }, plain: string) => result.recency === "news" ? "news check" : plain;
+/** One line naming the newest dated source of a verdict (site or host, date, how many more); undefined without sources. */
+export function verdictSourceLine(sources: readonly { url: string; title?: string; publishedAt?: string; site?: string }[]): string | undefined {
+  if (!sources.length) return undefined;
+  const dated = sources.filter(source => source.publishedAt).sort((a, b) => b.publishedAt!.localeCompare(a.publishedAt!));
+  const best = dated[0] ?? sources[0]!;
+  let name = oneLine(best.site ?? "");
+  if (!name) { try { name = new URL(best.url).hostname.replace(/^www\./u, ""); } catch { name = oneLine(best.title ?? ""); } }
+  if (!name) return undefined;
+  return `Src: ${name}${best.publishedAt ? ` · ${best.publishedAt}` : ""}${sources.length > 1 ? ` · +${sources.length - 1}` : ""}`;
 }
 
 const ASK_LABEL: Readonly<Record<string, string>> = { lookup: "LOOKUP", propose: "PROPOSAL", question: "QUESTION" };
@@ -500,18 +540,26 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
   }
   for (const result of snapshot.verifications) {
     const summary = oneLine(result.summary);
+    const source = verdictSourceLine(result.sources);
     items.push({ key: `v:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "verification",
       live: titled(verdictLabel(result.status), `${oneLine(result.target)}${summary ? ` — ${summary}` : ""}`),
-      check: `${verdictLine(result)} · verify\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}` });
+      check: `${verdictLine(result)} · ${checkKind(result, "verify")}\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}`,
+      ...(source ? { source } : {}) });
   }
   for (const result of snapshot.factChecks) {
     const summary = oneLine(result.summary);
+    const source = verdictSourceLine(result.sources);
     items.push({ key: `f:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "fact-check",
       live: titled(verdictLabel(result.status), `${oneLine(result.claim)}${summary ? ` — ${summary}` : ""}`),
-      check: `${verdictLine(result)} · web check\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}` });
+      check: `${verdictLine(result)} · ${checkKind(result, "web check")}\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}`,
+      ...(source ? { source } : {}) });
   }
   for (const fact of snapshot.summary?.keyFacts ?? []) {
     items.push({ key: `kf:${oneLine(fact).toLowerCase()}`, sig: "", kind: "fact", live: `Fact: ${oneLine(fact)}` });
+  }
+  // Notes mode: one short confirmation per captured or changed to-do ("TODO + Send quote - Mei, Fri").
+  for (const cue of snapshot.notebook?.cues ?? []) {
+    items.push({ key: `t:${cue.id}`, sig: cue.text, kind: "todo", live: oneLine(cue.text) });
   }
   for (const suggestion of snapshot.suggestions) {
     items.push({ key: `s:${suggestion.id}`, sig: "", kind: "suggestion", live: `? ${oneLine(suggestion.question)}` });
@@ -544,6 +592,13 @@ const CAPS = { concepts: 5, claims: 6, checks: 5, summaryPages: 3, suggestions: 
 const HANDLED: HudCommand = Object.freeze({ type: "handled" });
 const HINT_CAPTION = "tap: act · double-tap: menu\nhold: talk · swipe ↑↓: views";
 const VERIFY_PENDING_MS = 45_000;
+/** Ambient cues: at most CUE_QUEUE wait their turn; one that waited longer than CUE_STALE_MS is dropped. */
+const CUE_QUEUE = 3, CUE_STALE_MS = 45_000, CUE_PAGES = 3, CUE_PAGES_DETAILED = 6, CUE_LAST_PAGE_MS = 5000;
+/** Ambient: "● listening" / "○ paused" shows this long after the mic state changes. */
+const STATUS_CUE_MS = 4000;
+const CUE_TITLE: Readonly<Partial<Record<ItemKind, string>>> = { concept: "CONCEPT", ask: "LOOKUP", conflict: "CHECK", verification: "CHECK", "fact-check": "FACT CHECK", todo: "TO-DO" };
+/** A cue that pops up on the blank ambient display: body pages, the page shown and when it turns / expires. */
+interface AmbientCue { readonly key: string; readonly title: string; readonly pages: readonly string[]; readonly at: number; page: number; until: number }
 const PARTIAL_ID = "transcript-partial";
 
 interface BodyView { readonly text: string; readonly label: string; readonly position?: string; readonly status?: string; readonly selection?: number }
@@ -629,6 +684,19 @@ export class GlassesHud implements GlassesSurface {
   private slowUntil = 0;
   private slowImages = 0;
   private lastSlowLog = 0;
+  // ---- ambient display ----
+  private displayMode: GlassesDisplay;
+  private readonly idleMs: number;
+  /** The woken HUD stays until this time (0 = not woken). State follows the clock: timers only call refresh(). */
+  private awakeUntil = 0;
+  /** Whether the HUD page on the glasses is the blank ambient page (no frame, no images). */
+  private pageAmbient = false;
+  private cue?: AmbientCue;
+  private cueQueue: AmbientCue[] = [];
+  private statusCueAt?: number;
+  private ambientTimer?: ReturnType<typeof setTimeout>;
+  /** Pages one ambient cue may use; follows Setup → Answer length. */
+  private cuePages = CUE_PAGES;
 
   public constructor(
     private readonly bridge: GlassesRenderBridge,
@@ -639,6 +707,9 @@ export class GlassesHud implements GlassesSurface {
     this.writeGap = Math.max(0, options.writeGapMs ?? WRITE_GAP_MS);
     this.intervals = { header: debounce, status: debounce, body: debounce, mode: debounce, views: debounce, caption: Math.max(debounce, options.captionIntervalMs ?? 1000) };
     this.now = options.now ?? (() => Date.now());
+    this.displayMode = options.display ?? DEFAULT_GLASSES_DISPLAY;
+    this.idleMs = Math.max(1000, options.ambientIdleMs ?? AMBIENT_IDLE_MS);
+    this.setAnswerLength(options.answerLength);
     this.pager = this.createPager();
     this.frameValue = this.compose();
   }
@@ -652,17 +723,23 @@ export class GlassesHud implements GlassesSurface {
   public get menuNative(): boolean { return !!this.menu?.native; }
   public get menuItems(): readonly HudMenuItem[] { return this.menu?.items ?? []; }
   public get lastRebuildAt(): number { return this.rebuildAt; }
+  /** Display setting: "ambient" or "always-on". */
+  public get display(): GlassesDisplay { return this.displayMode; }
+  /** True while the ambient display hides the HUD (blank, or only an answer / cue pop-up). */
+  public get ambient(): boolean { return this.ambientActive(); }
   /** What the phone mirror shows. */
   public get mirror(): HudMirror {
     const frame = this.frameValue;
     // Menu: every item, one per line; `selection` is the absolute index.
     const body = this.menu ? this.menu.items.map(item => item.label).join("\n") : frame.body;
-    const images = this.imagesOn && this.initialized ? Object.fromEntries(this.imageWanted) : undefined;
+    const ambient = this.ambientActive();
+    const images = this.imagesOn && this.initialized && !ambient ? Object.fromEntries(this.imageWanted) : undefined;
     return {
       view: this.viewName, header: frame.header, body, caption: frame.caption, menuOpen: !!this.menu,
       title: frame.title, status: frame.status.trim(),
       railMode: frame.mode.trim(), railViews: frame.views, content: frame.body,
       ...(images && Object.keys(images).length ? { images } : {}),
+      ...(ambient ? { ambient: true } : {}),
       ...(this.selection() === undefined ? {} : { selection: this.selection() }),
       ...(this.lastGesture ? { lastGesture: this.lastGesture } : {}),
       updatedAt: this.now(),
@@ -691,8 +768,8 @@ export class GlassesHud implements GlassesSurface {
   private async createPage(generation: number): Promise<void> {
     this.menu = undefined;
     const frame = this.frameValue = this.compose();
-    const splash = this.splashActive();
-    const page = this.hudPage(frame, splash);
+    const splash = this.splashActive(), ambient = this.ambientActive();
+    const page = this.hudPage(frame, splash, ambient);
     const result = await this.bridge.createStartUpPageContainer(new CreateStartUpPageContainer(page));
     this.nextWriteAt = this.now() + (this.writeGap ? Math.max(300, this.writeGap * 3) : 0);
     if (generation !== this.generation) return;
@@ -707,6 +784,7 @@ export class GlassesHud implements GlassesSurface {
     this.initialized = true;
     this.page = "hud";
     this.pageSplash = splash;
+    this.pageAmbient = ambient;
     const at = this.now();
     for (const key of PANEL_ORDER) { this.sent.set(key, panelText(frame, key)); this.sentAt.set(key, at); }
     this.imagesSent.clear(); // a new page has empty image containers
@@ -731,7 +809,15 @@ export class GlassesHud implements GlassesSurface {
     try {
       const status = this.glasses.status;
       if (this.menu) {
-        const command = this.menuGesture(gesture);
+        // Ambient display: double-tap on the menu hides the whole HUD again (wake and hide are one gesture).
+        const hide = gesture === "double" && this.ambientSession() && !this.menu.idle;
+        const command = hide ? this.sleep() : this.menuGesture(gesture);
+        if (!hide) this.touch();
+        this.refresh();
+        return command;
+      }
+      if (this.ambientActive()) {
+        const command = this.ambientGesture(gesture);
         this.refresh();
         return command;
       }
@@ -752,6 +838,7 @@ export class GlassesHud implements GlassesSurface {
       }
       this.fresh = 0;
       this.lastGesture = gesture;
+      this.touch();
       let command: HudCommand = HANDLED;
       if (gesture === "double") this.openMenu();
       else if (gesture === "click") command = this.click();
@@ -766,12 +853,16 @@ export class GlassesHud implements GlassesSurface {
 
   /** Click on the native MENU list (listEvent.currentSelectItemIndex, name when the host sends it). */
   public selectListItem(index: number, name?: string): HudCommand | undefined {
-    if (this.disposed || !this.menu) return undefined;
+    if (this.disposed) return undefined;
+    // Ambient display: the woken menu closes by itself (idle or hide). A list click that arrives after
+    // that is stale; it must not fall through to a tap on the blank display (which asks a billable question).
+    if (!this.menu) return this.ambientActive() ? HANDLED : undefined;
     try {
       const items = this.menu.items;
       const byName = name ? items.findIndex(item => item.label === name) : -1;
       const position = byName >= 0 ? byName : Math.max(0, Math.min(items.length - 1, Math.trunc(index) || 0));
       this.menu.selection = position;
+      this.touch();
       const command = this.runMenuItem(items[position]!);
       this.refresh();
       return command;
@@ -832,6 +923,9 @@ export class GlassesHud implements GlassesSurface {
     this.timer = undefined;
     if (this.ticker) clearInterval(this.ticker);
     this.ticker = undefined;
+    if (this.ambientTimer) clearTimeout(this.ambientTimer);
+    this.ambientTimer = undefined;
+    this.awakeUntil = 0; this.cue = undefined; this.cueQueue = [];
     this.pager.dispose();
   }
 
@@ -851,6 +945,7 @@ export class GlassesHud implements GlassesSurface {
     if (status !== this.previousStatus) {
       if ((status === "connecting" || status === "authorizing") && !["connecting", "authorizing"].includes(this.previousStatus)) this.resetSession();
       this.previousStatus = status;
+      if (ACTIVE.includes(status)) this.statusCueAt = now;
     }
     if (ACTIVE.includes(status) && this.sessionStart === undefined) this.sessionStart = now;
     if (glasses.interaction !== this.interaction?.text) this.interaction = glasses.interaction ? { text: glasses.interaction, at: now } : undefined;
@@ -865,6 +960,7 @@ export class GlassesHud implements GlassesSurface {
         if (previous?.sig === item.sig) continue;
         this.seen.set(item.key, { sig: item.sig, seq: ++this.seq });
         if (item.kind !== "fact" && (!previous || item.kind === "ask")) this.fresh += 1;
+        this.offerCue(item, now);
       }
       for (const key of [...this.seen.keys()]) if (!keys.has(key)) this.seen.delete(key);
       this.countUnseen(snapshot);
@@ -915,13 +1011,17 @@ export class GlassesHud implements GlassesSurface {
     add("qa", snapshot.suggestions.map(item => item.id));
     add("concepts", snapshot.concepts.map(item => item.id));
     add("checks", [...snapshot.conflicts, ...snapshot.verifications, ...snapshot.factChecks, ...snapshot.claims].map(item => item.id));
-    const sig = snapshot.summary ? `${snapshot.summary.bullets.join("|")}#${snapshot.summary.keyFacts.join("|")}` : "";
+    const notebook = snapshot.notebook ? `#${snapshot.notebook.todos.map(item => `${item.id}:${item.done}:${item.text}:${item.owner ?? ""}:${item.due ?? ""}`).join("|")}#${snapshot.notebook.notes.length}` : "";
+    const sig = snapshot.summary || notebook ? `${snapshot.summary?.bullets.join("|") ?? ""}#${snapshot.summary?.keyFacts.join("|") ?? ""}${notebook}` : "";
     if (sig !== this.summarySig) { this.summarySig = sig; if (sig) this.unseen.summary = 1; }
     while (this.counted.size > 2000) this.counted.delete(this.counted.values().next().value!);
   }
 
   private answerKeys(): boolean { return modeProfile(this.glasses.mode).selfQuestions === "answer-key"; }
   private askLabel(): string { return modeProfile(this.glasses.mode).askLabel; }
+  /** Notes mode: the SUMMARY view is the to-do / notes view. */
+  private noteTaking(): boolean { return modeProfile(this.glasses.mode).presets.noteTaking === true; }
+  private summaryLabel(): string { return this.noteTaking() ? "TO-DO" : VIEW_LABEL.summary; }
 
   private kindOf(glasses: GlassesConversationState): AnswerKind {
     const question = glasses.question;
@@ -946,7 +1046,181 @@ export class GlassesHud implements GlassesSurface {
     this.requested.clear();
     this.counted.clear(); this.summarySig = "";
     for (const key of RAIL_ROWS) this.unseen[key] = 0;
+    this.awakeUntil = 0; this.cue = undefined; this.cueQueue = [];
     if (this.menu) this.closeMenu();
+  }
+
+  /* ---------------- ambient display ---------------- */
+
+  /** Ambient setting during a running session (the only time the display goes blank). */
+  private ambientSession(): boolean {
+    return this.displayMode === "ambient" && ACTIVE.includes(this.glasses.status);
+  }
+  /** True while the ambient display replaces the HUD: a session is running, the HUD is not woken, no menu. */
+  private ambientActive(): boolean {
+    return this.ambientSession() && !this.menu && this.now() >= this.awakeUntil;
+  }
+
+  /** Setup → Answer length. Applies to cues that arrive from now on (answers always page in full). */
+  public setAnswerLength(length: string | undefined): void {
+    this.cuePages = length === "detailed" ? CUE_PAGES_DETAILED : CUE_PAGES;
+  }
+
+  /** Setup switch: ambient or always-on. Takes effect right away (the page is swapped when needed). */
+  public setDisplay(display: GlassesDisplay): void {
+    if (this.disposed || display === this.displayMode) return;
+    this.displayMode = display;
+    this.awakeUntil = 0; this.cue = undefined; this.cueQueue = [];
+    this.lastGesture = `display:${display}`;
+    try { this.refresh(); } catch (error) { this.reportRenderError(error); }
+  }
+
+  /** The menu gesture on the blank display: show the full HUD until idle. */
+  private wake(): void {
+    this.awakeUntil = this.now() + this.idleMs;
+    this.cue = undefined; this.cueQueue = [];
+  }
+  /** A gesture on the woken HUD restarts the idle time. */
+  private touch(): void {
+    if (this.ambientSession() && this.awakeUntil) this.awakeUntil = this.now() + this.idleMs;
+  }
+  /** Back to the blank display (double-tap on the menu, or idle). */
+  private sleep(): HudCommand {
+    this.awakeUntil = 0;
+    if (this.menu) this.closeMenu();
+    this.lastGesture = "ambient:sleep";
+    return HANDLED;
+  }
+
+  /** A new or changed LIVE item becomes a cue that pops up on the blank display. */
+  private offerCue(item: HudItem, now: number): void {
+    if (!this.ambientSession() || this.awakeUntil > now) return;
+    const title = CUE_TITLE[item.kind];
+    // Lookups pop up when their answer arrived, not while pending or after a failure.
+    if (!title || (item.kind === "ask" && /^(pending|failed)\|/u.test(item.sig))) return;
+    // Verdict pop-ups end with the dated source line (news search), so the wearer sees how fresh the evidence is.
+    const lines = wrapText(clean(`${item.check ?? item.live}${item.source ? `\n${item.source}` : ""}`), HUD_LINE_WIDTH.body);
+    const pages: string[] = [];
+    // Setup → Answer length "Detailed" writes longer lookups and verdicts: allow them more pages before the "…".
+    const CUE_PAGES = this.cuePages;
+    for (let index = 0; index < lines.length && pages.length < CUE_PAGES; index += BODY_LINES) {
+      const page = lines.slice(index, index + BODY_LINES);
+      // The last allowed page ends with "…" when text is left over (all of it is in the woken HUD and on the phone).
+      const rest = lines[index + BODY_LINES];
+      if (pages.length + 1 === CUE_PAGES && rest !== undefined) page[page.length - 1] = ellipsize(`${page[page.length - 1]!} ${rest}`, HUD_LINE_WIDTH.body);
+      pages.push(page.join("\n"));
+    }
+    if (!pages.length) return;
+    if (this.cue?.key === item.key) this.cue = undefined; // the item changed while on screen: show the new text
+    this.cueQueue = [...this.cueQueue.filter(cue => cue.key !== item.key), { key: item.key, title, pages, at: now, page: 0, until: 0 }].slice(-CUE_QUEUE);
+  }
+
+  /** Reading time of the cue's current page; the last page stays at least CUE_LAST_PAGE_MS. */
+  private cueReadMs(cue: AmbientCue): number {
+    const ms = pageReadingMs(graphemes(cue.pages[cue.page] ?? "").length);
+    return cue.page + 1 < cue.pages.length ? ms : Math.max(CUE_LAST_PAGE_MS, ms);
+  }
+
+  /**
+   * Moves the ambient state to the current time: idle HUD -> blank, cue page turns, cue expiry, next
+   * cue. Only ever moves forward, so a late or stale timer cannot bring back anything that expired.
+   */
+  private stepAmbient(): void {
+    if (this.displayMode !== "ambient") return;
+    const now = this.now();
+    // Outside a session nothing is ambient: a wake left over from the ended session must not later
+    // "sleep" (close) the Connect/Mode menu opened since.
+    if (!ACTIVE.includes(this.glasses.status)) { this.awakeUntil = 0; this.cue = undefined; this.cueQueue = []; return; }
+    if (this.awakeUntil && now >= this.awakeUntil) this.sleep();
+    if (this.awakeUntil) { this.cue = undefined; this.cueQueue = []; return; }
+    if (this.answerBusy()) {
+      // An answer has the display: the cue waits and starts over afterwards.
+      if (this.cue) { this.cueQueue = [{ ...this.cue, page: 0 }, ...this.cueQueue].slice(0, CUE_QUEUE); this.cue = undefined; }
+      return;
+    }
+    const cue = this.cue;
+    if (cue && now >= cue.until) {
+      if (cue.page + 1 < cue.pages.length) { cue.page += 1; cue.until = now + this.cueReadMs(cue); }
+      else this.cue = undefined;
+    }
+    this.cueQueue = this.cueQueue.filter(item => now - item.at < CUE_STALE_MS);
+    if (!this.cue && this.cueQueue.length) {
+      const next = this.cueQueue.shift()!;
+      next.page = 0; next.until = now + this.cueReadMs(next);
+      this.cue = next;
+    }
+  }
+
+  /** One timer for the next ambient deadline; it only calls refresh(), which re-reads the clock. */
+  private scheduleAmbient(): void {
+    if (this.ambientTimer) clearTimeout(this.ambientTimer);
+    this.ambientTimer = undefined;
+    if (this.displayMode !== "ambient" || this.disposed) return;
+    const now = this.now();
+    const deadlines = [this.awakeUntil, this.cue?.until ?? 0, (this.statusCueAt ?? -STATUS_CUE_MS) + STATUS_CUE_MS,
+      this.interaction ? this.interaction.at + 4001 : 0, ...this.cueQueue.map(cue => cue.at + CUE_STALE_MS),
+      this.pageSwapDue() ? this.blockedUntil : 0].filter(time => time > now);
+    if (!deadlines.length) return;
+    this.ambientTimer = setTimeout(() => {
+      this.ambientTimer = undefined;
+      if (this.disposed) return;
+      try { this.refresh(); } catch (error) { this.reportRenderError(error); }
+    }, Math.max(1, Math.min(...deadlines) - now));
+  }
+
+  /** The glasses show the wrong one of the HUD page / blank ambient page (and the bridge can swap pages). */
+  private pageSwapDue(): boolean {
+    return this.initialized && this.page === "hud" && typeof this.bridge.rebuildPageContainer === "function" && this.ambientActive() !== this.pageAmbient;
+  }
+
+  /** Gestures on the blank display: double-tap wakes the HUD; tap / swipe act on the pop-up only. */
+  private ambientGesture(gesture: HudGesture): HudCommand {
+    this.lastGesture = `ambient:${gesture}`;
+    if (gesture === "double") {
+      this.wake();
+      this.openMenu();
+      return HANDLED;
+    }
+    if (this.pager.text) {
+      if (gesture === "up") { this.pager.previous(); return HANDLED; }
+      if (this.pager.next() || this.pager.isStreaming) return HANDLED;
+      this.leaveAnswer(this.returnView ?? "live");
+      return HANDLED;
+    }
+    if (this.glasses.manualPending) return HANDLED;
+    const cue = this.cue;
+    if (cue) {
+      const page = cue.page + (gesture === "up" ? -1 : 1);
+      if (page >= cue.pages.length) this.cue = undefined;
+      else if (page >= 0) { cue.page = page; cue.until = this.now() + this.cueReadMs(cue); }
+      return HANDLED;
+    }
+    // Nothing on screen: a tap asks about the last few sentences (the answer pops up); swipes have nothing to turn.
+    return gesture === "click" ? { type: "askLocal" } : HANDLED;
+  }
+
+  /** The blank display, or the answer / cue that is popping up on it. */
+  private composeAmbient(): HudFrame {
+    const cue = this.cue, answering = this.answerBusy();
+    const pop: BodyView | undefined = answering ? this.answerView()
+      : cue ? { label: cue.title, text: cue.pages[cue.page] ?? "", ...(cue.pages.length > 1 ? { position: `${cue.page + 1}/${cue.pages.length}` } : {}),
+        status: cue.page + 1 < cue.pages.length ? "swipe ↓ more" : "tap to close" } : undefined;
+    if (answering) this.unseen.answer = 0; // an answer that popped up was seen
+    const parts: string[] = [];
+    const interaction = this.interactionText(), status = this.glasses.status;
+    if (interaction) parts.push(interaction);
+    else if (this.statusCueAt !== undefined && this.now() - this.statusCueAt < STATUS_CUE_MS) parts.push(status === "listening" ? "● listening" : status === "paused" ? "○ paused" : "○ mic off");
+    if (pop?.status) parts.push(pop.status);
+    if (this.glasses.error) parts.push(`! ${oneLine(this.glasses.error)}`);
+    const statusLine = parts.length ? ellipsize(parts.join(" · "), HUD_LINE_WIDTH.status) : "";
+    const title = pop ? ellipsize(`${pop.label}${pop.position ? ` ${pop.position}` : ""}`, HUD_LINE_WIDTH.header) || " " : " ";
+    return {
+      header: [title, statusLine].filter(part => part.trim()).join(" · ") || " ",
+      title,
+      status: rightAlign(statusLine, HUD_LINE_WIDTH.status) || " ",
+      body: pop ? fitLines(clean(pop.text), BODY_LINES, HUD_LINE_WIDTH.body).join("\n") || " " : " ",
+      caption: " ", mode: " ", views: " ",
+    };
   }
 
   /** An auto-shown answer returns to the previous view once it is gone. */
@@ -1087,6 +1361,7 @@ export class GlassesHud implements GlassesSurface {
       if (item.action === "claims" && this.claimList().length) return { ...item, label: `Claims · ${this.claimList().length}` };
       if (item.action === "concepts" && this.conceptList().length) return { ...item, label: `Concepts · ${this.conceptList().length}` };
       if (item.action === "ask-them") return { ...item, label: sentenceCase(this.askLabel()) };
+      if (item.action === "summary" && this.noteTaking()) return { ...item, label: "To-do" }; // Notes mode: the SUMMARY view is the TO-DO view
       return item;
     }).slice(0, HUD_MENU_LIST.maxItems).map(item => ({ ...item, label: item.label.slice(0, HUD_MENU_LIST.maxChars) }));
   }
@@ -1183,14 +1458,22 @@ export class GlassesHud implements GlassesSurface {
   private checkList(): HudItem[] { return this.ordered(["conflict", "verification", "fact-check"]).slice(0, CAPS.checks); }
 
   private summaryPages(): string[][] {
-    const summary = this.snapshot?.summary;
-    if (!summary || (!summary.bullets.length && !summary.keyFacts.length)) return [];
+    const summary = this.snapshot?.summary ?? { bullets: [], keyFacts: [] };
+    // Notes mode: the to-do list (open items first) and the newest notes lead this view.
+    const notebook = this.snapshot?.notebook, todos = notebook?.todos ?? [], notes = notebook?.notes ?? [];
+    if (!summary.bullets.length && !summary.keyFacts.length && !todos.length && !notes.length) return [];
     const lines: string[] = [];
     const add = (marker: string, text: string) => {
       const hang = indent(hudTextWidth(`${marker} `));
       const width = HUD_LINE_WIDTH.body - Math.max(hudTextWidth(`${marker} `), hudTextWidth(hang));
       wrapText(oneLine(text), width).forEach((line, index) => lines.push(`${index ? hang : `${marker} `}${line}`));
     };
+    for (const todo of [...todos.filter(item => !item.done), ...todos.filter(item => item.done)]) add(todo.done ? "[x]" : "[ ]", todoShort(todo, 80));
+    if (notes.length) {
+      if (lines.length) lines.push("Notes");
+      for (const note of notes.slice(-6).reverse()) add("•", note.text);
+    }
+    if (lines.length && summary.bullets.length) lines.push("Summary");
     for (const bullet of summary.bullets) add("•", bullet);
     if (summary.keyFacts.length) {
       lines.push("Key facts");
@@ -1220,6 +1503,7 @@ export class GlassesHud implements GlassesSurface {
   /* ---------------- composition ---------------- */
 
   private refresh(): void {
+    this.stepAmbient();
     this.frameValue = this.compose();
     const now = this.now();
     for (const key of PANEL_ORDER) {
@@ -1228,12 +1512,16 @@ export class GlassesHud implements GlassesSurface {
     }
     this.schedule();
     // Connect / disconnect: swap to the page with (or without) the opaque SPLASH container.
-    if (this.initialized && this.imagesOn && this.page === "hud" && !this.rebuilding && this.splashActive() !== this.pageSplash) void this.rebuild("hud", false);
+    // Ambient display: swap between the blank page and the HUD page (wake, idle, session start / end).
+    const swap = (this.imagesOn && this.splashActive() !== this.pageSplash) || (this.pageSwapDue() && now >= this.blockedUntil);
+    if (this.initialized && this.page === "hud" && !this.rebuilding && swap) void this.rebuild("hud", false);
     this.updateImages();
     this.publishMirror();
+    this.scheduleAmbient();
   }
 
   private compose(): HudFrame {
+    if (this.ambientActive()) return this.composeAmbient();
     const status = this.glasses.status;
     const active = ACTIVE.includes(status) || status === "failed";
     // v0.11: the native MENU sits in the rail, so the view stays visible; only the text fallback uses the BODY.
@@ -1241,7 +1529,7 @@ export class GlassesHud implements GlassesSurface {
     const body = this.menu && !this.menu.native ? this.menuView() : view;
     const label = this.menu ? (this.menu.kind === "mode" ? "MODE" : "MENU") : body.label;
     const title = ellipsize(`${label}${!this.menu && body.position ? ` ${body.position}` : ""}`, HUD_LINE_WIDTH.header) || " ";
-    const statusLine = this.composeStatus(this.menu ? { ...body, status: "tap: select · double: close" } : body, active);
+    const statusLine = this.composeStatus(this.menu ? { ...body, status: this.menuHint() } : body, active);
     this.unseen[this.railKey()] = 0; // what is on screen is seen
     return {
       header: [title, statusLine].filter(part => part.trim()).join(" · ") || " ",
@@ -1261,7 +1549,7 @@ export class GlassesHud implements GlassesSurface {
   private composeRail(): string {
     const current = this.railKey();
     return RAIL_ROWS.map(key => {
-      const name = key === "qa" ? this.askLabel() : RAIL_LABEL[key];
+      const name = key === "qa" ? this.askLabel() : key === "summary" ? this.summaryLabel() : RAIL_LABEL[key];
       if (key === current) return ellipsize(`▶ ${name}`, HUD_LINE_WIDTH.rail);
       const count = this.unseen[key];
       const badge = !count ? "" : key === "summary" ? " ●" : ` ${CIRCLED[Math.min(count, CIRCLED.length) - 1]}`;
@@ -1305,13 +1593,18 @@ export class GlassesHud implements GlassesSurface {
     return { label: "HELIX", status: connect ? "not connected" : "paused", text: `${prompt}${/[.!?]$/u.test(prompt) ? "" : "."}\n\n▶ Tap to ${connect ? "connect" : "resume"}.` };
   }
 
+  /** Header hint while the menu is open; on the ambient display double-tap hides the whole HUD. */
+  private menuHint(): string {
+    return this.ambientSession() && !this.menu?.idle ? "tap: select · double: hide" : "tap: select · double: close";
+  }
+
   private menuView(): BodyView {
     const menu = this.menu!;
     const width = HUD_LINE_WIDTH.body;
     const first = Math.max(0, Math.min(menu.selection - 2, menu.items.length - BODY_LINES));
     const lines = menu.items.slice(first, first + BODY_LINES).map((item, offset) =>
       ellipsize(`${first + offset === menu.selection ? "▶ " : indent(hudTextWidth("▶ "))}${item.label}`, width));
-    return { label: menu.kind === "mode" ? "MODE" : "MENU", status: "tap: select · double: close", text: lines.join("\n"), selection: menu.selection };
+    return { label: menu.kind === "mode" ? "MODE" : "MENU", status: this.menuHint(), text: lines.join("\n"), selection: menu.selection };
   }
 
   private bodyView(): BodyView {
@@ -1331,7 +1624,7 @@ export class GlassesHud implements GlassesSurface {
     if (glasses.status === "failed") {
       return { label: "LIVE", text: `Problem: ${oneLine(glasses.error ?? "Helix stopped.")}\n\nCheck the phone, then tap to try again.` };
     }
-    const items = this.ordered(["concept", "conflict", "ask", "verification", "fact-check", "fact"]);
+    const items = this.ordered(["concept", "conflict", "ask", "verification", "fact-check", "fact", "todo"]);
     if (!items.length) {
       const text = glasses.status === "listening"
         ? "Listening…\n\nConcepts, lookups, claims and\nquestions appear as people talk."
@@ -1364,14 +1657,14 @@ export class GlassesHud implements GlassesSurface {
     }
     if (glasses.manualPending) {
       const speaker = glasses.question?.speaker;
-      const about = speaker === "Local context" ? "About the last minute of conversation."
+      const about = speaker === "Local context" ? "About the last few sentences."
         : speaker === "Whole conversation" ? "Using the whole conversation."
           : glasses.question?.text ? `Q: ${oneLine(glasses.question.text)}` : "";
       return { label: VIEW_LABEL.answer, status: "thinking", text: `Thinking…${about ? `\n\n${about}` : ""}` };
     }
     const pages = this.recallPages();
     if (!pages.length) {
-      return { label: VIEW_LABEL.answer, text: "No answer yet.\n\nTap: ask about the last minute.\nMenu (double-tap): the whole talk." };
+      return { label: VIEW_LABEL.answer, text: "No answer yet.\n\nTap: ask about the last few lines.\nMenu (double-tap): the whole talk." };
     }
     const index = Math.min(this.cursor.answer, pages.length - 1);
     return { label: VIEW_LABEL.answer, position: `${index + 1}/${pages.length}`, status: "last answer",
@@ -1447,12 +1740,13 @@ export class GlassesHud implements GlassesSurface {
   }
 
   private summaryView(): BodyView {
-    const pages = this.summaryPages();
+    const pages = this.summaryPages(), label = this.summaryLabel();
     if (!pages.length) {
+      if (this.noteTaking()) return { label, text: "No to-dos or notes yet.\n\nAction items and notes appear\nhere as people talk." };
       return { label: VIEW_LABEL.summary, text: "No summary yet.\n\nA rolling summary appears after\nabout a minute of conversation." };
     }
     const index = Math.min(this.cursor.summary, pages.length - 1);
-    return { label: VIEW_LABEL.summary, position: `${index + 1}/${pages.length}`, text: pages[index]!.join("\n") };
+    return { label, position: `${index + 1}/${pages.length}`, text: pages[index]!.join("\n") };
   }
 
   private checksView(): BodyView {
@@ -1574,6 +1868,7 @@ export class GlassesHud implements GlassesSurface {
   /** One image at a time (SDK rule), latest wanted image wins, mascot at most every mascotIntervalMs. */
   private pumpImages(): void {
     if (this.imageInFlight || this.inFlight || this.disposed || !this.initialized || this.rebuilding || !this.imagesOn) return;
+    if (this.page === "hud" && this.pageAmbient) return; // the blank ambient page has no image containers
     const now = this.now();
     if (this.nextWriteAt > now) {
       if (!this.imageTimer) this.imageTimer = setTimeout(() => { this.imageTimer = undefined; this.pumpImages(); }, this.nextWriteAt - now);
@@ -1652,7 +1947,12 @@ export class GlassesHud implements GlassesSurface {
 
   /* ---------------- transport ---------------- */
 
-  private hudPage(frame: HudFrame, splash = this.splashActive()): Partial<CreateStartUpPageContainer> {
+  private hudPage(frame: HudFrame, splash = this.splashActive(), ambient = false): Partial<CreateStartUpPageContainer> {
+    if (ambient) {
+      // Blank ambient page: the same text containers (BODY still the one event-capture container), no frame border, no images.
+      const panels = PANEL_ORDER.map(key => new TextContainerProperty(panelProperty(key, panelText(frame, key))));
+      return { containerTotalNum: panels.length, textObject: panels, menuObject: osMenu() };
+    }
     const textObject = [new TextContainerProperty(frameProperty()), ...PANEL_ORDER.map(key => new TextContainerProperty(panelProperty(key, panelText(frame, key))))];
     // Declaration order is drawing order: images after the BODY so the splash draws on top of it.
     const keys = splash ? (["mascot", "badge", "splash"] as const) : (["mascot", "badge"] as const);
@@ -1697,15 +1997,16 @@ export class GlassesHud implements GlassesSurface {
       if (!this.initialized || generation !== this.generation || !this.bridge.rebuildPageContainer) return false;
       const target = this.menu?.native ? "menu" : "hud";
       const splash = target === "hud" && this.splashActive();
-      if (!force && target === this.page && (target === "menu" || splash === this.pageSplash)) return true;
+      const ambient = target === "hud" && this.ambientActive();
+      if (!force && target === this.page && (target === "menu" || (splash === this.pageSplash && ambient === this.pageAmbient))) return true;
       this.frameValue = this.compose();
       const frame = this.frameValue;
       let ok = false;
       const startedAt = this.now();
       try {
-        ok = await this.bridge.rebuildPageContainer(new RebuildPageContainer(target === "menu" ? this.menuPage(frame) : this.hudPage(frame, splash)));
+        ok = await this.bridge.rebuildPageContainer(new RebuildPageContainer(target === "menu" ? this.menuPage(frame) : this.hudPage(frame, splash, ambient)));
       } catch (error) { this.reportRenderError(error); }
-      recordDiagnostic("glasses-page", `${force ? "re-push" : target === "menu" ? "menu" : splash !== this.pageSplash ? "connect/disconnect" : "menu close"} · ${this.lastGesture || "-"} · ${ok ? "ok" : "rejected"} ${((this.now() - startedAt) / 1000).toFixed(1)} s`);
+      recordDiagnostic("glasses-page", `${force ? "re-push" : target === "menu" ? "menu" : ambient !== this.pageAmbient ? (ambient ? "ambient" : "wake") : splash !== this.pageSplash ? "connect/disconnect" : "menu close"} · ${this.lastGesture || "-"} · ${ok ? "ok" : "rejected"} ${((this.now() - startedAt) / 1000).toFixed(1)} s`);
       this.nextWriteAt = this.now() + (this.writeGap ? Math.max(300, this.writeGap * 3) : 0); // a new page needs longer to settle
       this.noteLatency("page", this.now() - startedAt);
       if (generation !== this.generation) return false;
@@ -1716,6 +2017,7 @@ export class GlassesHud implements GlassesSurface {
       }
       this.page = target;
       this.pageSplash = splash;
+      this.pageAmbient = ambient;
       this.rebuildAt = this.now();
       const at = this.now();
       for (const key of PANEL_ORDER) {

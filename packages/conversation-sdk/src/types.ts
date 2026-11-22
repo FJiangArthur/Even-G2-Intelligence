@@ -14,6 +14,8 @@ export const CONVERSATION_MODES = [
   "partner",
   "negotiation",
   "learning",
+  // Notes mode: note-taker (action items, to-do list, running notes)
+  "notes",
 ] as const;
 export type ConversationMode = typeof CONVERSATION_MODES[number];
 export type ConversationModeInput = ConversationMode | "interview";
@@ -75,7 +77,8 @@ export interface ProviderProfilePreferences {
   readonly answerProvider?: string;
 }
 
-export const PROVIDER_CREDENTIAL_NAMES = ["openai", "deepgram", "soniox", "omi"] as const;
+// deepseek / dashscope (Alibaba Qwen) / zhipu / moonshot: answer and copilot providers called directly from the phone.
+export const PROVIDER_CREDENTIAL_NAMES = ["openai", "deepgram", "soniox", "omi", "deepseek", "dashscope", "zhipu", "moonshot"] as const;
 export type ProviderCredentialName = typeof PROVIDER_CREDENTIAL_NAMES[number];
 export const MAX_PROVIDER_CREDENTIAL_LENGTH = 8_192;
 

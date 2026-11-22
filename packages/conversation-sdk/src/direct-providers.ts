@@ -1,6 +1,8 @@
 /** Browser-native provider calls. No Node runtime, proxy, or bundled credentials. */
 import type { Citation, ReasoningEffort } from "./copilot-types.js";
 import { answerModelInfo, firstAccessibleModel, liveReasoningEffort, type RawUsage } from "./model-catalog.js";
+import { chatAnswerStream } from "./chat-providers.js";
+import type { AnswerProviderInfo } from "./provider-registry.js";
 export type DirectFetch = (input: string, init?: RequestInit) => Promise<Response>;
 export const OPENAI_BASE = "https://api.openai.com/v1";
 export const TRANSCRIPTION_MODELS: Readonly<Record<string, string>> = {
@@ -41,11 +43,13 @@ export interface AnswerRequestOptions {
   readonly onCitations?: (sources: Citation[]) => void;
   readonly reasoningEffort?: ReasoningEffort;
   readonly maxOutputTokens?: number;
+  /** A non-OpenAI provider from provider-registry.ts: the request goes to its Chat Completions endpoint with `key` as that provider's key. */
+  readonly provider?: AnswerProviderInfo;
 }
-function promptContextFailure(provisional = false): DirectProviderError {
+export function promptContextFailure(provisional = false): DirectProviderError {
   return new DirectProviderError("prompt-context-limit", `${provisional ? "The selected model has an unverified context window; Helix applies a provisional 4,096-token request budget. " : ""}Answer context is too large for the selected model budget. Shorten the custom prompt, turn off local memory, choose a larger supported model and reconnect, or start a new session. The captured transcript has not been discarded.`);
 }
-function isContextOverflow(value: unknown): boolean {
+export function isContextOverflow(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const error = value as { code?: unknown; message?: unknown };
   return error.code === "context_length_exceeded" || error.code === "context_window_exceeded"
@@ -106,7 +110,8 @@ export function parseChatUsage(value: unknown): RawUsage | undefined {
   const input = count(value.prompt_tokens), output = count(value.completion_tokens);
   if (input === undefined && output === undefined) return;
   const inDetails = isRecord(value.prompt_tokens_details) ? value.prompt_tokens_details : {}, outDetails = isRecord(value.completion_tokens_details) ? value.completion_tokens_details : {};
-  return { inputTokens: input ?? 0, outputTokens: output ?? 0, cachedInputTokens: count(inDetails.cached_tokens) ?? 0, reasoningTokens: count(outDetails.reasoning_tokens) ?? 0 };
+  // DeepSeek also reports cache hits as top-level prompt_cache_hit_tokens.
+  return { inputTokens: input ?? 0, outputTokens: output ?? 0, cachedInputTokens: count(inDetails.cached_tokens) ?? count(value.prompt_cache_hit_tokens) ?? 0, reasoningTokens: count(outDetails.reasoning_tokens) ?? 0 };
 }
 /** Final (non-streamed) Responses object: text, citations, web search calls. */
 export function parseResponseOutput(value: unknown): { text: string; sources: Citation[]; webSearchCalls: number; usage?: RawUsage } {
@@ -257,6 +262,7 @@ export async function transcribeDirect(fetcher: DirectFetch, profile: string, ke
   return result.text.trim();
 }
 export async function* answerDirect(fetcher: DirectFetch, key: string, profile: string, model: string, instructions: string, history: readonly { role: string; content: string }[], signal: AbortSignal, options: AnswerRequestOptions = {}): AsyncGenerator<string> {
+  if (options.provider && options.provider.api !== "openai") { yield* chatAnswerStream(fetcher, options.provider, key, model, instructions, history, signal, options); return; }
   const responses = usesResponsesApi(profile, model, options.webSearch);
   const body = budgetAnswerBody(responses, model, instructions, history, options);
   const response = await directFetch(fetcher, `${OPENAI_BASE}/${responses ? "responses" : "chat/completions"}`, {

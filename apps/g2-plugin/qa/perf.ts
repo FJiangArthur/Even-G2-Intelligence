@@ -67,6 +67,19 @@ const bridge = {
   },
 };
 
+/** Lock-screen repro: what the native side does when the WebView resumes after `seconds` of suspension —
+ * every audio event it queued is delivered back to back. Returns the synchronous delivery time in ms. */
+(window as unknown as { __burst: (seconds: number) => number }).__burst = seconds => {
+  const began = performance.now();
+  for (let n = 0; n < seconds * 50; n++) {
+    const pcm = new Int16Array(320);
+    if (n % 275 < 210) for (let i = 0; i < 320; i++) pcm[i] = (Math.random() - 0.5) * 6000;
+    const event = { audioEvent: new AudioEvent({ audioPcm: new Uint8Array(pcm.buffer), source: AudioInputSource.Glasses, speakerRole: AudioSpeakerRole.Other }) };
+    for (const listener of listeners) listener(event);
+  }
+  return Math.round(performance.now() - began);
+};
+
 // --- fake realtime socket: words ~250 ms behind speech, sentence punctuation, finals on commit ---
 let item = 0, words: string[] = [], said = "", sentenceIndex = 0;
 class PerfSocket {
@@ -83,7 +96,7 @@ class PerfSocket {
     }
   }
   send(data: string) {
-    perf.socketSends++;
+    perf.socketSends++; (perf as { socketBytes?: number }).socketBytes = ((perf as { socketBytes?: number }).socketBytes ?? 0) + data.length;
     const message = JSON.parse(data);
     if (message.type === "input_audio_buffer.commit") {
       const id = `item_${item++}`, text = said.trim() || "Okay."; said = ""; words = [];

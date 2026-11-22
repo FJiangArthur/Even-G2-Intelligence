@@ -3,196 +3,12 @@ import {
   AudioInputSource,
   AudioSpeakerRole,
   OsEventTypeList,
-  StartUpPageCreateResult,
-  type CreateStartUpPageContainer,
-  type EvenHubEvent,
-  type TextContainerUpgrade,
 } from "@evenrealities/even_hub_sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { G2ConversationController, type G2BridgePort } from "../src/controller";
+import { G2ConversationController } from "../src/controller";
 import { GlassesRenderer } from "../src/glasses-renderer";
 import { ConversationPresentation } from "../src/presentation";
-import type { SessionFormState } from "../src/config";
-import { WebSocketConversationTransport } from "@helix/conversation-sdk";
-
-// Legacy protocol adapter used only to observe controller gesture ordering.
-function testController(bridge: FakeBridge, renderer: GlassesRenderer, presentation: ConversationPresentation) {
-  return new G2ConversationController(bridge, renderer, presentation, () => new WebSocketConversationTransport({
-    url: "ws://127.0.0.1:8787/v2/conversations", protocols: ["helix.v2", "helix-auth.c2hvcnQtbGl2ZWQtdG9rZW4"],
-  }));
-}
-
-type FakeListener = (event: { data?: unknown }) => void;
-
-class FakeWebSocket {
-  public static latest?: FakeWebSocket;
-  public readyState = 0;
-  public binaryType = "blob";
-  public readonly sent: Array<string | ArrayBuffer | ArrayBufferView | Blob> = [];
-  public readonly protocols: string | readonly string[] | undefined;
-  private readonly listeners = new Map<string, Set<FakeListener>>();
-
-  public constructor(_url: string, protocols?: string | readonly string[]) {
-    this.protocols = protocols;
-    FakeWebSocket.latest = this;
-    queueMicrotask(() => {
-      this.readyState = 1;
-      this.emit("open", {});
-    });
-  }
-
-  public addEventListener(type: string, listener: FakeListener): void {
-    const listeners = this.listeners.get(type) ?? new Set<FakeListener>();
-    listeners.add(listener);
-    this.listeners.set(type, listeners);
-  }
-
-  public removeEventListener(type: string, listener: FakeListener): void {
-    this.listeners.get(type)?.delete(listener);
-  }
-
-  public send(data: string | ArrayBuffer | ArrayBufferView | Blob): void {
-    this.sent.push(data);
-    if (typeof data !== "string") return;
-
-    const message = JSON.parse(data) as Record<string, unknown>;
-    if (message.type !== "session.start") return;
-    const session = message.session as {
-      sessionId: string;
-      endpoint: object;
-      prompt: { id: string; version: string };
-      mode?: "general" | "interviewee" | "interviewer" | "social" | "office-discussion" | "passive";
-      responseStrategy?: "reactive" | "proactive" | "both";
-      providers?: {
-        transcriptionProvider?: string;
-        answerProvider?: string;
-      };
-      memory?: {
-        readOmiContext: boolean;
-        syncNotes: boolean;
-      };
-      automation?: {
-        detectQuestions: boolean;
-        answerQuestions: boolean;
-        saveNotes: boolean;
-      };
-      audio: object;
-    };
-    queueMicrotask(() => this.emit("message", {
-      data: JSON.stringify({
-        protocolVersion: "2.1",
-        type: "session.started",
-        eventId: "event_started",
-        sessionId: session.sessionId,
-        occurredAt: new Date().toISOString(),
-        accepted: {
-          prompt: { id: session.prompt.id, version: session.prompt.version },
-          endpoint: session.endpoint,
-          audio: session.audio,
-          mode: session.mode,
-          responseStrategy: session.responseStrategy,
-          transcriptionProvider: session.providers?.transcriptionProvider
-            ? { profileId: session.providers.transcriptionProvider }
-            : undefined,
-          answerProvider: session.providers?.answerProvider
-            ? { profileId: session.providers.answerProvider }
-            : undefined,
-          memory: session.memory,
-          automation: session.automation,
-        },
-      }),
-    }));
-  }
-
-  public close(): void {
-    this.readyState = 3;
-    this.emit("close", {});
-  }
-
-  private emit(type: string, event: { data?: unknown }): void {
-    for (const listener of [...(this.listeners.get(type) ?? [])]) listener(event);
-  }
-}
-
-class FakeBridge implements G2BridgePort {
-  public readonly calls: string[] = [];
-  public readonly storage = new Map<string, string>();
-  public readonly updates: TextContainerUpgrade[] = [];
-  public readonly shutdownModes: number[] = [];
-  private eventListener?: (event: EvenHubEvent) => void;
-
-  public async createStartUpPageContainer(
-    _container: CreateStartUpPageContainer,
-  ): Promise<StartUpPageCreateResult> {
-    this.calls.push("startup-page");
-    return StartUpPageCreateResult.success;
-  }
-
-  public async textContainerUpgrade(container: TextContainerUpgrade): Promise<boolean> {
-    this.updates.push(container);
-    return true;
-  }
-
-  public async audioControl(isOpen: boolean, source?: AudioInputSource): Promise<boolean> {
-    this.calls.push(`audio:${String(isOpen)}:${source ?? "default"}`);
-    return true;
-  }
-
-  public async shutDownPageContainer(exitMode = 0): Promise<boolean> {
-    this.shutdownModes.push(exitMode);
-    return true;
-  }
-
-  public onEvenHubEvent(callback: (event: EvenHubEvent) => void): () => void {
-    this.eventListener = callback;
-    return () => { this.eventListener = undefined; };
-  }
-
-  public async getLocalStorage(key: string): Promise<string> {
-    return this.storage.get(key) ?? "";
-  }
-
-  public async setLocalStorage(key: string, value: string): Promise<boolean> {
-    this.storage.set(key, value);
-    return true;
-  }
-
-  public emit(event: object): void {
-    this.eventListener?.(event as EvenHubEvent);
-  }
-}
-
-const form: SessionFormState = {
-  copilotModel: "gpt-6-luna", copilotSummarize: true, copilotConcepts: true, copilotConflicts: true,
-  copilotSuggestions: true, copilotImplicitAsks: true, copilotWebGrounding: true,
-  autoExplainTerms: true,
-  useLocalMemory: true,
-  liveWebFactCheck: false,
-  gatewayUrl: "ws://127.0.0.1:8787/v2/conversations",
-  accessToken: "short-lived-token",
-  openaiApiKey: "",
-  deepgramApiKey: "",
-  sonioxApiKey: "",
-  omiApiKey: "",
-  saveApiKeysOnPhone: false,
-  endpointId: "test-endpoint",
-  provider: "mock",
-  model: "mock-fast",
-  promptId: "test-prompt",
-  promptVersion: "1",
-  instructions: "Answer directly.",
-  locale: "en",
-  maxResponseSentences: 3,
-  conversationMode: "interviewer",
-  responseStrategy: "proactive",
-  transcriptionProvider: "soniox",
-  answerProvider: "openai-responses",
-  autoQuestion: true,
-  autoAnswer: true,
-  autoNotes: true,
-  readOmiContext: true,
-  syncOmiNotes: true,
-};
+import { FakeBridge, FakeWebSocket, form, testController } from "./controller-fakes";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -319,7 +135,7 @@ describe("G2 controller integration", () => {
     await vi.waitFor(() => expect(bridge.shutdownModes).toEqual([1]));
     expect(presentation.snapshot().status).toBe("exited");
     expect(socket.readyState).toBe(3);
-    expect(bridge.calls.at(-1)).toBe("audio:false:default");
+    expect(bridge.calls.at(-1)).toBe(`audio:false:${AudioInputSource.Glasses}`); // v0.13.2: every close names its microphone
     const calls = bridge.calls.length;
     emit(OsEventTypeList.CLICK_EVENT);
     await controller.togglePause();
@@ -432,7 +248,7 @@ describe("G2 controller integration", () => {
 
     bridge.emit({ sysEvent: { eventType: OsEventTypeList.SYSTEM_EXIT_EVENT } });
     await vi.waitFor(() => expect(socket?.readyState).toBe(3));
-    expect(bridge.calls.at(-1)).toBe("audio:false:default");
+    expect(bridge.calls.at(-1)).toBe(`audio:false:${AudioInputSource.Glasses}`); // v0.13.2: every close names its microphone
   });
 
   it("omits provider preferences only when both profiles use the gateway defaults", async () => {
@@ -518,6 +334,93 @@ describe("G2 controller integration", () => {
     });
     expect(presentation.snapshot().feed).toEqual([]);
 
+    await controller.dispose();
+  });
+  it("v0.12.2 audio intake: 20 ms frames are handed on in ~100 ms batches, and a backlog delivered at once after a suspension is dropped", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.UTC(2026, 10, 21, 20, 0, 0) });
+    const bridge = new FakeBridge();
+    const presentation = new ConversationPresentation();
+    const controller = testController(bridge, new GlassesRenderer(bridge), presentation);
+    controller.audioRealtimeGuard = true;
+    await controller.initialize();
+    await controller.connect(form);
+    const socket = FakeWebSocket.latest!;
+    await controller.startListening();
+    await vi.waitFor(() => expect(presentation.snapshot().status).toBe("listening"));
+    const frame = () => bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array(640).fill(7), source: AudioInputSource.Glasses, speakerRole: AudioSpeakerRole.Other }) });
+    const audio = () => socket.sent.filter((item): item is ArrayBuffer => item instanceof ArrayBuffer);
+    const bytes = () => audio().reduce((sum, item) => sum + item.byteLength, 0);
+    // One second of live audio, 20 ms apart: 50 frames in, 10 hand-offs of 100 ms out, nothing lost.
+    for (let i = 0; i < 50; i++) { vi.setSystemTime(Date.now() + 20); frame(); }
+    await vi.waitFor(() => expect(bytes()).toBe(50 * 640));
+    expect(audio()).toHaveLength(10);
+    // Locked for 5 minutes: the native side queued 15,000 frames and delivers them in one go on resume.
+    vi.setSystemTime(Date.now() + 300_000);
+    const before = bytes();
+    for (let i = 0; i < 15_000; i++) frame();
+    await controller.togglePause(); // drains what was accepted
+    const accepted = (bytes() - before) / 640 / 50;
+    expect(accepted).toBeGreaterThan(1.5); expect(accepted).toBeLessThanOrEqual(2); // only the 2 s burst allowance
+    // Live audio afterwards flows normally again.
+    await controller.startListening();
+    await vi.waitFor(() => expect(presentation.snapshot().status).toBe("listening"));
+    const resumed = bytes();
+    for (let i = 0; i < 25; i++) { vi.setSystemTime(Date.now() + 20); frame(); }
+    await vi.waitFor(() => expect(bytes() - resumed).toBe(25 * 640));
+    vi.useRealTimers();
+    await controller.dispose();
+  });
+  it("v0.12.3 overload while locked: audio arriving slower than it is recorded on a hidden page pauses the microphone; a visible page resumes it", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+    const doc = { visibilityState: "visible" };
+    vi.stubGlobal("document", doc);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], now: Date.UTC(2026, 10, 21, 20, 0, 0) });
+    const bridge = new FakeBridge();
+    const presentation = new ConversationPresentation();
+    const controller = testController(bridge, new GlassesRenderer(bridge), presentation);
+    controller.audioRealtimeGuard = true;
+    await controller.initialize();
+    await controller.connect(form);
+    await controller.startListening();
+    await vi.waitFor(() => expect(presentation.snapshot().status).toBe("listening"));
+    const frame = () => bridge.emit({ audioEvent: new AudioEvent({ audioPcm: new Uint8Array(640).fill(7), source: AudioInputSource.Glasses, speakerRole: AudioSpeakerRole.Other }) });
+    const micCalls = () => bridge.calls.filter(call => call.startsWith("audio:"));
+    // This device delivers 42 frames a second in the foreground (as measured): that is the baseline, not an overload.
+    for (let i = 0; i < 42 * 8; i++) { vi.setSystemTime(Date.now() + 24); frame(); }
+    expect(controller.audioPausedForLoad).toBe(false);
+    const opened = micCalls().length;
+    // Visible but slow (weak link): never paused. v0.13.2: the on-screen guard asks the bridge for a reply when
+    // delivery is slow; here it answers at once (the loop yields so it can), so nothing is flushed within 10 s.
+    for (let i = 0; i < 24 * 10; i++) { vi.setSystemTime(Date.now() + 42); frame(); await Promise.resolve(); await Promise.resolve(); }
+    expect(controller.audioPausedForLoad).toBe(false);
+    expect(controller.audioFlushingForLoad).toBe(false);
+    for (let i = 0; i < 42 * 4; i++) { vi.setSystemTime(Date.now() + 24); frame(); }
+    // Locked: every event now takes 42 ms, so 24 a second get through.
+    doc.visibilityState = "hidden";
+    for (let i = 0; i < 24 * 5; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(false); // not on the first slow seconds
+    for (let i = 0; i < 24 * 4; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(true);
+    expect(micCalls().slice(opened)).toEqual([`audio:false:${AudioInputSource.Glasses}`]);
+    expect(presentation.snapshot().glasses.interaction).toContain("MIC PAUSED");
+    // A glasses event while still locked does not turn it back on.
+    await controller.resumeFromBackground("foreground-enter");
+    expect(controller.audioPausedForLoad).toBe(true);
+    // Unlock: microphone back on.
+    doc.visibilityState = "visible";
+    vi.setSystemTime(Date.now() + 5000);
+    await controller.resumeFromBackground("visible");
+    expect(controller.audioPausedForLoad).toBe(false);
+    expect(micCalls().at(-1)).toBe(`audio:true:${AudioInputSource.Glasses}`);
+    // Locked again and overloaded again: paused, then the retry timer re-opens it after 30 s.
+    doc.visibilityState = "hidden";
+    for (let i = 0; i < 24 * 9; i++) { vi.setSystemTime(Date.now() + 42); frame(); }
+    expect(controller.audioPausedForLoad).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(controller.audioPausedForLoad).toBe(false);
+    expect(micCalls().at(-1)).toBe(`audio:true:${AudioInputSource.Glasses}`);
+    vi.useRealTimers();
     await controller.dispose();
   });
 });
