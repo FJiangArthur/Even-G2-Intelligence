@@ -45,6 +45,23 @@ export interface AnswerRequestOptions {
   readonly maxOutputTokens?: number;
   /** A non-OpenAI provider from provider-registry.ts: the request goes to its Chat Completions endpoint with `key` as that provider's key. */
   readonly provider?: AnswerProviderInfo;
+  /**
+   * v0.14: the provider stopped at its length limit after some text had streamed. With this callback the
+   * stream ends normally (the text so far is the answer, marked partial by the caller); without it the
+   * cut is an error, as before.
+   */
+  readonly onIncomplete?: () => void;
+}
+/** One SSE `data:` payload as an object; undefined for anything that is not a JSON object (the event is skipped). */
+export function parseStreamEvent(data: string): Record<string, any> | undefined {
+  try {
+    const value: unknown = JSON.parse(data);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, any> : undefined;
+  } catch { return undefined; }
+}
+/** A stream whose events could not be read: a provider fault, not the phone's connection. */
+export function unreadableStream(provider: string): DirectProviderError {
+  return new DirectProviderError("provider-response", `${provider} sent an unreadable answer stream. Try again.`, true);
 }
 export function promptContextFailure(provisional = false): DirectProviderError {
   return new DirectProviderError("prompt-context-limit", `${provisional ? "The selected model has an unverified context window; Helix applies a provisional 4,096-token request budget. " : ""}Answer context is too large for the selected model budget. Shorten the custom prompt, turn off local memory, choose a larger supported model and reconnect, or start a new session. The captured transcript has not been discarded.`);
@@ -271,7 +288,7 @@ export async function* answerDirect(fetcher: DirectFetch, key: string, profile: 
   }, "OpenAI answer");
   if (!response.body) throw new DirectProviderError("provider-response", "OpenAI returned no answer stream.");
   const reader = response.body.getReader(), decoder = new TextDecoder();
-  let buffer = "", completed = false, carriage = "", produced = "", inMarker = false;
+  let buffer = "", completed = false, carriage = "", produced = "", inMarker = false, malformed = 0;
   let usage: RawUsage | undefined, finalCalls: number | undefined;
   const searchItems = new Set<string>(); let anonymousSearches = 0;
   const sources = new Map<string, Citation>();
@@ -299,8 +316,17 @@ export async function* answerDirect(fetcher: DirectFetch, key: string, profile: 
         const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
         if (!data) continue;
         if (data === "[DONE]") { completed = true; continue; }
-        const event = JSON.parse(data);
-        if (event.error || ["response.failed", "response.incomplete", "error"].includes(event.type)) {
+        // One garbled event (a proxy page, a cut line) is skipped; it must not look like a network failure.
+        const event = parseStreamEvent(data);
+        if (!event) { malformed++; continue; }
+        // Cut at the length limit after text streamed: what arrived is still useful mid-conversation.
+        if (event.type === "response.incomplete" && !event.error && produced.trim() && options.onIncomplete) {
+          completed = true;
+          usage = parseResponsesUsage(event.response?.usage) ?? usage;
+          try { options.onIncomplete(); } catch { /* host callback isolation */ }
+          continue;
+        }
+        if (event.error ||["response.failed", "response.incomplete", "error"].includes(event.type)) {
           if (isContextOverflow(event.error) || isContextOverflow(event.response?.error) || isContextOverflow(event)) throw promptContextFailure();
           throw new DirectProviderError("provider-response", "OpenAI could not complete the answer.");
         }
@@ -321,12 +347,17 @@ export async function* answerDirect(fetcher: DirectFetch, key: string, profile: 
           const chatUsage = parseChatUsage(event.usage); if (chatUsage) usage = chatUsage;
         }
         const raw = responses ? (event.type === "response.output_text.delta" ? event.delta : undefined) : event.choices?.[0]?.delta?.content;
-        if (!responses && event.choices?.[0]?.finish_reason === "length") throw new DirectProviderError("provider-response", "Answer exceeded its length limit. Ask a shorter question.");
         const delta = typeof raw === "string" ? speakable(raw) : "";
         if (delta) { produced += delta; yield delta; }
+        if (!responses && event.choices?.[0]?.finish_reason === "length") {
+          if (!produced.trim() || !options.onIncomplete) throw new DirectProviderError("provider-response", "Answer exceeded its length limit. Ask a shorter question.");
+          completed = true;
+          try { options.onIncomplete(); } catch { /* host callback isolation */ }
+        }
       }
       if (done) break;
     }
+    if (malformed && !produced.trim()) throw unreadableStream("OpenAI");
     if (!completed) throw new DirectProviderError("provider-response", "OpenAI answer stream ended before completion.");
     const webSearchCalls = finalCalls ?? searchItems.size + anonymousSearches;
     try { options.onCitations?.([...sources.values()]); } catch { /* host callback isolation */ }

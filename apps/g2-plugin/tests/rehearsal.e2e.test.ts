@@ -164,7 +164,9 @@ describe("rehearsal scripts", () => {
     for (const script of REHEARSAL_SCRIPTS) {
       const detected = script.lines.flatMap(line => extractQuestions(line.text).map(q => q.text));
       for (const needle of script.expectations.questions ?? []) expect(detected.some(q => q.includes(needle)), `${script.id}: ${needle}`).toBe(true);
-      for (const needle of script.expectations.implicitQuestions ?? []) expect(detected.some(q => q.includes(needle)), `implicit stays implicit: ${needle}`).toBe(false);
+      // v0.14: a request phrased as a wish ("I'd like to hear about a time…") is detected on-device too,
+      // so an interviewer's prompt is answered without waiting for the copilot's implicit-ask pass.
+      for (const needle of script.expectations.implicitQuestions ?? []) expect(detected.some(q => q.includes(needle)), `wish-form request is detected: ${needle}`).toBe(true);
     }
   });
 

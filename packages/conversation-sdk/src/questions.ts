@@ -21,6 +21,26 @@ const WHAT_QUESTION_START = /^what\s+(?!a\b|an\b)\S+/iu;
 const HOW_QUESTION_START = /^how\s+(?:do|does|did|can|could|would|will|should|may|might|must|is|are|am|was|were|have|has|had|many|much|long|far|often|soon|old|big|small|fast|slow|well)\b/iu;
 const MODAL_QUESTION_START = /^(?:can|could|would|will|should|may|might|must)\s+(?:i|you|we|they|he|she|it|this|that|these|those|there|someone|anyone|the|a|an|my|your|our|their|its)\b\s+\S+/iu;
 const AUXILIARY_QUESTION_START = /^(?:do|does|did|is|are|am|was|were|have|has|had)\s+\S+\s+\S+/iu;
+/**
+ * v0.14 requests phrased as an instruction or a wish ("Give me an example of…", "I'd like to hear about…").
+ * Interviewers ask this way as often as with a question word. Each form names what is wanted, so plain
+ * statements with the same opening ("Give me a second.", "I'd like a coffee.") stay statements.
+ */
+const REQUEST_NOUN = String.raw`(?:examples?|instances?|overview|sense|summary|idea|rundown|picture|walk-?through|time|story|situation|experience)`;
+const IMPERATIVE_QUESTION_START = new RegExp(String.raw`^(?:` + [
+  String.raw`tell\s+us\b`,
+  String.raw`(?:walk|talk|take)\s+(?:me|us)\s+through\b`,
+  String.raw`talk\s+(?:to\s+(?:me|us)\s+)?about\b`,
+  String.raw`help\s+us\s+understand\b`,
+  String.raw`elaborate\s+on\b`,
+  String.raw`give\s+(?:me|us)\s+(?:an?\s+|one\s+|some\s+|another\s+|your\s+|a\s+(?:quick|brief|short|concrete|specific|recent)\s+)?${REQUEST_NOUN}\b`,
+  String.raw`share\s+(?:with\s+(?:me|us)\s+)?(?:an?\s+|one\s+|some\s+)(?:\S+\s+)?${REQUEST_NOUN}\b`,
+].join("|") + ")", "iu");
+const WISH_VERB = String.raw`(?:hear(?!\s+back\b)|know|understand|learn|see\s+(?:how|what|why))`;
+const WISH_ASK = String.raw`you\s+to\s+(?:walk|talk|tell|describe|explain|share|give|take|elaborate|outline|show|think)\b`;
+const WISH_QUESTION_START = new RegExp(String.raw`^i(?:\s+would|['’]d)\s+(?:like|love)\s+(?:to\s+${WISH_VERB}\b|${WISH_ASK})|^i\s+want\s+(?:to\s+${WISH_VERB}\b|${WISH_ASK})`, "iu");
+/** "I'm curious how you…", "I was wondering if you could…": a question only when it is about the listener. */
+const CURIOUS_QUESTION_START = /^i(?:['’]m|\s+am|\s+was)\s+(?:curious|wondering)\s+(?:about|how|what|why|whether|if|when|where|which|who)\b.*\byou(?:r|rs)?\b/iu;
 const CHINESE_QUESTION = /^(?:你能|你可以|您能|您可以|能否|可否|是否|为什么|为何|怎么|怎样|如何|什么|谁|哪(?:个|些|里)?|几|多少)|(?:吗|呢|么)[。！!\s]*$/u;
 const ARABIC_QUESTION = /^(?:هل|ما|ماذا|من|متى|أين|لماذا|كيف|أي|أيمكن|يمكن\s+أن)(?:\s|$)/u;
 const SPANISH_QUESTION = /^¿?\s*(?:puedes|podrías|podria|podriais|qué|que\s+|cómo|como\s+|por\s+qué|cuando|cuándo|donde|dónde|quién|quien|cuál|cual|cuánto|cuanto|es\s+|son\s+)/iu;
@@ -61,6 +81,31 @@ function canonicalQuestion(text: string): string {
   return text.normalize("NFKC").toLocaleLowerCase("en-US").replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
+/** Dedupe key of a question: case, punctuation, spacing and leading filler ("So, …") do not matter. */
+export function questionKey(text: string): string {
+  return canonicalQuestion(text.replace(/\s+/g, " ").trim().replace(LEADING_FILLER, ""));
+}
+
+/**
+ * v0.14 questions answered or queued recently, across transcript turns. extractQuestions only dedupes
+ * within one line; an interviewer repeating a question a moment later must not be answered twice.
+ */
+export class RecentQuestions {
+  private readonly at = new Map<string, number>();
+  constructor(private readonly windowMs = 90_000) {}
+  has(text: string, now = Date.now()): boolean {
+    const seen = this.at.get(questionKey(text));
+    return seen !== undefined && now - seen <= this.windowMs;
+  }
+  add(text: string, now = Date.now()): void {
+    for (const [key, seen] of this.at) if (now - seen > this.windowMs) this.at.delete(key);
+    const key = questionKey(text);
+    if (key) this.at.set(key, now);
+  }
+  delete(text: string): void { this.at.delete(questionKey(text)); }
+  clear(): void { this.at.clear(); }
+}
+
 function looksLikeUnpunctuatedQuestion(text: string): boolean {
   const cleaned = text
     .replace(/^["'“‘「『（(\s]+/, "")
@@ -72,6 +117,9 @@ function looksLikeUnpunctuatedQuestion(text: string): boolean {
     || HOW_QUESTION_START.test(cleaned)
     || MODAL_QUESTION_START.test(cleaned)
     || AUXILIARY_QUESTION_START.test(cleaned)
+    || IMPERATIVE_QUESTION_START.test(cleaned)
+    || WISH_QUESTION_START.test(cleaned)
+    || CURIOUS_QUESTION_START.test(cleaned)
   ) return true;
   return CHINESE_QUESTION.test(cleaned)
     || ARABIC_QUESTION.test(cleaned)
