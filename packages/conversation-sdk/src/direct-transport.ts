@@ -50,7 +50,7 @@ interface RealtimeState {
   /** v0.12.1 idle gate: while nobody speaks the uplink is paused; `preroll` keeps the last moments to send first on resume. */
   idle: boolean; preroll: Int16Array[]; prerollSamples: number;
 }
-export interface MemoryRetrievalResult { readonly items: RetrievedMemory[]; readonly searchedEntries: number; readonly matched?: number }
+export interface MemoryRetrievalResult { readonly items: RetrievedMemory[]; readonly searchedEntries: number; readonly matched?: number; /** The search gave up at its deadline: the answer goes out without saved knowledge. */ readonly timedOut?: true }
 
 interface Runtime {
   config: NormalizedSessionConfig;
@@ -92,8 +92,10 @@ export interface DirectConversationOptions {
   /**
    * Preferred over both: the same result without holding the thread (LocalHistoryStore.retrieveAsync). A search
    * of a large archive in one task stalls the page long enough for microphone events to pile up behind it.
+   * `signal` aborts with the answer it was for. The host bounds the wait (LocalHistoryStore.retrieveAsync
+   * deadlineMs): an answer must not hang on a search, and no synchronous search is run in its place.
    */
-  retrieveMemoryAsync?: (query: string, sessionId: string) => Promise<MemoryRetrievalResult>;
+  retrieveMemoryAsync?: (query: string, sessionId: string, signal?: AbortSignal) => Promise<MemoryRetrievalResult>;
   /**
    * v0.12 OpenAI knowledge base. When this returns a vector store id, answers first search that store
    * (Retrieval API, the session's OpenAI key) and fall back to the local lookup when the search
@@ -561,7 +563,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
       if (cloud.length) {
         found = cloud; matched = cloud.length; knowledge = "openai";
       } else if (this.options.retrieveMemoryAsync || this.options.retrieveMemoryWithStats) {
-        const result = this.options.retrieveMemoryAsync ? await this.options.retrieveMemoryAsync(query, config.sessionId) : this.options.retrieveMemoryWithStats!(query, config.sessionId);
+        const result = this.options.retrieveMemoryAsync ? await this.options.retrieveMemoryAsync(query, config.sessionId, signal) : this.options.retrieveMemoryWithStats!(query, config.sessionId);
         if (!current()) return;
         found = Array.isArray(result?.items) ? result.items : [];
         searchedEntries = Number.isFinite(result?.searchedEntries) ? result.searchedEntries : 0;

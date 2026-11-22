@@ -123,7 +123,7 @@ describe("v0.7 direct transport", () => {
     const fetcher = vi.fn(async () => answer("About 12 weeks [M1]."));
     const { client, metas } = setup(fetcher, { retrieveMemoryAsync, retrieveMemoryWithStats: sync, retrieveMemory: sync });
     await client.start(config, { openai: "k" }); await client.ask("Jetson lead time?");
-    await vi.waitFor(() => expect(retrieveMemoryAsync).toHaveBeenCalledWith(expect.stringContaining("Jetson lead time?"), config.sessionId));
+    await vi.waitFor(() => expect(retrieveMemoryAsync).toHaveBeenCalledWith(expect.stringContaining("Jetson lead time?"), config.sessionId, expect.any(AbortSignal))); // aborted with the answer
     expect(fetcher).not.toHaveBeenCalled(); // the answer request waits for the search, the page does not
     release();
     await vi.waitFor(() => expect(metas).toHaveLength(1));
@@ -136,6 +136,13 @@ describe("v0.7 direct transport", () => {
     await vi.waitFor(() => expect(failing.metas).toHaveLength(1));
     expect(failing.metas[0]).toMatchObject({ grounded: "conversation", retrieval: { searchedEntries: 0, matched: 0 } });
     await failing.client.dispose();
+    // The search gave up at its deadline: the answer goes out without saved knowledge.
+    const late = setup(vi.fn(async () => answer("No record of that.")), { retrieveMemoryAsync: async () => ({ items: [], searchedEntries: 0, matched: 0, timedOut: true as const }), retrieveMemoryWithStats: sync, retrieveMemory: sync });
+    await late.client.start(config, { openai: "k" }); await late.client.ask("Jetson lead time?");
+    await vi.waitFor(() => expect(late.metas).toHaveLength(1));
+    expect(late.metas[0]).toMatchObject({ grounded: "conversation", retrieval: { searchedEntries: 0, matched: 0 } });
+    expect(sync).not.toHaveBeenCalled();
+    await late.client.dispose();
   });
   it("injectTranscript runs the post-transcription path without STT: transcript.final, auto answer, copilot submit", async () => {
     const fetcher = vi.fn(async (url: string, init?: RequestInit) => {

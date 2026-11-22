@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { YIELD_FALLBACK_MS, hostYield, tokenChunks, tokenList as indexTokens } from "../src/history-retrieval.js";
 import { LEGACY_HISTORY_KEY, LocalHistoryStore, type HistoryEntry, type HistorySession, type LocalHistoryOptions, type RetrievalStats, type RetrievedMemory } from "../src/index.js";
 
 /*
@@ -301,6 +302,11 @@ describe("saved-knowledge search index", () => {
     await store.upsertSession(session("long")); await store.upsertSession(session("word"));
     await store.upsertEntries([entry("l1", "long", `${"plain filler ".repeat(46).slice(0, 594)} zeppelinxyz ${"more filler ".repeat(20)}`), entry("w1", "word", "zeppe")]);
     expect(await ids("zeppe")).toEqual(["l1", "w1"]); expect(await ids("zeppe", { excludeSessionId: "word" })).toEqual([]);
+    // The excluded session's own words are counted once and then follow its changes: it loses the word, another session gains it.
+    await store.upsertSession(session("third")); await store.upsertEntries([entry("w1", "word", "nothing here"), entry("t1", "third", "zeppe")]);
+    expect(await ids("zeppe", { excludeSessionId: "word" })).toEqual(["l1", "t1"]);
+    await store.upsertEntries([entry("w2", "word", "zeppe")]); await store.deleteSession("third");
+    expect(await ids("zeppe", { excludeSessionId: "word" })).toEqual([]); expect(await ids("zeppe")).toEqual(["l1", "w2"]);
     await store.deleteSession("word");
     expect(await ids("zeppe")).toEqual([]);
     await store.deleteSession("long");
@@ -417,4 +423,128 @@ describe("saved-knowledge search index", () => {
     for (let k = 1; k <= warm; k++) await run(big, k, true);
     for (let k = 1; k <= long; k++) await run(small, k, false);
   }, 240_000);
+
+  it("gives up at its deadline or on abort without holding later searches, and never searches in one go instead", async () => {
+    const archive = makeArchive(0.3 * MIB, 41), { text } = archive, query = `${text.sentence()} ${text.passage(600)}`;
+    // A page that gets no time: every yield waits until the test lets it go.
+    const parked: (() => void)[] = []; let starved = true, pauses = 0;
+    const store = await storeOf(archive, { retrievalSliceMs: 0, retrievalYield: () => { pauses++; return starved ? new Promise<void>(resolve => { parked.push(resolve); }) : Promise.resolve(); } });
+    const snapshot = saved(store), blocking = vi.spyOn(store, "retrieveWithStats"), finished: unknown[] = [];
+    const began = performance.now();
+    expect(await store.retrieveAsync(query, { deadlineMs: 40, onTiming: timing => finished.push(timing) })).toEqual({ items: [], searchedEntries: 0, matched: 0, timedOut: true });
+    expect(performance.now() - began).toBeLessThan(2000);
+    expect(blocking).not.toHaveBeenCalled(); expect(pauses).toBe(1);
+    // Searches behind the abandoned one: each settles by its own deadline or abort, and none of them starts work.
+    expect((await store.retrieveAsync(query, { deadlineMs: 20, excludeSessionId: snapshot.sessions[0]!.id })).timedOut).toBe(true);
+    const answer = new AbortController(), aborted = store.retrieveAsync(query, { signal: answer.signal, deadlineMs: 60_000 });
+    answer.abort(new Error("answer cancelled"));
+    await expect(aborted).rejects.toThrow("answer cancelled");
+    await expect(store.retrieveAsync(query, { signal: answer.signal })).rejects.toThrow("answer cancelled"); // already aborted
+    expect(pauses).toBe(1);
+    // The page gets time again: the abandoned search stops at once, the index build it had started goes on
+    // (queued by the timeout), and the next question is answered from the whole archive.
+    starved = false; parked.splice(0).forEach(resume => resume());
+    await store.warmRetrieval();
+    expect(store.retrievalIndexSize().entries).toBe(oracle(snapshot, query).searchedEntries);
+    expect(finished).toEqual([]);                                            // the abandoned search never ran to its end
+    expect(await store.retrieveAsync(query, { deadlineMs: 60_000, onTiming: timing => finished.push(timing) })).toEqual(oracle(snapshot, query));
+    expect(finished).toHaveLength(1); expect(blocking).not.toHaveBeenCalled();
+    // An abort in the middle of a search over a warm index: at most the pause it was in, then no more work.
+    let searching = false, searchPauses = 0;
+    const stopper = new AbortController();
+    const second = await storeOf(archive, { retrievalSliceMs: 0, retrievalYield: async () => { if (searching && ++searchPauses === 3) stopper.abort(); } });
+    await second.warmRetrieval(); searching = true;
+    await expect(second.retrieveAsync(query, { signal: stopper.signal })).rejects.toThrow();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(searchPauses).toBe(3); searching = false;
+    expect(await second.retrieveAsync(query)).toEqual(oracle(snapshot, query)); // and the next search is not behind it
+    // A deadline that is read from the clock at a pause (the timer itself is late on a throttled page).
+    let busy = true;
+    const third = await storeOf(archive, { retrievalSliceMs: 0, retrievalYield: async () => { if (!busy) return; busy = false; const until = performance.now() + 30; while (performance.now() < until) { /* the page is busy elsewhere */ } } });
+    expect((await third.retrieveAsync(query, { deadlineMs: 10 })).timedOut).toBe(true);
+    await third.warmRetrieval();
+    expect(await third.retrieveAsync(query, { deadlineMs: 60_000 })).toEqual(oracle(snapshot, query));
+  }, 60_000);
+
+  it("tokenizes a pasted document in pieces that give exactly the tokens of the whole", async () => {
+    const rand = random(77), text = makeText(rand);
+    // Places where a careless cut changes the tokens: final sigma, combining marks, kana voicing marks, Hangul jamo, full-width forms.
+    const tricky = ["ΟΔΟΣ. Β", "ΑΣ ", "ΑΣ.", "é ", " ́x", "が ", "。゙か", "한 ", " ᅡᆫ", "ＡＢＣ，ｄｅｆ", "don't ", "3.5 ", "ﬁne ", "İstanbul ", "１２３、", "𠀋𠀋 ", "ｶﾞ "];
+    for (let round = 0; round < 60; round++) {
+      let body = "";
+      while (body.length < 400 + round * 40) body += rand() < 0.4 ? tricky[Math.floor(rand() * tricky.length)]! : `${text.sentence()}${rand() < 0.5 ? " " : ""}`;
+      for (const size of [4, 16, 64, 2048]) {
+        const chunks = tokenChunks(body, size);
+        expect(chunks.join("")).toBe(body);
+        expect(chunks.flatMap(chunk => indexTokens(chunk))).toEqual(indexTokens(body));
+      }
+    }
+    const prose = text.passage(300_000), pieces = tokenChunks(prose);
+    expect(pieces.length).toBeGreaterThan(100); expect(Math.max(...pieces.map(piece => piece.length))).toBeLessThan(4200);
+    expect(tokenChunks("x".repeat(50_000))).toHaveLength(1);                  // nowhere safe to cut: one piece, as before
+    // In the index: one 300 000-character entry is tokenized across pauses (its windows alone are 1000 of them), and searched like any other.
+    const session: HistorySession = { id: "doc", source: "helix", title: "Pasted", startedAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" };
+    const snapshot: Snapshot = { sessions: [session], entries: [{ id: "doc:1", sessionId: "doc", kind: "transcript", text: prose, occurredAt: session.startedAt }, { id: "doc:2", sessionId: "doc", kind: "transcript", text: text.sentence(), occurredAt: session.startedAt }] };
+    let pauses = 0;
+    const store = await storeOf(snapshot, { retrievalSliceMs: 0, retrievalYield: async () => { pauses++; } });
+    await store.warmRetrieval();
+    expect(pauses).toBeGreaterThanOrEqual(prose.length / 300 + pieces.length);
+    const query = prose.slice(150_000, 150_300);
+    expect(await store.retrieveAsync(query)).toEqual(oracle(snapshot, query));
+    expect(store.retrieveWithStats(query, { maxChars: 250 })).toEqual(oracle(snapshot, query, { maxChars: 250 }));
+  }, 60_000);
+
+  it("keeps the index small: ids in typed arrays per session, and words of deleted sessions are forgotten", async () => {
+    const store = new LocalHistoryStore(memoryDisk()), at = "2026-09-01T00:00:00.000Z";
+    const session = (id: string): HistorySession => ({ id, source: "helix", title: id, startedAt: at, updatedAt: at });
+    await store.upsertSession(session("big")); await store.upsertSession(session("small"));
+    await store.upsertEntries(Array.from({ length: 60 }, (_, i): HistoryEntry => ({ id: `big:${i}`, sessionId: "big", kind: "transcript", occurredAt: at,
+      text: Array.from({ length: i % 10 ? 50 : 400 }, (_, j) => `rare${i}x${j}`).join(" ") })));
+    await store.upsertEntries([{ id: "small:1", sessionId: "small", kind: "transcript", text: "The zeppelin hangar is booked. 发布计划改到十月。", occurredAt: at }]);
+    expect(store.retrievalIndexSize()).toEqual({ vocabulary: 0, entries: 0, bytes: 0 });  // nothing is built until it is used
+    expect(store.retrieveWithStats("rare7x3 zeppelin")).toEqual(oracle(saved(store), "rare7x3 zeppelin"));
+    const full = store.retrievalIndexSize();
+    expect(full.entries).toBe(61); expect(full.vocabulary).toBeGreaterThan(5000);
+    // 4 bytes per token id (long entries also keep their passage windows: about 3 ids per token), no slack left behind.
+    const tokens = saved(store).entries.reduce((n, entry) => n + tokenList(entry.text).length * (entry.text.length > 600 ? 3.2 : 1), 0);
+    expect(full.bytes).toBeGreaterThan(tokens * 3); expect(full.bytes).toBeLessThan(tokens * 4 * 1.3 + 2048);
+    await store.deleteSession("big");
+    expect(store.retrieveWithStats("rare7x3 zeppelin 十月")).toEqual(oracle(saved(store), "rare7x3 zeppelin 十月"));
+    const left = store.retrievalIndexSize();
+    expect(left.entries).toBe(1); expect(left.vocabulary).toBeLessThan(40); expect(left.bytes).toBeLessThan(400);
+    // A session that keeps growing and being revised does not accumulate dead ids either.
+    await store.upsertSession(session("live"));
+    for (let i = 0; i < 120; i++) {
+      await store.upsertEntries([{ id: `live:${i % 30}`, sessionId: "live", kind: "transcript", text: `Revision ${i} of line ${i % 30} about the zeppelin budget.`, occurredAt: at }]);
+      if (i % 20 === 19) expect(await store.retrieveAsync("zeppelin budget revision")).toEqual(oracle(saved(store), "zeppelin budget revision"));
+    }
+    expect(store.retrievalIndexSize().bytes).toBeLessThan(31 * 12 * 4 * 2);
+  });
+
+  it("ends each yield with its own message: one that arrives late does not cut a later yield short", async () => {
+    const posted: unknown[] = []; let deliver!: (event: { data: unknown }) => void;
+    class Channel {
+      port1 = { set onmessage(handler: (event: { data: unknown }) => void) { deliver = handler; } } as unknown as { onmessage: ((event: { data: unknown }) => void) | null };
+      port2 = { postMessage: (message: unknown) => { posted.push(message); } };
+    }
+    vi.useFakeTimers();
+    try {
+      const pause = hostYield({ MessageChannel: Channel, setTimeout: (run, ms) => setTimeout(run, ms), clearTimeout: timer => clearTimeout(timer) });
+      let first = false, second = false, third = false;
+      void pause().then(() => { first = true; });
+      await vi.advanceTimersByTimeAsync(YIELD_FALLBACK_MS - 1); expect(first).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); expect(first).toBe(true);          // the host held the message back: the timer ends the yield
+      void pause().then(() => { second = true; });
+      deliver({ data: posted[0] }); await vi.advanceTimersByTimeAsync(0);
+      expect(second).toBe(false);                                              // the first yield's message, late: not ours
+      deliver({ data: posted[1] }); await vi.advanceTimersByTimeAsync(0);
+      expect(second).toBe(true);
+      void pause().then(() => { third = true; });
+      deliver({ data: posted[2] }); await vi.advanceTimersByTimeAsync(0);
+      expect(third).toBe(true); expect(vi.getTimerCount()).toBe(0);            // and its fallback timer is cleared
+      // Without a MessageChannel (or with setImmediate) it is a plain macrotask.
+      let plain = false; void hostYield({ setTimeout: (run, ms) => setTimeout(run, ms), clearTimeout: timer => clearTimeout(timer) })().then(() => { plain = true; });
+      await vi.advanceTimersByTimeAsync(0); expect(plain).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
 });

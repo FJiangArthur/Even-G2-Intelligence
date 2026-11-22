@@ -41,11 +41,19 @@ describe("saved-knowledge search in the controller", () => {
     vi.mocked(countDiagnostic).mockClear();
     const result = await options.retrieveMemoryAsync!("Orin lead time", live);
     expect(result).toMatchObject({ searchedEntries: 1, matched: 1, items: [{ entry: { id: "old:1" }, session: { title: "Vendor call" } }] });
-    expect(sliced).toHaveBeenCalledWith("Orin lead time", expect.objectContaining({ excludeSessionId: live }));
+    expect(sliced).toHaveBeenCalledWith("Orin lead time", expect.objectContaining({ excludeSessionId: live, deadlineMs: 2500 }));
     expect(blocking).not.toHaveBeenCalled();
     // Shown by the heartbeat as "memory-search Nx max S s".
     expect(vi.mocked(countDiagnostic).mock.calls.filter(call => call[0] === "memory-search")).toEqual([["memory-search", expect.any(Number)]]);
     expect(vi.mocked(countDiagnostic).mock.calls.some(call => call[0] === "memory-block")).toBe(false);
+    // Not done by the deadline (cold index on a busy page): the answer gets no saved knowledge, the timeout is counted, nothing blocks.
+    controller.knowledgeSearchDeadlineMs = 30;
+    const answer = new AbortController();
+    sliced.mockImplementationOnce(async (_query, options) => { expect(options).toMatchObject({ deadlineMs: 30, signal: answer.signal }); return { items: [], searchedEntries: 0, matched: 0, timedOut: true }; });
+    vi.mocked(countDiagnostic).mockClear();
+    expect(await options.retrieveMemoryAsync!("Orin lead time", live, answer.signal)).toEqual({ items: [], searchedEntries: 0, matched: 0, timedOut: true });
+    expect(vi.mocked(countDiagnostic).mock.calls).toEqual([["memory-search-timeout", 30]]);
+    expect(blocking).not.toHaveBeenCalled();
     // Switched off: nothing is searched or counted, and no index is built.
     await controller.setLocalMemoryEnabled(false);
     vi.mocked(countDiagnostic).mockClear(); sliced.mockClear();
