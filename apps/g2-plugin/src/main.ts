@@ -1,7 +1,11 @@
 import { waitForEvenAppBridge } from "@evenrealities/even_hub_sdk";
 import { bootstrap } from "./app";
 import { attachDiagnosticsStore, monitorBridge, recordDiagnostic } from "./diagnostics";
+import { installMicProbe } from "./mic-probe";
 import "./styles.css";
+
+// Before the bridge is used, so the probe's listeners run ahead of the SDK's own handling of a host push.
+installMicProbe();
 
 const root = document.querySelector<HTMLElement>("#app");
 if (!root) throw new Error("Missing #app mount point");

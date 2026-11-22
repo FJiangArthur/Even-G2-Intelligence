@@ -17,6 +17,8 @@ import { CompanionUi } from "./ui";
 import { RESUME_PROMPT } from "./controller";
 import { REHEARSAL_SCRIPTS } from "./rehearsal";
 import { countDiagnostic, recordDiagnostic, watchLifecycle } from "./diagnostics";
+import { AudioInputSource } from "@evenrealities/even_hub_sdk";
+import { installMicProbe, setSdkAudioLogQuiet } from "./mic-probe";
 
 
 export interface BootstrapOptions {
@@ -35,6 +37,10 @@ export const GLASSES_IMAGES_KEY = "helix.glasses.images.v1";
 export const GLASSES_WRITE_GAP_KEY = "helix.glasses.write-gap.v1";
 /** Glasses display: "ambient" (default; blank until an answer or cue pops up) or "always-on". Stored through the Even bridge. */
 export const GLASSES_DISPLAY_KEY = "helix.glasses.display.v1";
+/** Microphone: "glasses" (default) or "phone" (AudioInputSource.Phone; untested on hardware). Stored through the Even bridge. */
+export const MIC_SOURCE_KEY = "helix.mic.source.v1";
+/** "on" = let the Even SDK console.log every audio frame again (default: skipped, see mic-probe.ts). Stored through the Even bridge. */
+export const SDK_AUDIO_LOG_KEY = "helix.mic.sdk-log.v1";
 export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebuildPageContainer?: unknown }, options: BootstrapOptions = {}) {
   const [config, providerCredentials] = await Promise.all([
     loadPersistedConfig(bridge),
@@ -58,6 +64,14 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   // Heat / lock screen: accept microphone audio only at its real-time rate (a backlog queued while the
   // WebView was suspended is dropped, not uploaded). `?audio=all` keeps everything (offline QA replays).
   controller.audioRealtimeGuard = new URLSearchParams(options.search ?? location.search).get("audio") !== "all";
+  // Microphone timing probe (main.ts installs it before the bridge exists; this covers the QA harnesses) and
+  // the two microphone switches in Setup → Diagnostics.
+  installMicProbe();
+  const [savedMic, savedSdkLog] = await Promise.race([Promise.all([bridge.getLocalStorage(MIC_SOURCE_KEY).catch(() => ""), bridge.getLocalStorage(SDK_AUDIO_LOG_KEY).catch(() => "")]),
+    new Promise<[string, string]>(done => setTimeout(() => done(["", ""]), 1500))]);
+  const micSource = savedMic === AudioInputSource.Phone ? AudioInputSource.Phone : AudioInputSource.Glasses;
+  controller.micSource = micSource;
+  setSdkAudioLogQuiet(savedSdkLog !== "on");
   const ui = new CompanionUi(root, config, providerCredentials, {
     rehearsalScripts: REHEARSAL_SCRIPTS.map(script => ({ id: script.id, title: script.title })),
   });
@@ -92,7 +106,26 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
       void bridge.setLocalStorage(GLASSES_WRITE_GAP_KEY, String(ms)).catch(() => false);
     });
   }
-  recordDiagnostic("glasses-settings", `pixel art ${pixelArt ? "on" : "off"} · pause ${writeGap} ms · display ${display}`);
+  const micSelect = root.querySelector<HTMLSelectElement>("#mic-source");
+  if (micSelect) {
+    micSelect.value = micSource;
+    micSelect.addEventListener("change", () => {
+      const next = micSelect.value === AudioInputSource.Phone ? AudioInputSource.Phone : AudioInputSource.Glasses;
+      void controller.setMicSource(next).catch(error => presentation.setStatus("failed", error instanceof Error ? error.message : String(error)));
+      void bridge.setLocalStorage(MIC_SOURCE_KEY, next).catch(() => false);
+    });
+  }
+  const sdkLogToggle = root.querySelector<HTMLInputElement>("#sdk-audio-log");
+  if (sdkLogToggle) {
+    sdkLogToggle.checked = savedSdkLog === "on";
+    sdkLogToggle.addEventListener("change", () => {
+      const on = sdkLogToggle.checked;
+      recordDiagnostic("sdk-audio-log", on ? "left on" : "skipped");
+      setSdkAudioLogQuiet(!on);
+      void bridge.setLocalStorage(SDK_AUDIO_LOG_KEY, on ? "on" : "off").catch(() => false);
+    });
+  }
+  recordDiagnostic("glasses-settings", `pixel art ${pixelArt ? "on" : "off"} · pause ${writeGap} ms · display ${display} · mic ${micSource} · SDK audio log ${savedSdkLog === "on" ? "left on" : "skipped"}`);
   // Glasses link changes (connected / disconnected, worn, in case): the usual companions of a slow bridge.
   let lastDevice = "";
   const stopDevice = (bridge as { onDeviceStatusChanged?: (callback: (status: { connectType?: string; isWearing?: boolean; isInCase?: boolean; batteryLevel?: number }) => void) => () => void })
