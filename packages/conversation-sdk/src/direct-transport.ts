@@ -104,6 +104,8 @@ interface Runtime {
   answerQueue: AnswerJob[];
   /** Questions answered or queued recently (cross-turn dedupe). */
   recent: RecentQuestions;
+  /** Transcript turns and new questions heard so far: tells a repeat from a follow-up about something new. */
+  heard: number;
   busyNoticeAt: number;
   pending: number;
   blocked: boolean;
@@ -167,8 +169,9 @@ export interface DirectConversationOptions {
   /**
    * v0.14 serial answer queue. Automatic answers run one at a time in the order heard. `maxWaiting`
    * (default 3) bounds the questions waiting behind the running answer (the oldest waiting one is dropped),
-   * `maxAgeMs` (default 20 s) drops a question that waited too long, and `dedupeMs` (default 90 s) is how
-   * long a question that was answered or queued is not answered again.
+   * `maxAgeMs` (default 20 s) drops a question that waited too long, and `dedupeMs` (default 10 s) is how
+   * long after its answer completed a question is not answered again. While it is queued or being answered
+   * a repeat is always a duplicate. Proactive help never waits: it is dropped while an answer runs or waits.
    */
   answerQueue?: { maxWaiting?: number; maxAgeMs?: number; dedupeMs?: number };
   /** Longest wait for the first answer token before giving up (default 15 s; doubled for web-grounded answers). */
@@ -270,7 +273,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
       // Preserve the selected model; unknown limits use a documented provisional
       // budget instead of silently sending a different model.
       const model = chat ? providerModel(provider, config.endpoint.model, "answer") : config.endpoint.model;
-      const runtime: Runtime = { config, credentials, stt, answer, model, provider, answerKey, abort: new AbortController(), chunks: [], samples: 0, speech: false, sequence: 0, committed: 0, queue: Promise.resolve(), transcript: new TranscriptContext(), manualHistory: [], answerEpoch: 0, manualActive: false, answering: false, answerQueue: [], recent: new RecentQuestions(this.options.answerQueue?.dedupeMs ?? QUESTION_DEDUPE_MS), busyNoticeAt: 0, pending: 0, blocked: false, notes: [], roles: new SpeakerRoleTally() };
+      const runtime: Runtime = { config, credentials, stt, answer, model, provider, answerKey, abort: new AbortController(), chunks: [], samples: 0, speech: false, sequence: 0, committed: 0, queue: Promise.resolve(), transcript: new TranscriptContext(), manualHistory: [], answerEpoch: 0, manualActive: false, answering: false, answerQueue: [], recent: new RecentQuestions(this.options.answerQueue?.dedupeMs ?? QUESTION_DEDUPE_MS), heard: 0, busyNoticeAt: 0, pending: 0, blocked: false, notes: [], roles: new SpeakerRoleTally() };
       this.runtime = runtime;
       const insights = this.options.insights;
       if (insights) runtime.insights = new ContextInsightAnalyzer({ fetch: this.fetcher, key: answerKey, sessionId: config.sessionId, profile: answer, model, ...(chat ? { provider } : {}), onUsage: usage => this.usage(runtime, usage), length: () => this.answerLength(),
@@ -319,8 +322,10 @@ export class DirectConversationTransport implements ConversationTransport, Copil
       const text = command.text.trim();
       if (!text || text.length > 8000) throw new Error("Enter a question of at most 8000 characters.");
       const at = Date.now();
-      if (!command.contextScope) runtime.recent.add(text, at);
-      this.startAnswer(runtime, { input: text, query: text, questionId: command.requestId, speaker: command.speaker, trigger: "manual", timing: { speechMs: 0, triggerAt: at, readyAt: at }, latency: { totalMs: 0 }, ...(command.contextScope ? { scope: command.contextScope } : {}), queuedAt: at });
+      const job: AnswerJob = { input: text, query: text, questionId: command.requestId, speaker: command.speaker, trigger: "manual", timing: { speechMs: 0, triggerAt: at, readyAt: at }, latency: { totalMs: 0 }, ...(command.contextScope ? { scope: command.contextScope } : {}), queuedAt: at };
+      // The manual ask takes the dedupe entry over from an automatic answer to the same text.
+      if (!command.contextScope) runtime.recent.begin(text, job, at, runtime.heard);
+      this.startAnswer(runtime, job);
     }
     if (command.type === "audio.commit") {
       if (command.sequence !== runtime.sequence || command.sequence <= runtime.committed) return;
@@ -358,6 +363,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
   private afterTranscript(runtime: Runtime, transcriptId: string, transcript: string, speaker: Speaker, latency: ConversationContext["latencyMs"], timing: TurnTiming): void {
     const earlierSpeech = runtime.transcript.global().slice(-4000);
     runtime.transcript.append(transcript);
+    runtime.heard++;
     const event = { ...this.base(runtime), type: "transcript.final" as const, transcriptId, text: transcript, context: this.context(runtime, speaker, latency) };
     this.emit(runtime, event);
     runtime.factChecker?.submit(transcriptId, transcript);
@@ -381,15 +387,18 @@ export class DirectConversationTransport implements ConversationTransport, Copil
     const answering = answerable && automation.answerQuestions !== false && shouldAnswerDetectedQuestions(strategy);
     for (const question of questions) {
       const now = Date.now();
-      // v0.14: a question repeated across turns is neither shown as new nor answered twice.
-      if (answering && runtime.recent.has(question.text, now)) continue;
+      // v0.14: a question repeated across turns is neither shown as new nor answered twice. A generic
+      // follow-up ("Can you give an example?") heard again after other speech is about something new.
+      if (answering && runtime.recent.has(question.text, now, runtime.heard)) continue;
+      runtime.heard++;
       const id = crypto.randomUUID();
       this.emitQuestion(runtime, question.text, id, speaker, latency, "question", event.transcriptId);
       // v0.14: every answerable question of the line is answered, in order (not just the last one).
       if (!answering || !answerableQuestion(question.text)) continue;
-      runtime.recent.add(question.text, now);
       const input = answerKey ? answerKeyInput(question.text, this.answerLength()) : unknownAsker ? unknownAskerInput(question.text) : question.text;
-      this.startAnswer(runtime, { input, query: question.text, questionId: id, speaker, trigger: "question", timing, latency, queuedAt: now });
+      const job: AnswerJob = { input, query: question.text, questionId: id, speaker, trigger: "question", timing, latency, queuedAt: now };
+      runtime.recent.begin(question.text, job, now, runtime.heard);
+      this.startAnswer(runtime, job);
     }
     if (!questions.length && automation.answerQuestions !== false && shouldGenerateProactiveResponse(transcript, mode, strategy)) {
       this.startAnswer(runtime, { input: proactiveInput(transcript), query: transcript.trim(), speaker, trigger: "proactive", timing, latency, queuedAt: Date.now() });
@@ -560,22 +569,31 @@ export class DirectConversationTransport implements ConversationTransport, Copil
   /**
    * v0.14 serial answers. A manual ask runs now and pre-empts the answer in flight. Automatic answers
    * (detected questions, proactive help) run one at a time in the order heard: while one runs, or a manual
-   * answer runs, the next ones wait. The wait is bounded so a live conversation never gets a stale answer.
+   * answer runs, the next questions wait. The wait is bounded so a live conversation never gets a stale answer.
+   * Proactive help is only worth having at once: it never waits, so it cannot take a question's place.
    */
   private startAnswer(runtime: Runtime, job: AnswerJob): void {
     if (job.trigger === "manual") { this.cancelFactChecks(); this.cancelInsights(); this.runAnswer(runtime, job); return; }
+    if (job.trigger === "proactive" && (runtime.answering || runtime.answerQueue.length)) return;
     if (!runtime.answering) { this.runAnswer(runtime, job); return; }
     runtime.answerQueue.push(job);
     const limit = Math.max(0, this.options.answerQueue?.maxWaiting ?? ANSWER_QUEUE_WAITING);
     // Over the bound the oldest waiting question goes, silently: it may be asked (and answered) again.
-    while (runtime.answerQueue.length > limit) runtime.recent.delete(runtime.answerQueue.shift()!.query);
+    // A proactive job, should one ever wait, goes before any question.
+    while (runtime.answerQueue.length > limit) {
+      const proactive = runtime.answerQueue.findIndex(waiting => waiting.trigger === "proactive");
+      const [dropped] = runtime.answerQueue.splice(Math.max(0, proactive), 1);
+      runtime.recent.release(dropped!.query, dropped);
+    }
   }
   private nextAnswer(runtime: Runtime): void {
     if (this.runtime !== runtime || runtime.abort.signal.aborted || runtime.blocked) { runtime.answerQueue = []; return; }
     const maxAge = this.options.answerQueue?.maxAgeMs ?? ANSWER_QUEUE_MAX_AGE_MS;
     while (runtime.answerQueue.length) {
       const job = runtime.answerQueue.shift()!;
-      if (Date.now() - job.queuedAt > maxAge) { runtime.recent.delete(job.query); continue; }
+      if (Date.now() - job.queuedAt > maxAge) { runtime.recent.release(job.query, job); continue; }
+      // A manual ask for the same text took the question over while it waited: it is answered there.
+      if (job.trigger === "question" && !runtime.recent.owns(job.query, job)) continue;
       this.runAnswer(runtime, job);
       return;
     }
@@ -613,8 +631,10 @@ export class DirectConversationTransport implements ConversationTransport, Copil
         if (current()) this.failure(runtime, !request.signal.aborted ? error : new DirectProviderError("provider-timeout", slowStart ? "The provider did not start answering in time. Try again." : "Provider request timed out. Try again.", true));
       } finally {
         clearTimeout(timer); clearTimeout(firstTimer); runtime.abort.signal.removeEventListener("abort", cancel);
-        // Failed, timed out or pre-empted: the question was not answered, so a repeat of it is answered.
-        if (!answered) runtime.recent.delete(job.query);
+        // Answered: the repeat window starts now. Failed, timed out or pre-empted: a repeat of it is answered.
+        // Either way only for the job that still owns the entry: a manual ask for the same text that
+        // pre-empted this answer has taken it over.
+        if (answered) runtime.recent.settle(job.query, job); else runtime.recent.release(job.query, job);
         if (epoch === runtime.answerEpoch) { runtime.manualActive = false; runtime.answerAbort = undefined; runtime.answering = false; this.nextAnswer(runtime); }
       }
     })();

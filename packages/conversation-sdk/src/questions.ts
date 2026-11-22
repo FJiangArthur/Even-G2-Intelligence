@@ -26,18 +26,31 @@ const AUXILIARY_QUESTION_START = /^(?:do|does|did|is|are|am|was|were|have|has|ha
  * Interviewers ask this way as often as with a question word. Each form names what is wanted, so plain
  * statements with the same opening ("Give me a second.", "I'd like a coffee.") stay statements.
  */
-const REQUEST_NOUN = String.raw`(?:examples?|instances?|overview|sense|summary|idea|rundown|picture|walk-?through|time|story|situation|experience)`;
+const REQUEST_NOUN = String.raw`(?:examples?|instances?|overview|sense|summary|idea|rundown|picture|walk-?through|story|situation|experience)`;
+/** What may stand between the verb and the thing asked for: "an", "a concrete", "your". */
+const REQUEST_DETERMINER = String.raw`(?:(?:an?|one|some|another|your)\s+(?:(?:quick|brief|short|concrete|specific|recent)\s+)?)`;
 const IMPERATIVE_QUESTION_START = new RegExp(String.raw`^(?:` + [
   String.raw`tell\s+us\b`,
   String.raw`(?:walk|talk|take)\s+(?:me|us)\s+through\b`,
   String.raw`talk\s+(?:to\s+(?:me|us)\s+)?about\b`,
   String.raw`help\s+us\s+understand\b`,
   String.raw`elaborate\s+on\b`,
-  String.raw`give\s+(?:me|us)\s+(?:an?\s+|one\s+|some\s+|another\s+|your\s+|a\s+(?:quick|brief|short|concrete|specific|recent)\s+)?${REQUEST_NOUN}\b`,
+  String.raw`give\s+(?:me|us)\s+${REQUEST_DETERMINER}?${REQUEST_NOUN}\b`,
   String.raw`share\s+(?:with\s+(?:me|us)\s+)?(?:an?\s+|one\s+|some\s+)(?:\S+\s+)?${REQUEST_NOUN}\b`,
 ].join("|") + ")", "iu");
-const WISH_VERB = String.raw`(?:hear(?!\s+back\b)|know|understand|learn|see\s+(?:how|what|why))`;
-const WISH_ASK = String.raw`you\s+to\s+(?:walk|talk|tell|describe|explain|share|give|take|elaborate|outline|show|think)\b`;
+/**
+ * A wish is a request only when it is about the listener or names what is wanted: "I want to see what happens",
+ * "I want to learn Spanish" and "I want you to give the report to Sam" are statements and instructions.
+ */
+const WISH_VERB = String.raw`(?:hear(?!\s+back\b)|know|understand|learn\s+(?:about|how|what|why|more)|see\s+(?:how|what|why)\s+you(?:r|rs)?)`;
+const WISH_ASK = String.raw`you\s+to\s+(?:` + [
+  String.raw`(?:walk|talk|take)\s+(?:me|us)\s+through`,
+  String.raw`talk\s+(?:to\s+(?:me|us)\s+)?about`,
+  String.raw`tell\s+(?:me|us)`,
+  String.raw`describe|explain|elaborate|outline`,
+  String.raw`think\s+(?:about|through|of)`,
+  String.raw`(?:give|show|share)\s+(?:with\s+)?(?:(?:me|us)\s+)?(?:how|what|why|${REQUEST_DETERMINER}?${REQUEST_NOUN})`,
+].join("|") + String.raw`)\b`;
 const WISH_QUESTION_START = new RegExp(String.raw`^i(?:\s+would|['’]d)\s+(?:like|love)\s+(?:to\s+${WISH_VERB}\b|${WISH_ASK})|^i\s+want\s+(?:to\s+${WISH_VERB}\b|${WISH_ASK})`, "iu");
 /** "I'm curious how you…", "I was wondering if you could…": a question only when it is about the listener. */
 const CURIOUS_QUESTION_START = /^i(?:['’]m|\s+am|\s+was)\s+(?:curious|wondering)\s+(?:about|how|what|why|whether|if|when|where|which|who)\b.*\byou(?:r|rs)?\b/iu;
@@ -87,30 +100,86 @@ export function questionKey(text: string): string {
 }
 
 /**
+ * Short follow-ups whose meaning comes from what was just said ("Can you give an example?", "Can you
+ * elaborate on that?", "Why is that?"). The same words asked again after other speech ask about something new.
+ */
+const ANAPHOR = /\b(?:that|this|it|those|these|them)\b/iu;
+const GENERIC_TAIL = /(?:\b(?:an?|another|one\s+more|some)\s+(?:(?:quick|brief|short|concrete|specific|recent)\s+)?(?:example|instance)s?|\belaborate|\bexpand|\bgo\s+(?:deeper|on)|\bsay\s+more|\bmore\s+(?:details?|specific)|\bbe\s+more\s+specific|\bwhat\s+do\s+you\s+mean|\bhow\s+so|\bwhy(?:\s+not)?|\bsuch\s+as|\bfor\s+example|\blike\s+what)[\s?!.]*$/iu;
+export function isGenericFollowUp(text: string): boolean {
+  const compact = text.replace(/\s+/g, " ").trim().replace(LEADING_FILLER, "");
+  const words = compact.match(/[\p{L}\p{N}'’-]+/gu) ?? [];
+  return words.length > 0 && words.length <= 8 && (ANAPHOR.test(compact) || GENERIC_TAIL.test(compact));
+}
+
+interface RecentEntry {
+  /** Queued or being answered: a duplicate at any age. Otherwise `at` is when its answer completed. */
+  pending: boolean;
+  at: number;
+  /** The answer job the entry belongs to; only that job may settle or release it. */
+  owner?: unknown;
+  /** Caller's count of things heard when the question came in (see `has`). */
+  mark?: number;
+}
+/**
  * v0.14 questions answered or queued recently, across transcript turns. extractQuestions only dedupes
  * within one line; an interviewer repeating a question a moment later must not be answered twice.
+ * A question that is queued or in flight is a duplicate however long that takes; once its answer
+ * completed it stays a duplicate for `windowMs`.
  */
 export class RecentQuestions {
-  private readonly at = new Map<string, number>();
+  private readonly entries = new Map<string, RecentEntry>();
   constructor(private readonly windowMs = 90_000) {}
-  has(text: string, now = Date.now()): boolean {
-    const seen = this.at.get(questionKey(text));
-    return seen !== undefined && now - seen <= this.windowMs;
+  /**
+   * `mark` is the caller's running count of transcript turns and other questions heard. A generic follow-up
+   * whose answer completed is not a duplicate once something else was heard in between (the count moved by
+   * more than the turn that carries the repeat itself).
+   */
+  has(text: string, now = Date.now(), mark?: number): boolean {
+    const entry = this.entries.get(questionKey(text));
+    if (!entry) return false;
+    if (entry.pending) return true;
+    if (now - entry.at > this.windowMs) return false;
+    return !(mark !== undefined && entry.mark !== undefined && mark - entry.mark >= 2 && isGenericFollowUp(text));
   }
+  /** Records a question whose answer is already complete (the window starts at `now`). */
   add(text: string, now = Date.now()): void {
-    for (const [key, seen] of this.at) if (now - seen > this.windowMs) this.at.delete(key);
+    this.prune(now);
     const key = questionKey(text);
-    if (key) this.at.set(key, now);
+    if (key) this.entries.set(key, { pending: false, at: now });
   }
-  delete(text: string): void { this.at.delete(questionKey(text)); }
-  clear(): void { this.at.clear(); }
+  /** A question was queued or its answer started; `owner` (the answer job) takes the entry over. */
+  begin(text: string, owner: unknown, now = Date.now(), mark?: number): void {
+    this.prune(now);
+    const key = questionKey(text);
+    if (key) this.entries.set(key, { pending: true, at: now, owner, ...(mark === undefined ? {} : { mark }) });
+  }
+  owns(text: string, owner: unknown): boolean {
+    const entry = this.entries.get(questionKey(text));
+    return entry !== undefined && entry.owner === owner;
+  }
+  /** The owner's answer completed: the repeat window starts now. */
+  settle(text: string, owner: unknown, now = Date.now()): void {
+    const entry = this.entries.get(questionKey(text));
+    if (entry && entry.owner === owner) { entry.pending = false; entry.at = now; }
+  }
+  /** The owner's question was not answered (failed, dropped, pre-empted): a repeat of it is answered. */
+  release(text: string, owner: unknown): void {
+    if (this.owns(text, owner)) this.entries.delete(questionKey(text));
+  }
+  delete(text: string): void { this.entries.delete(questionKey(text)); }
+  clear(): void { this.entries.clear(); }
+  private prune(now: number): void {
+    for (const [key, entry] of this.entries) if (!entry.pending && now - entry.at > this.windowMs) this.entries.delete(key);
+  }
 }
 
 /**
  * Questions people put to themselves while thinking aloud ("Where do I even start?", "How should I put
- * it?", "What's the word?") or tag onto a statement ("right?", "you know?"). Nobody wants them answered.
+ * it?", "What was I saying?") or tag onto a statement ("right?", "you know?"). Nobody wants them answered.
+ * Forms that are as often a real question to the listener ("What's the term for that?", "What else?",
+ * "Who knows?", "Really?") are deliberately not here.
  */
-const RHETORICAL = /^(?:(?:well|so|um+|uh+|hmm+|oh|okay|ok|gosh|wow|honestly|i mean)[,.\s]+)*(?:where (?:do|would|should|can) i (?:even |really )?(?:start|begin)|how (?:do|should|would|shall|can) i (?:even |best )?(?:put|say|phrase|describe|explain) (?:it|this|that)|what(?:'s| is| was) the (?:right )?(?:word|term|phrase|name)(?: for (?:it|that|this))?|what was i (?:saying|going to say)|where was i|how (?:do|should) i say (?:this|that|it)|what else|what can i say|who knows|you know(?: what i mean)?|right|okay|ok|yeah|no|really|see|make sense|does that make sense|is that fair|you see what i mean|what do you call it|let me think|how to put (?:it|this))[\s?!.…]*$/iu;
+const RHETORICAL = /^(?:(?:well|so|um+|uh+|hmm+|oh|okay|ok|gosh|wow|honestly|i mean)[,.\s]+)*(?:where (?:do|would|should|can) i (?:even |really )?(?:start|begin)|how (?:do|should|would|shall|can) i (?:even |best )?(?:put|say|phrase|describe|explain) (?:it|this|that)|what was i (?:saying|going to say)|where was i|how (?:do|should) i say (?:this|that|it)|what can i say|you know(?: what i mean)?|right|okay|ok|yeah|no|make sense|does that make sense|is that fair|you see what i mean|what do you call it|let me think|how to put (?:it|this))[\s?!.…]*$/iu;
 export function isRhetoricalQuestion(text: string): boolean { return RHETORICAL.test(text.trim()); }
 
 function looksLikeUnpunctuatedQuestion(text: string): boolean {

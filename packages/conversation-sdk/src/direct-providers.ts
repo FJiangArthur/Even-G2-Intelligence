@@ -48,7 +48,9 @@ export interface AnswerRequestOptions {
   /**
    * v0.14: the provider stopped at its length limit after some text had streamed. With this callback the
    * stream ends normally (the text so far is the answer, marked partial by the caller); without it the
-   * cut is an error, as before.
+   * cut is an error, as before. Also called (at most once per stream) when an unreadable event was skipped
+   * after text had started: words may be missing, so the answer is not complete either. A stop for any
+   * other reason (content filter) is always an error.
    */
   readonly onIncomplete?: () => void;
 }
@@ -62,6 +64,12 @@ export function parseStreamEvent(data: string): Record<string, any> | undefined 
 /** A stream whose events could not be read: a provider fault, not the phone's connection. */
 export function unreadableStream(provider: string): DirectProviderError {
   return new DirectProviderError("provider-response", `${provider} sent an unreadable answer stream. Try again.`, true);
+}
+/** The provider ended the answer itself, for a reason other than its length: say which, never call it a cut-off. */
+export function stoppedAnswerFailure(provider: string, reason: unknown): DirectProviderError {
+  if (reason === "content_filter") return new DirectProviderError("provider-response", `${provider}'s content filter stopped this answer. Rephrase the question and try again.`);
+  if (reason === "max_output_tokens" || reason === "length") return new DirectProviderError("provider-response", "Answer exceeded its length limit. Ask a shorter question.");
+  return new DirectProviderError("provider-response", `${provider} could not complete the answer.`);
 }
 export function promptContextFailure(provisional = false): DirectProviderError {
   return new DirectProviderError("prompt-context-limit", `${provisional ? "The selected model has an unverified context window; Helix applies a provisional 4,096-token request budget. " : ""}Answer context is too large for the selected model budget. Shorten the custom prompt, turn off local memory, choose a larger supported model and reconnect, or start a new session. The captured transcript has not been discarded.`);
@@ -289,6 +297,9 @@ export async function* answerDirect(fetcher: DirectFetch, key: string, profile: 
   if (!response.body) throw new DirectProviderError("provider-response", "OpenAI returned no answer stream.");
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = "", completed = false, carriage = "", produced = "", inMarker = false, malformed = 0;
+  // `gap`: an event was skipped after text started, so words may be missing. `cut`: onIncomplete was called.
+  let gap = false, cut = false;
+  const incomplete = () => { if (cut) return; cut = true; try { options.onIncomplete?.(); } catch { /* host callback isolation */ } };
   let usage: RawUsage | undefined, finalCalls: number | undefined;
   const searchItems = new Set<string>(); let anonymousSearches = 0;
   const sources = new Map<string, Citation>();
@@ -318,13 +329,18 @@ export async function* answerDirect(fetcher: DirectFetch, key: string, profile: 
         if (data === "[DONE]") { completed = true; continue; }
         // One garbled event (a proxy page, a cut line) is skipped; it must not look like a network failure.
         const event = parseStreamEvent(data);
-        if (!event) { malformed++; continue; }
-        // Cut at the length limit after text streamed: what arrived is still useful mid-conversation.
-        if (event.type === "response.incomplete" && !event.error && produced.trim() && options.onIncomplete) {
-          completed = true;
-          usage = parseResponsesUsage(event.response?.usage) ?? usage;
-          try { options.onIncomplete(); } catch { /* host callback isolation */ }
-          continue;
+        if (!event) { malformed++; gap ||= produced.trim() !== ""; continue; }
+        if (event.type === "response.incomplete" && !event.error) {
+          const reason: unknown = event.response?.incomplete_details?.reason;
+          // Cut at the length limit after text streamed: what arrived is still useful mid-conversation.
+          if (reason === "max_output_tokens" && produced.trim() && options.onIncomplete) {
+            completed = true;
+            usage = parseResponsesUsage(event.response?.usage) ?? usage;
+            incomplete();
+            continue;
+          }
+          // Any other reason (content filter) is not a cut-off answer; a length cut with no text is no answer.
+          if (reason === "max_output_tokens" || reason === "content_filter") throw stoppedAnswerFailure("OpenAI", reason);
         }
         if (event.error ||["response.failed", "response.incomplete", "error"].includes(event.type)) {
           if (isContextOverflow(event.error) || isContextOverflow(event.response?.error) || isContextOverflow(event)) throw promptContextFailure();
@@ -349,16 +365,19 @@ export async function* answerDirect(fetcher: DirectFetch, key: string, profile: 
         const raw = responses ? (event.type === "response.output_text.delta" ? event.delta : undefined) : event.choices?.[0]?.delta?.content;
         const delta = typeof raw === "string" ? speakable(raw) : "";
         if (delta) { produced += delta; yield delta; }
+        if (!responses && event.choices?.[0]?.finish_reason === "content_filter") throw stoppedAnswerFailure("OpenAI", "content_filter");
         if (!responses && event.choices?.[0]?.finish_reason === "length") {
-          if (!produced.trim() || !options.onIncomplete) throw new DirectProviderError("provider-response", "Answer exceeded its length limit. Ask a shorter question.");
+          if (!produced.trim() || !options.onIncomplete) throw stoppedAnswerFailure("OpenAI", "length");
           completed = true;
-          try { options.onIncomplete(); } catch { /* host callback isolation */ }
+          incomplete();
         }
       }
       if (done) break;
     }
     if (malformed && !produced.trim()) throw unreadableStream("OpenAI");
     if (!completed) throw new DirectProviderError("provider-response", "OpenAI answer stream ended before completion.");
+    // Words may be missing where the event was skipped: the answer is shown, marked cut off, and not kept as complete.
+    if (gap) incomplete();
     const webSearchCalls = finalCalls ?? searchItems.size + anonymousSearches;
     try { options.onCitations?.([...sources.values()]); } catch { /* host callback isolation */ }
     try {

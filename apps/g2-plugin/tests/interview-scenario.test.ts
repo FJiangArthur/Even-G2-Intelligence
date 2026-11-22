@@ -328,10 +328,12 @@ describe("provider faults", () => {
     expect(report.summary.answersClearedByError).toBe(0);
   });
 
-  it("malformed stream event: the question is still answered  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event fails the whole answer]", async () => {
+  it("malformed stream event: the question is still answered, marked partial  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event fails the whole answer]", async () => {
     const { report } = await arrange("malformed", () => twoQuestions(current => current.api.fault("malformed-event")));
     expect(report.rows[1]!.faults).toEqual(["malformed-event"]);
-    expect(describeRows(report.rows.filter(row => !row.ok))).toEqual([]);
+    // The event was skipped after text had started, so words may be missing: shown once, as a partial answer.
+    expect(report.rows.filter(row => !row.ok).map(row => [row.line, row.timesAnswered, row.finalState])).toEqual([[report.rows[1]!.line, 1, "partial"]]);
+    expect(report.summary.notices).toBe(0);
   });
 
   it("malformed stream event: nothing is cleared from the glasses  [waits for: display, minor errors keep the answer; pins: the error wipes the answer that was showing]", async () => {
@@ -420,8 +422,11 @@ describe("whole scripts under a fault (the fault hits the first answer request)"
     });
     it(`${scriptId} · malformed stream event: no question is lost  [waits for: answer pipeline, tolerant stream parsing or retry; pins: one bad event loses the question]`, async () => {
       const { faulted, cleanGood, faultedGood } = await sameAsClean("malformed-event");
-      expect(faulted.report.summary.lostToFault).toBe(0);
-      expect(faultedGood).toEqual(cleanGood);
+      // The event is skipped after text started, so that one answer is kept as partial (words may be missing).
+      const hit = faulted.report.rows.filter(row => row.faults.includes("malformed-event"));
+      expect(hit.map(row => [row.timesAnswered, row.finalState])).toEqual([[1, "partial"]]);
+      expect(faulted.report.summary.answersClearedByError).toBe(0);
+      expect(faultedGood).toEqual(cleanGood.filter(label => label !== `L${hit[0]!.line} ${hit[0]!.question}`));
     });
     it(`${scriptId} · cut-off answer: kept as partial, every other question as in the clean run  [waits for: answer pipeline, partial answers; pins: the cut-off answer is discarded]`, async () => {
       const { faulted, cleanGood, faultedGood } = await sameAsClean("cut-off");
