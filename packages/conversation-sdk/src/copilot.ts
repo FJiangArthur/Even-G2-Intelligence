@@ -7,7 +7,7 @@ import { DEFAULT_FACT_CHECK_MODEL, NO_WEB_SEARCH_MESSAGE, verifyClaim } from "./
 import { answerLengthProfile } from "./answer-length.js";
 import { chatComplete, deepseekSearchDetails, providerSearchTools } from "./chat-providers.js";
 import { providerModel, type AnswerProviderInfo, type SearchRoute } from "./provider-registry.js";
-import { modeProfile } from "./modes.js";
+import { SUGGESTION_KIND_LABELS, SUGGESTION_KINDS, modeProfile, type SuggestionKind } from "./modes.js";
 import type { Speaker } from "./types.js";
 import type { SessionNotebook } from "./session-notebook.js";
 import { NOTEBOOK_PROMPT_VERSION, type TodoOp } from "./todo-list.js";
@@ -32,10 +32,16 @@ export interface ConversationCopilotOptions {
   readonly search?: () => SearchRoute | undefined;
 }
 
-interface Line { readonly transcriptId: string; readonly speaker: string; readonly text: string }
+interface Line { readonly transcriptId: string; readonly speaker: string; readonly text: string; readonly role?: Speaker["role"] }
 
 const MAX_LINES_CHARS = 60_000, MAX_NEW_SPEECH = 4000, MAX_EARLIER = 6000, MAX_OUTPUT_TEXT = 32_000;
-const ASK_QUEUE = 3, MAX_VERIFICATIONS = 2, MAX_STORED = 200, MAX_PEOPLE = 200;
+const ASK_QUEUE = 3, MAX_VERIFICATIONS = 2, MAX_STORED = 200, MAX_PEOPLE = 200, MAX_SUGGESTIONS = 5, MAX_ASKED = 100;
+/** A suggestion the model has not proposed again for this long is dropped. */
+export const SUGGESTION_TTL_MS = 180_000;
+/** A reply that is not valid JSON is re-analysed this many times before its speech is skipped. */
+const MAX_BAD_REPLY_RETRIES = 2;
+/** Share of a suggestion's content words that must be heard in one sentence for it to count as asked. */
+const ASKED_OVERLAP = 0.7;
 /** Pronouns, speaker labels, teams and generic roles are never people. */
 const NOT_PEOPLE = new Set(("i me you we they he she him her them us someone somebody everyone everybody nobody anyone speaker otherspeaker user assistant ai helix omi unknown "
   + "team theteam finance legal hr sales marketing engineering product management manager boss vendor supplier customer client interviewer interviewee candidate recruiter g2conversation").split(" "));
@@ -59,6 +65,57 @@ function grounded(quote: string, source: string, sourceKey: string): number {
   if (!quoted.size) return 0;
   let hit = 0; for (const word of quoted) if (available.has(word)) hit++;
   return hit / quoted.size;
+}
+const STOP_WORDS = new Set(("a an the and or but so um uh er well okay ok like just right now then also really actually "
+  + "is are was were be been am do does did have has had will would can could should may might shall "
+  + "i you he she it we they me my your our their them us him her its "
+  + "what which who whom whose when where why how "
+  + "to of in on at for from with about as by into than that this these those there here if not no yes please tell").split(" "));
+const SPACELESS = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+/** Cheap stem for ASCII words: drops a plural or verb ending, then a final "e" ("approves", "approve" -> "approv"). */
+function stem(word: string): string {
+  if (!/^[a-z]+$/u.test(word)) return word;
+  let value = word;
+  for (const suffix of ["ing", "ed", "es", "s"]) {
+    if (value.endsWith(suffix) && value.length - suffix.length >= 3) { value = value.slice(0, -suffix.length); break; }
+  }
+  return value.endsWith("e") && value.length >= 4 ? value.slice(0, -1) : value;
+}
+/** Stemmed content words; text written without spaces becomes character pairs. */
+function contentTokens(text: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const run of text.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+    if (!SPACELESS.test(run)) { if (!STOP_WORDS.has(run)) tokens.add(stem(run)); continue; }
+    const chars = [...run];
+    if (chars.length === 1) tokens.add(run);
+    for (let i = 0; i + 1 < chars.length; i++) tokens.add(chars[i]! + chars[i + 1]!);
+  }
+  return tokens;
+}
+const overlap = (wanted: Set<string>, heard: Set<string>): number => {
+  if (!wanted.size) return 0;
+  let hit = 0; for (const token of wanted) if (heard.has(token)) hit++;
+  return hit / wanted.size;
+};
+const speechSegments = (speech: string): string[] => {
+  const sentences = speech.match(/[^.!?。！？]+/gu)?.map(part => part.trim()).filter(Boolean) ?? [];
+  return speech.length <= 300 && sentences.length !== 1 ? [...sentences, speech] : sentences;
+};
+/**
+ * True when `speech` (one final transcript line) contains `question` said aloud: at least 70% of the
+ * question's content words occur in one sentence of the line. Deterministic, no model call.
+ * A question with fewer than two content words must be the whole sentence.
+ */
+export function suggestionMatchesSpeech(question: string, speech: string): boolean {
+  const wanted = contentTokens(question), segments = speechSegments(speech);
+  if (wanted.size < 2) { const key = copilotKey(question); return key !== "" && segments.some(segment => copilotKey(segment) === key); }
+  return segments.some(segment => overlap(wanted, contentTokens(segment)) >= ASKED_OVERLAP);
+}
+/** The same question in other words (both ways, so a narrower follow-up is still allowed). */
+function sameQuestion(a: string, b: string): boolean {
+  if (copilotKey(a) === copilotKey(b)) return true;
+  const left = contentTokens(a), right = contentTokens(b);
+  return left.size >= 2 && right.size >= 2 && overlap(left, right) >= ASKED_OVERLAP && overlap(right, left) >= ASKED_OVERLAP;
 }
 const id = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 const now = () => new Date().toISOString();
@@ -85,7 +142,7 @@ export function copilotSchema(settings: CopilotSettings, notebook = false): Reco
   if (settings.summarize) properties.summary = obj({ bullets: arr(str), keyFacts: arr(str) });
   if (settings.concepts) properties.concepts = arr(obj({ term: str, explanation: str }));
   if (settings.conflicts) properties.conflicts = arr(obj({ earlier: str, later: str, explanation: str }));
-  if (settings.suggestions) properties.suggestedQuestions = arr(obj({ question: str, why: str }));
+  if (settings.suggestions) properties.suggestedQuestions = arr(obj({ question: str, why: str, ...(modeProfile(settings.mode).suggestionKinds ? { kind: { type: "string", enum: [...SUGGESTION_KINDS] } } : {}) }));
   if (settings.implicitAsks) properties.asks = arr(obj({ kind: { type: "string", enum: ["lookup", "propose", "question"] }, topic: str, trigger: str }));
   if (claimsOn(settings)) properties.claims = arr(obj({ text: str, speaker: str, scope: { type: "string", enum: ["public", "conversation"] } }));
   if (peopleOn(settings)) properties.people = arr(obj({ name: str, role: str, context: str }));
@@ -149,6 +206,17 @@ export class ConversationCopilot {
   private readonly askKeys = new Set<string>();
   private readonly conflictsSeen: CopilotConflict[] = [];
   private suggestionList: CopilotSuggestion[] = [];
+  /** Mode the current suggestions were written for; a change clears them. */
+  private suggestionMode?: string;
+  /** Suggestion id -> when the model last proposed it (ms). */
+  private readonly suggestionFreshAt = new Map<string, number>();
+  /** Asked suggestions that a refresh has already shown as asked; the next refresh drops them. */
+  private readonly askedShown = new Set<string>();
+  /** Questions asked aloud this session; never suggested again. */
+  private askedQuestions: string[] = [];
+  private expiryTimer?: ReturnType<typeof setTimeout>;
+  /** Replies in a row that were not valid JSON. */
+  private badReplies = 0;
   private readonly askQueue: CopilotAsk[] = [];
   private askActive?: AbortController;
   private readonly verifications = new Set<AbortController>();
@@ -172,8 +240,13 @@ export class ConversationCopilot {
     const clean = text.replace(/\s+/g, " ").trim().slice(0, MAX_NEW_SPEECH);
     if (!clean) return;
     const label = (typeof speaker === "string" ? speaker : speaker?.label)?.trim().slice(0, 40) || "Speaker";
-    this.lines.push({ transcriptId, speaker: label, text: clean }); this.chars += clean.length;
+    const role = typeof speaker === "object" ? speaker.role : undefined;
+    this.lines.push({ transcriptId, speaker: label, text: clean, ...(role ? { role } : {}) }); this.chars += clean.length;
     while (this.chars > MAX_LINES_CHARS && this.lines.length > 1) { this.chars -= this.lines.shift()!.text.length; this.processed = Math.max(0, this.processed - 1); }
+    const live = this.liveSettings();
+    if (live) this.syncSuggestionMode(live.mode);
+    this.pruneSuggestions();
+    this.markAsked(clean, role);
     this.pump();
   }
   /** Bypasses cooldown; still one active request. */
@@ -237,7 +310,92 @@ export class ConversationCopilot {
     for (const controller of this.verifications) controller.abort();
     this.verifications.clear();
     clearTimeout(this.timer); this.timer = undefined; this.immediate = false;
-    this.processed = this.lines.length;
+    clearTimeout(this.expiryTimer); this.expiryTimer = undefined;
+    this.processed = this.lines.length; this.badReplies = 0;
+  }
+
+  // ---- suggestions lifecycle: asked, expired, mode change ----
+  private emitSuggestions(next: CopilotSuggestion[]): void {
+    this.suggestionList = next;
+    const keep = new Set(next.map(item => item.id));
+    for (const key of this.suggestionFreshAt.keys()) if (!keep.has(key)) this.suggestionFreshAt.delete(key);
+    for (const key of this.askedShown) if (!keep.has(key)) this.askedShown.delete(key);
+    this.armExpiry();
+    try { this.options.callbacks.onSuggestions?.(next); } catch { /* isolate host */ }
+  }
+  /** Suggestions belong to the mode they were written for. */
+  private syncSuggestionMode(mode: string | undefined): void {
+    const next = modeProfile(mode).id;
+    if (this.suggestionMode !== undefined && this.suggestionMode !== next && this.suggestionList.length) this.emitSuggestions([]);
+    this.suggestionMode = next;
+  }
+  private pruneSuggestions(): void {
+    const cutoff = Date.now() - SUGGESTION_TTL_MS;
+    const kept = this.suggestionList.filter(item => (this.suggestionFreshAt.get(item.id) ?? 0) > cutoff);
+    if (kept.length !== this.suggestionList.length) this.emitSuggestions(kept); else this.armExpiry();
+  }
+  /** One timer for the oldest suggestion, so a quiet conversation does not keep a stale list. */
+  private armExpiry(): void {
+    clearTimeout(this.expiryTimer); this.expiryTimer = undefined;
+    if (!this.suggestionList.length) return;
+    const oldest = Math.min(...this.suggestionList.map(item => this.suggestionFreshAt.get(item.id) ?? 0));
+    const timer = setTimeout(() => { this.expiryTimer = undefined; this.pruneSuggestions(); }, Math.max(0, oldest + SUGGESTION_TTL_MS - Date.now()) + 1);
+    (timer as { unref?: () => void }).unref?.();
+    this.expiryTimer = timer;
+  }
+  private wasAsked(question: string): boolean { return this.askedQuestions.some(asked => sameQuestion(asked, question)); }
+  /**
+   * Marks open suggestions that this final line says aloud. "they-ask" suggestions are matched against
+   * the other side, the rest against the wearer; a line with no known role can match either.
+   */
+  private markAsked(text: string, role: Speaker["role"] | undefined): void {
+    const at = now(), open: CopilotSuggestion[] = [], asked: CopilotSuggestion[] = [];
+    let changed = false;
+    for (const item of this.suggestionList) {
+      if (item.askedAt) { asked.push(item); continue; }
+      const wrongSpeaker = item.kind === "they-ask" ? role === "self" : role === "other";
+      if (wrongSpeaker || !suggestionMatchesSpeech(item.question, text)) { open.push(item); continue; }
+      changed = true;
+      this.askedQuestions.push(item.question);
+      if (this.askedQuestions.length > MAX_ASKED) this.askedQuestions.shift();
+      asked.push({ ...item, askedAt: at });
+    }
+    if (changed) this.emitSuggestions([...open, ...asked]);
+  }
+  /** One refresh: the model's new list replaces the open suggestions; asked ones stay for exactly one refresh. */
+  private refreshSuggestions(settings: CopilotSettings, proposed: unknown): void {
+    const profile = modeProfile(settings.mode);
+    // A reply written for a mode the wearer has since left is not shown.
+    if (this.suggestionMode !== undefined && this.suggestionMode !== profile.id) return;
+    this.suggestionMode = profile.id;
+    const at = Date.now(), cutoff = at - SUGGESTION_TTL_MS;
+    const current = this.suggestionList.filter(item => (this.suggestionFreshAt.get(item.id) ?? 0) > cutoff);
+    const previous = new Map(current.filter(item => !item.askedAt).map(item => [copilotKey(item.question), item]));
+    const fresh: CopilotSuggestion[] = [], keys = new Set<string>();
+    for (const item of Array.isArray(proposed) ? proposed : []) {
+      if (fresh.length >= MAX_SUGGESTIONS || !record(item)) continue;
+      const question = cleanCopilotText(item.question, 300), key = copilotKey(question);
+      if (!question || !key || keys.has(key) || this.wasAsked(question)) continue;
+      keys.add(key);
+      let why = cleanCopilotText(item.why, 300), kind: SuggestionKind | undefined;
+      if (profile.suggestionKinds) {
+        kind = item.kind === "they-ask" ? "they-ask" : "ask-them";
+        // The kind is readable in `why` for hosts that show only question and why.
+        const reason = why.replace(/^(?:they may ask|ask them)\s*[:：-]\s*/iu, "");
+        why = `${SUGGESTION_KIND_LABELS[kind]}${reason ? `: ${reason}` : ""}`.slice(0, 300);
+      }
+      const old = previous.get(key);
+      const base: CopilotSuggestion = old ?? { id: id(), question, why, createdAt: now() };
+      const { kind: _oldKind, ...kept } = base;
+      fresh.push({ ...kept, why: why || kept.why, ...(kind ? { kind } : {}) });
+    }
+    const asked = current.filter(item => item.askedAt && !this.askedShown.has(item.id));
+    for (const item of asked) this.askedShown.add(item.id);
+    const open = fresh.length ? fresh : [...previous.values()];
+    const next = [...open.slice(0, Math.max(0, MAX_SUGGESTIONS - asked.length)), ...asked.slice(0, MAX_SUGGESTIONS)];
+    for (const item of fresh) this.suggestionFreshAt.set(item.id, at);
+    const same = next.length === this.suggestionList.length && next.every((item, index) => item === this.suggestionList[index]);
+    if (fresh.length || !same) this.emitSuggestions(next); else this.armExpiry();
   }
 
   /** Notes mode: the host's session notebook, while the mode preset asks for note-taking. */
@@ -265,6 +423,7 @@ export class ConversationCopilot {
     try {
       const settings = this.settings();
       if (!settings) return;
+      this.syncSuggestionMode(settings.mode);
       const notebook = this.notebook(settings);
       const schema = copilotSchema(settings, notebook !== undefined);
       if (!Object.keys(schema.properties as object).length) { this.processed = target; return; }
@@ -276,7 +435,7 @@ export class ConversationCopilot {
         newSpeech: this.transcript(this.lines.slice(this.processed, target)).slice(-MAX_NEW_SPEECH),
         alreadyExplainedTerms: [...this.conceptKeys].slice(-100),
         knownConflicts: this.conflictsSeen.slice(-10).map(c => ({ earlier: c.earlier, later: c.later })),
-        previousSuggestions: this.suggestionList.map(s => s.question),
+        previousSuggestions: this.suggestionList.filter(s => !s.askedAt).map(s => s.question),
         existingAsks: [...this.askKeys].slice(-50),
         ...(claimsOn(settings) ? { knownClaims: [...this.claimStore.values()].slice(-30).map(c => c.text) } : {}),
         ...(peopleOn(settings) ? { knownPeople: [...this.peopleByKey.values()].slice(-30).map(p => ({ name: p.name, role: p.role ?? "" })) } : {}),
@@ -289,8 +448,7 @@ export class ConversationCopilot {
           { maxTokens: effort ? 2500 : 1500, json: true, signal: controller.signal, purpose: "copilot" });
         if (!current()) return;
         try { this.usage(usageRecord("copilot", model, completion.usage, completion.measured)); } catch { /* best effort */ }
-        this.processed = target;
-        this.apply(settings, completion.text, target, notebook, model);
+        this.settle(this.apply(settings, completion.text, target, notebook, model), target);
         return;
       }
       const body = JSON.stringify({ model, store: false, instructions: copilotInstructions(settings, notebook !== undefined), input,
@@ -303,24 +461,32 @@ export class ConversationCopilot {
       if (!current()) return;
       const parsed = parseResponseOutput(value);
       this.report("copilot", model, parsed.usage, body, parsed.text, parsed.webSearchCalls);
-      this.processed = target;
-      this.apply(settings, parsed.text, target, notebook, model);
+      this.settle(this.apply(settings, parsed.text, target, notebook, model), target);
     } catch { /* Optional lane: errors are nonfatal; unprocessed speech is retried after cooldown. */ }
     finally {
       clearTimeout(timer);
       if (this.active === controller) { this.active = undefined; this.nextAt = Date.now() + (this.options.cooldownMs ?? 8000); this.pump(); }
     }
   }
+  /**
+   * Speech counts as analysed only when the reply was usable. A reply that is not valid JSON leaves the
+   * span for the next run; after MAX_BAD_REPLY_RETRIES bad replies in a row the span is skipped, and until
+   * a good reply arrives every later span gets a single attempt, so a broken provider cannot loop.
+   */
+  private settle(usable: boolean, target: number): void {
+    if (usable) { this.badReplies = 0; this.processed = target; return; }
+    if (++this.badReplies > MAX_BAD_REPLY_RETRIES) this.processed = target;
+  }
   private report(kind: UsageKind, model: string, measured: RawUsage | undefined, body: string, output: string, webSearchCalls: number, relatedId?: string): void {
     const usage = measured ? { ...measured, webSearchCalls } : { inputTokens: estimate(body), outputTokens: estimate(output), webSearchCalls };
     try { this.usage(usageRecord(kind, model, usage, measured !== undefined, relatedId)); } catch { /* best effort */ }
   }
-  /** Validates and clamps untrusted model output, dedupes against the session, and emits callbacks. */
-  private apply(settings: CopilotSettings, text: string, target: number, notebook?: SessionNotebook, model?: string): void {
-    if (!text || text.length > MAX_OUTPUT_TEXT) return;
+  /** Validates and clamps untrusted model output, dedupes against the session, and emits callbacks. False when the reply was not a JSON object. */
+  private apply(settings: CopilotSettings, text: string, target: number, notebook?: SessionNotebook, model?: string): boolean {
+    if (!text || text.length > MAX_OUTPUT_TEXT) return false;
     let data: unknown;
-    try { data = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, "")); } catch { return; }
-    if (!record(data)) return;
+    try { data = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, "")); } catch { return false; }
+    if (!record(data)) return false;
     const callbacks = this.options.callbacks, all = this.transcript(), allKey = copilotKey(all);
     const fresh = this.transcript(this.lines.slice(Math.max(0, target - 50), target));
     const lastTranscriptId = this.lines[target - 1]?.transcriptId;
@@ -363,19 +529,7 @@ export class ConversationCopilot {
         safe(() => callbacks.onConflict?.(conflict));
       }
     }
-    if (settings.suggestions && Array.isArray(data.suggestedQuestions)) {
-      const previous = new Map(this.suggestionList.map(s => [copilotKey(s.question), s]));
-      const next: CopilotSuggestion[] = [], keys = new Set<string>();
-      for (const item of data.suggestedQuestions) {
-        if (next.length >= 5 || !record(item)) continue;
-        const question = cleanCopilotText(item.question, 300), why = cleanCopilotText(item.why, 300), key = copilotKey(question);
-        if (!question || !key || keys.has(key)) continue;
-        keys.add(key);
-        const old = previous.get(key);
-        next.push(old ? { ...old, why: why || old.why } : { id: id(), question, why, createdAt: now() });
-      }
-      if (next.length) { this.suggestionList = next; safe(() => callbacks.onSuggestions?.(next)); }
-    }
+    if (settings.suggestions) this.refreshSuggestions(settings, data.suggestedQuestions);
     if (settings.implicitAsks && Array.isArray(data.asks)) {
       let added = 0;
       for (const item of data.asks) {
@@ -427,6 +581,7 @@ export class ConversationCopilot {
       }
     }
     if (notebook) this.applyNotebook(notebook, data, target, model);
+    return true;
   }
   /**
    * Notes mode: applies the model's to-do operations and notes to the session notebook. Every item must
