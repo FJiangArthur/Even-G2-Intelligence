@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { attachDiagnosticsStore, diagnosticsReport, mainThreadPressure, monitorBridge, recordMicWindow, resetDiagnosticsForTest } from "../src/diagnostics";
 import {
-  installMicProbe, micEntryObserved, micHandlerBegin, micHandlerEnd, micProbeState, micProbeWindow, noteMicDropped, noteMicSend,
+  installMicProbe, micEntryObserved, micHandlerBegin, micHandlerEnd, micProbeCheck, micProbeState, micProbeWindow, noteMicDropped, noteMicSend,
   resetMicProbeForTest, setSdkAudioLogQuiet,
 } from "../src/mic-probe";
 
@@ -151,6 +151,44 @@ describe("microphone probe", () => {
     expect(() => installMicProbe(undefined)()).not.toThrow();
   });
 
+  it("notices when its wrappers are replaced, re-installs each once, and otherwise says the log is NOT being skipped", () => {
+    const page = fakePage(clock);
+    installMicProbe(page.target as never, page.logger);
+    expect(micProbeCheck()).toBe("ok");
+    expect(micProbeState()).toContain("probe installed · SDK audio log skipped");
+    // The SDK (or the host) defines the entry function again, and something replaces console.log.
+    Object.defineProperty(page.target, "_listenEvenAppMessage", { configurable: true, writable: true, value: page.original });
+    const replaced: unknown[][] = [];
+    page.logger.log = (...args: unknown[]) => { replaced.push(args); };
+    page.push(JSON.stringify(page.audio(640)));
+    expect(replaced).toHaveLength(1); // the audio line got through: the skip is not working right now
+    expect(micProbeWindow()!.sdk).toContain("(fn 0 ·");
+    expect(micProbeCheck()).toBe("entry function was replaced: probe re-installed · console.log was replaced: SDK audio log wrapper re-installed");
+    page.push(JSON.stringify(page.audio(640)));
+    expect(replaced).toHaveLength(1);
+    const again = micProbeWindow()!;
+    expect(again.sdk).toContain("(fn 1 ·");
+    expect(again.sdk).toContain("sdk-log skipped x1");
+    expect(micProbeCheck()).toBe("ok");
+    // A second replacement is reported, not fought over.
+    Object.defineProperty(page.target, "_listenEvenAppMessage", { configurable: true, writable: true, value: page.original });
+    page.logger.log = () => undefined;
+    expect(micProbeCheck()).toBe("probe displaced: the entry function was replaced · SDK audio log NOT skipped: console replaced");
+    expect(micProbeState()).toContain("probe displaced · SDK audio log NOT skipped: console replaced");
+    expect(page.target._listenEvenAppMessage).toBe(page.original);
+  });
+
+  it("counts each event once when the app's listener is registered before the probe and there is no entry function", () => {
+    const target = new EventTarget();
+    target.addEventListener("evenHubEvent", event => { micHandlerEnd(micHandlerBegin((event as CustomEvent<{ audioEvent: { audioPcm: Uint8Array } }>).detail.audioEvent.audioPcm.byteLength)); });
+    installMicProbe(target as never, { log: () => undefined });
+    const send = (count: number) => { for (let i = 0; i < count; i++) { clock.now += 24; target.dispatchEvent(new CustomEvent("evenHubEvent", { detail: { audioEvent: { audioPcm: new Uint8Array(640) } } })); } };
+    send(5);
+    expect(micProbeWindow()!.mic).toContain("x5 ·");
+    send(7);
+    expect(micProbeWindow()!.mic).toContain("x7 ·");
+  });
+
   it("writes the two lines to the diagnostics report like any other line, and keeps them in the Even bridge storage", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], now: Date.UTC(2026, 10, 21, 20, 0, 0) });
     vi.stubGlobal("navigator", { userAgent: "test" });
@@ -187,6 +225,9 @@ describe("microphone probe", () => {
     const reply = bridge.getLocalStorage("helix.mic.ping");
     vi.setSystemTime(Date.now() + 4200);
     expect(mainThreadPressure().bridgePendingMs).toBe(4200);
+    // A call that has been unanswered for longer than 15 s is a hung call, not a sign of queued audio.
+    vi.setSystemTime(Date.now() + 20_000);
+    expect(mainThreadPressure().bridgePendingMs).toBe(0);
     answer(""); await reply; await Promise.resolve();
     expect(mainThreadPressure().bridgePendingMs).toBe(0);
     vi.useRealTimers();
