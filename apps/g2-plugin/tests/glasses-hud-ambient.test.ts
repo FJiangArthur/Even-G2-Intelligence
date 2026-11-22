@@ -258,9 +258,9 @@ describe("ambient glasses display", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(vi.getTimerCount()).toBe(0);
     expect(allBlank(bridge)).toBe(true);
-    // Concepts and finished lookups are cues too; pending lookups, suggestions and summaries are not.
+    // Concepts and finished lookups are cues too; pending lookups and summaries are not
+    // (v0.14: the top suggested question is a cue as well, see v14-interview.test.ts).
     presentation.applyAsk({ id: "k1", kind: "lookup", topic: "Jetson lead time?", trigger: "lead time", status: "pending", createdAt: at });
-    presentation.setSuggestions([{ id: "s1", question: "Who owns the purchase request?", why: "", createdAt: at }]);
     presentation.applySummary({ updatedAt: at, transcriptChars: 4000, bullets: ["Budget is open."], keyFacts: ["Quote due Thursday"] });
     expect(blank(hud.frame.body)).toBe(true);
     presentation.applyAsk({ id: "k1", kind: "lookup", topic: "Jetson lead time?", trigger: "lead time", status: "done", answer: "12 to 16 weeks.", createdAt: at });
