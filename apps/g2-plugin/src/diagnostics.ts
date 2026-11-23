@@ -27,6 +27,10 @@ let memory: DiagnosticEvent[] | undefined;
 let remoteHeartbeat: Heartbeat | undefined;
 let lastHeartbeat: Heartbeat | undefined;
 let flushTimer: ReturnType<typeof setTimeout> | undefined, flushing = false, flushAgain = false;
+// v0.15: a mirror write the bridge never answers is given up after 5 s, so later lines (the evidence of a
+// hang) still go out; retries wait 5, 10, then 20 s so a backed-up bridge gets at most one write per step.
+const FLUSH_DEADLINE_MS = 5000, FLUSH_BACKOFF_MAX_MS = 20_000;
+let flushBatch = 0, flushTimeouts = 0, flushBlockedUntil = 0, flushDeadline: ReturnType<typeof setTimeout> | undefined;
 
 function validEvents(parsed: unknown): DiagnosticEvent[] {
   return Array.isArray(parsed) ? parsed.filter((e): e is DiagnosticEvent => !!e && typeof (e as DiagnosticEvent).kind === "string" && typeof (e as DiagnosticEvent).t === "string") : [];
@@ -43,17 +47,36 @@ function flushRemote(): void {
   if (!remote) return;
   if (flushing) { flushAgain = true; return; }
   if (!eventsDirty && !beatDirty && !micDirty) return;
+  const wait = flushBlockedUntil - Date.now();
+  if (wait > 0) { flushTimer ??= setTimeout(() => { flushTimer = undefined; flushRemote(); }, wait); return; }
   flushing = true;
   const store = remote, writes: Promise<unknown>[] = [];
+  const batch = ++flushBatch, had = { events: eventsDirty, beat: beatDirty, mic: micDirty };
+  let settled = false;
+  // Runs once per batch; a late answer of a timed-out batch must not release a newer one.
+  const finish = (timedOut: boolean) => {
+    if (settled) return;
+    settled = true;
+    if (batch !== flushBatch) return;
+    clearTimeout(flushDeadline); flushDeadline = undefined;
+    flushing = false;
+    if (timedOut) {
+      eventsDirty ||= had.events; beatDirty ||= had.beat; micDirty ||= had.mic;
+      flushAgain = false;
+      flushBlockedUntil = Date.now() + Math.min(FLUSH_BACKOFF_MAX_MS, FLUSH_DEADLINE_MS * 2 ** Math.min(4, flushTimeouts++));
+      flushRemote(); // arms the retry timer
+      return;
+    }
+    flushTimeouts = 0;
+    if (flushAgain) { flushAgain = false; flushRemote(); }
+  };
   try {
     if (eventsDirty) { eventsDirty = false; const payload = JSON.stringify({ events: readDiagnostics() }); writes.push(Promise.resolve().then(() => store.setLocalStorage(DIAGNOSTICS_STORE_KEY, payload))); }
     if (beatDirty) { beatDirty = false; const payload = JSON.stringify(lastHeartbeat ?? null); writes.push(Promise.resolve().then(() => store.setLocalStorage(HEARTBEAT_STORE_KEY, payload))); }
     if (micDirty) { micDirty = false; const payload = JSON.stringify({ events: micLog }); writes.push(Promise.resolve().then(() => store.setLocalStorage(MIC_STORE_KEY, payload))); }
   } catch { /* unserializable: skip this round */ }
-  void Promise.all(writes.map(write => write.catch(() => false))).then(() => {
-    flushing = false;
-    if (flushAgain) { flushAgain = false; flushRemote(); }
-  });
+  flushDeadline = setTimeout(() => finish(true), FLUSH_DEADLINE_MS);
+  void Promise.all(writes.map(write => write.catch(() => false))).then(() => finish(false));
 }
 /** Urgent writes go out now (the next thing may be a hang); the rest are coalesced. */
 function scheduleRemote(urgent: boolean, what: "events" | "beat" | "mic" = "events"): void {
@@ -100,7 +123,8 @@ function mergeEvents(a: readonly DiagnosticEvent[], b: readonly DiagnosticEvent[
 /** Test hook: forget the attached store and in-memory copy. */
 export function resetDiagnosticsForTest(): void {
   remote = undefined; memory = undefined; remoteHeartbeat = undefined; lastHeartbeat = undefined; previousExit = null;
-  clearTimeout(flushTimer); flushTimer = undefined; flushing = false; flushAgain = false; eventsDirty = false; beatDirty = false; taps.length = 0; pending.clear(); io.clear(); slowLogged.clear();
+  clearTimeout(flushTimer); flushTimer = undefined; flushing = false; flushAgain = false; eventsDirty = false; beatDirty = false; taps.length = 0;
+  clearTimeout(flushDeadline); flushDeadline = undefined; flushBatch += 1; flushTimeouts = 0; flushBlockedUntil = 0; pending.clear(); io.clear(); slowLogged.clear();
   micLog = []; micLoaded = true; micDirty = false; micPending = 0; lagSum = 0; lagN = 0; lagMax = 0; lateAt = 0; lateMs = 0;
 }
 

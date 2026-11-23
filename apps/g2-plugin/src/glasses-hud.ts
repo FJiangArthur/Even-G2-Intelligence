@@ -52,7 +52,9 @@ import type { CopilotClaim, CopilotConcept, CopilotSuggestion, HudMirror, Verifi
 import { AnswerPager, pageReadingMs, paginateAnswer, type PageLayout } from "./answer-pager";
 import { blankImage, centeredImage, drawBitmap, encodeGrayPng, type GrayImage } from "./glasses-image";
 import { ICONS, MASCOT_FRAMES, modeIcon, textBitmap, type MascotState } from "./pixel-art";
+import { BridgeTimeoutError, PAGE_WRITE_DEADLINE_MS, TEXT_WRITE_DEADLINE_MS, withDeadline, writeTimeoutBackoff } from "./glasses-renderer";
 import type { GlassesConversationState, GlassesRenderBridge } from "./glasses-renderer";
+import { FEED_LIMIT } from "./presentation";
 import type { FeedItem, PresentationSnapshot } from "./presentation";
 import { SHORTCUT_ACTIONS } from "./shortcut-actions";
 
@@ -254,6 +256,8 @@ export const WRITE_GAP_MS = 80;
 /** How long the lighter mode lasts after the last slow write. */
 export const SLOW_HOLD_MS = 30_000;
 const SLOW_CAPTION_MS = 1500, SLOW_PANEL_MS = 600;
+/** v0.15: least time between two BODY writes while the answer on screen is still streaming. */
+export const STREAMING_BODY_MS = 300;
 /** v0.10 image containers (4-bit greyscale PNG via updateImageRawData). */
 export const HUD_IMAGES = Object.freeze({
   mascot: Object.freeze({ containerID: 10, containerName: "hud-mascot", xPosition: 0, yPosition: 0, width: 40, height: 36 }),
@@ -693,6 +697,17 @@ export class GlassesHud implements GlassesSurface {
   private readonly dirtySince = new Map<PanelKey, number>();
   /** After a rejected write the link is likely congested: pause all writes. */
   private blockedUntil = 0;
+  // v0.15: a write the glasses never answer is given up after a deadline (see withDeadline), so the
+  // single write queue cannot halt. Consecutive unanswered writes, the back-off after them, and a full
+  // re-push owed once the link answers again (what the glasses show after an unanswered write is unknown).
+  private timeouts = 0;
+  private timeoutUntil = 0;
+  private timeoutTimer?: ReturnType<typeof setTimeout>;
+  private repushOwed = false;
+  /** True while render() runs ingest(): the pager callback leaves the refresh to render(). */
+  private ingesting = false;
+  /** What ingest() last handed to the pager; an unchanged answer is not handed over again. */
+  private pagerInput?: { id?: string; questionId?: string; text?: string; streaming?: boolean; partial?: boolean; layout?: PageLayout; revision?: number; none: boolean };
   private initialized = false;
   private disposed = false;
   private generation = 0;
@@ -833,7 +848,8 @@ export class GlassesHud implements GlassesSurface {
     try {
       this.glasses = glasses;
       if (snapshot) this.snapshot = snapshot;
-      this.ingest();
+      this.ingesting = true;
+      try { this.ingest(); } finally { this.ingesting = false; }
       this.refresh();
     } catch (error) { this.reportRenderError(error); }
   }
@@ -960,6 +976,8 @@ export class GlassesHud implements GlassesSurface {
     this.ticker = undefined;
     if (this.ambientTimer) clearTimeout(this.ambientTimer);
     this.ambientTimer = undefined;
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    this.timeoutTimer = undefined;
     this.awakeUntil = 0; this.cue = undefined; this.cueQueue = [];
     this.pager.dispose();
   }
@@ -967,8 +985,9 @@ export class GlassesHud implements GlassesSurface {
   /* ---------------- state ---------------- */
 
   private createPager(): AnswerPager {
+    this.pagerInput = undefined;
     return new AnswerPager(() => {
-      if (this.disposed) return;
+      if (this.disposed || this.ingesting) return; // during render(): ingest() follows the answer, render() refreshes
       try { this.followAnswer(); this.refresh(); } catch (error) { this.reportRenderError(error); }
     }, ANSWER_LAYOUT, () => this.now());
   }
@@ -1005,9 +1024,9 @@ export class GlassesHud implements GlassesSurface {
         if (item.id === PARTIAL_ID) this.partialSeenAt = now;
         else if (!this.finalsSeen.has(item.id)) this.finalsSeen.set(item.id, now);
       }
-      while (this.finalsSeen.size > 200) this.finalsSeen.delete(this.finalsSeen.keys().next().value!);
+      while (this.finalsSeen.size > FEED_LIMIT) this.finalsSeen.delete(this.finalsSeen.keys().next().value!);
       for (const item of snapshot.feed) if (item.kind === "answer" && !item.streaming && !this.answerSeenAt.has(item.id)) this.answerSeenAt.set(item.id, now);
-      while (this.answerSeenAt.size > 200) this.answerSeenAt.delete(this.answerSeenAt.keys().next().value!);
+      while (this.answerSeenAt.size > FEED_LIMIT) this.answerSeenAt.delete(this.answerSeenAt.keys().next().value!);
       this.settleRequests(snapshot.verifications);
     }
 
@@ -1028,9 +1047,22 @@ export class GlassesHud implements GlassesSurface {
         this.answerInfo.set(key, info);
         while (this.answerInfo.size > 12) this.answerInfo.delete(this.answerInfo.keys().next().value!);
       }
-      this.pager.update({ ...answer, layout: info.kind === "answer" ? ANSWER_LAYOUT : THEY_ASKED_LAYOUT }, glasses.answerResetRevision);
-    } else this.pager.update(undefined, glasses.answerResetRevision);
+      this.updatePager({ ...answer, layout: info.kind === "answer" ? ANSWER_LAYOUT : THEY_ASKED_LAYOUT }, glasses.answerResetRevision);
+    } else this.updatePager(undefined, glasses.answerResetRevision);
     this.followAnswer();
+  }
+
+  /**
+   * pager.update, skipped when nothing about the answer changed since the last call (most events are
+   * transcript partials). An answer the pager ended by itself (stalled stream) is still handed over.
+   */
+  private updatePager(answer: Parameters<AnswerPager["update"]>[0], revision?: number): void {
+    const last = this.pagerInput;
+    const same = !!last && last.none === !answer && last.revision === revision && last.id === answer?.id && last.questionId === answer?.questionId
+      && last.text === answer?.text && last.streaming === answer?.streaming && last.partial === answer?.partial && last.layout === answer?.layout;
+    if (same && !(answer?.streaming && !this.pager.isStreaming)) return;
+    this.pagerInput = { none: !answer, revision, id: answer?.id, questionId: answer?.questionId, text: answer?.text, streaming: answer?.streaming, partial: answer?.partial, layout: answer?.layout };
+    this.pager.update(answer, revision);
   }
 
   /** The ANSWER view follows whichever answer the pager shows now (a new one, or the next waiting one). */
@@ -1617,7 +1649,7 @@ export class GlassesHud implements GlassesSurface {
     this.schedule();
     // Connect / disconnect: swap to the page with (or without) the opaque SPLASH container.
     // Ambient display: swap between the blank page and the HUD page (wake, idle, session start / end).
-    const swap = (this.imagesOn && this.splashActive() !== this.pageSplash) || (this.pageSwapDue() && now >= this.blockedUntil);
+    const swap = now >= this.timeoutUntil && ((this.imagesOn && this.splashActive() !== this.pageSplash) || (this.pageSwapDue() && now >= this.blockedUntil));
     if (this.initialized && this.page === "hud" && !this.rebuilding && swap) void this.rebuild("hud", false);
     this.updateImages();
     this.publishMirror();
@@ -2014,9 +2046,11 @@ export class GlassesHud implements GlassesSurface {
       let ok = false;
       const startedAt = this.now();
       try {
-        const result = await this.bridge.updateImageRawData!(new ImageRawDataUpdate({ containerID: container.containerID, containerName: container.containerName, imageData: this.imageBytes(want) }));
+        const result = await withDeadline(this.bridge.updateImageRawData!(new ImageRawDataUpdate({ containerID: container.containerID, containerName: container.containerName, imageData: this.imageBytes(want) })),
+          PAGE_WRITE_DEADLINE_MS, `${container.containerName} image update`);
         ok = typeof result !== "string" || ImageRawDataUpdateResult.isSuccess(ImageRawDataUpdateResult.normalize(result));
-      } catch { ok = false; }
+        if (generation === this.generation) this.writeAnswered();
+      } catch (error) { ok = false; if (error instanceof BridgeTimeoutError && generation === this.generation) this.writeUnanswered("image", error); }
       // Even docs: `success` means accepted, not displayed; a full-size (288x144) image takes about
       // 800 ms to reach the glasses and 100 ms is the floor between image sends.
       const airtime = this.writeGap ? 100 + Math.round(800 * (container.width * container.height) / (288 * 144)) : 0;
@@ -2121,15 +2155,21 @@ export class GlassesHud implements GlassesSurface {
       let ok = false;
       const startedAt = this.now();
       try {
-        ok = await this.bridge.rebuildPageContainer(new RebuildPageContainer(target === "menu" ? this.menuPage(frame) : this.hudPage(frame, splash, ambient)));
-      } catch (error) { this.reportRenderError(error); }
+        ok = await withDeadline(this.bridge.rebuildPageContainer(new RebuildPageContainer(target === "menu" ? this.menuPage(frame) : this.hudPage(frame, splash, ambient))),
+          PAGE_WRITE_DEADLINE_MS, "page rebuild");
+        // An accepted page is the full re-push: nothing more is owed.
+        if (generation === this.generation && ok) { this.repushOwed = false; this.writeAnswered(); }
+      } catch (error) {
+        if (error instanceof BridgeTimeoutError) { if (generation === this.generation) this.writeUnanswered("page", error); }
+        else this.reportRenderError(error);
+      }
       recordDiagnostic("glasses-page", `${force ? "re-push" : target === "menu" ? "menu" : ambient !== this.pageAmbient ? (ambient ? "ambient" : "wake") : splash !== this.pageSplash ? "connect/disconnect" : "menu close"} · ${this.lastGesture || "-"} · ${ok ? "ok" : "rejected"} ${((this.now() - startedAt) / 1000).toFixed(1)} s`);
       this.nextWriteAt = this.now() + (this.writeGap ? Math.max(300, this.writeGap * 3) : 0); // a new page needs longer to settle
       this.noteLatency("page", this.now() - startedAt);
       if (generation !== this.generation) return false;
       if (!ok) {
         if (target === "menu" && this.menu) { this.menu.native = false; this.page = "hud"; }
-        this.blockedUntil = this.now() + 1000;
+        this.blockedUntil = Math.max(this.blockedUntil, this.now() + 1000);
         return false;
       }
       this.page = target;
@@ -2168,7 +2208,9 @@ export class GlassesHud implements GlassesSurface {
 
   private dueAt(key: PanelKey): number {
     const since = this.dirtySince.get(key) ?? this.now();
-    const interval = this.slowUntil > this.now() ? Math.max(this.intervals[key], key === "caption" ? SLOW_CAPTION_MS : SLOW_PANEL_MS) : this.intervals[key];
+    let interval = this.slowUntil > this.now() ? Math.max(this.intervals[key], key === "caption" ? SLOW_CAPTION_MS : SLOW_PANEL_MS) : this.intervals[key];
+    // A streaming answer changes at every token: a few body writes per page are enough.
+    if (key === "body" && this.pager.text && this.pager.isStreaming) interval = Math.max(interval, STREAMING_BODY_MS);
     return Math.max(since + this.debounce, (this.sentAt.get(key) ?? 0) + interval, this.blockedUntil);
   }
 
@@ -2210,9 +2252,9 @@ export class GlassesHud implements GlassesSurface {
           if (panelText(this.frameValue, key) !== content) continue; // changed while waiting: next pass sends the newer text
         }
         const startedAt = this.now();
-        const accepted = await this.bridge.textContainerUpgrade(new TextContainerUpgrade({
+        const accepted = await withDeadline(this.bridge.textContainerUpgrade(new TextContainerUpgrade({
           containerID: panel.containerID, containerName: panel.containerName, content,
-        }));
+        })), TEXT_WRITE_DEADLINE_MS, `${panel.containerName} text update`);
         this.nextWriteAt = this.now() + this.writeGap;
         this.noteLatency("text", this.now() - startedAt);
         if (generation !== this.generation) return;
@@ -2221,14 +2263,49 @@ export class GlassesHud implements GlassesSurface {
         this.sentAt.set(key, this.now());
         if (panelText(this.frameValue, key) === content) this.dirtySince.delete(key);
         else this.dirtySince.set(key, this.now());
+        if (this.writeAnswered()) return; // the re-push carries every container
       } catch (error) {
         if (generation !== this.generation) return;
-        // Back off one second before retrying any container.
-        this.blockedUntil = this.now() + 1000;
+        // Back off one second before retrying any container (longer after an unanswered write).
+        this.blockedUntil = Math.max(this.blockedUntil, this.now() + 1000);
+        if (error instanceof BridgeTimeoutError) this.writeUnanswered("text", error);
         this.options.onError?.(error instanceof Error ? error : new Error(String(error)));
         return;
       }
     }
+  }
+
+  /**
+   * A glasses write got no answer within its deadline: it counts as failed (nothing is marked as sent,
+   * a late answer is ignored). All writes pause for a growing back-off, so retries do not add a call per
+   * deadline to a host that is already behind, and the HUD goes into its lighter mode.
+   */
+  private writeUnanswered(kind: "text" | "image" | "page", error: BridgeTimeoutError): void {
+    const now = this.now();
+    const wait = writeTimeoutBackoff(++this.timeouts);
+    this.timeoutUntil = now + wait;
+    this.blockedUntil = Math.max(this.blockedUntil, this.timeoutUntil);
+    this.repushOwed = true;
+    recordDiagnostic("bridge-timeout", `${error.message} · next glasses write in ${wait / 1000} s`);
+    if (kind === "text") this.noteLatency(kind, TEXT_WRITE_DEADLINE_MS); // image and page writes report their own duration
+    // Page swaps wait for the back-off too; this wakes them (and the text queue) when it is over.
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    this.timeoutTimer = setTimeout(() => {
+      this.timeoutTimer = undefined;
+      if (this.disposed) return;
+      try { this.refresh(); } catch (cause) { this.reportRenderError(cause); }
+    }, wait);
+  }
+
+  /** The glasses answered a write. After unanswered ones, redraw the whole page once (returns true then). */
+  private writeAnswered(): boolean {
+    this.timeouts = 0;
+    if (!this.repushOwed) return false;
+    this.repushOwed = false;
+    if (this.disposed || !this.initialized || !this.bridge.rebuildPageContainer) return false;
+    this.lastGesture = "after unanswered write";
+    void this.rebuild(this.menu?.native ? "menu" : "hud", true);
+    return true;
   }
 
   /** A glasses write took `ms`. Slow answers put the HUD in a lighter mode for SLOW_HOLD_MS. */
