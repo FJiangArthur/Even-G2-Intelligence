@@ -181,6 +181,11 @@ export class G2ConversationController {
    * flushHistory() (page hidden/frozen), disconnect(), dispose(), deletions and imports.
    */
   public liveHistoryWriteDelayMs = 0;
+  /** v0.15: longest Stop / exit wait for history to be saved. Past it the save goes on in the background and Stop still completes. */
+  public historyTeardownWaitMs = 5000;
+  /** v0.15: the saved session list (a copy and a sort of every session), kept until the store saves a change. */
+  private savedSessionsCache?: { revision: number; sessions: readonly HistorySession[] };
+  private readonly knowledgeStamps = new WeakMap<HistorySession, string>();
   /** Longest an answer waits for the saved-knowledge search before going out without it (0: no limit). */
   public knowledgeSearchDeadlineMs = 2500;
   // ---- end history write coalescing ----
@@ -233,8 +238,17 @@ export class G2ConversationController {
   ) { this.history = new LocalHistoryStore(bridge); }
 
   public historySnapshot(): HistoryState {
-    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), sessions: this.history.listSessions(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
+    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), sessions: this.savedSessions().slice(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
       useLocalMemory: this.localMemoryEnabled, liveWebFactCheck: this.webCheckEnabled, autoExplainTerms: this.autoExplainEnabled };
+  }
+  /**
+   * v0.15: one archive pass per saved change, not per emit: status-only emits (one or two per archived
+   * line) and the knowledge-base counts reuse it. The objects are shared with listeners: read only.
+   */
+  private savedSessions(): readonly HistorySession[] {
+    const revision = this.history.revision;
+    if (this.savedSessionsCache?.revision !== revision) this.savedSessionsCache = { revision, sessions: this.history.listSessions() };
+    return this.savedSessionsCache.sessions;
   }
   public subscribeHistory(listener: (state: HistoryState) => void): () => void {
     this.historyListeners.add(listener); listener(this.historySnapshot());
@@ -505,10 +519,13 @@ export class G2ConversationController {
     // Only worth an archive pass when the OpenAI store is in use.
     if (this.knowledgeSource === "openai" || this.openaiKnowledge.vectorStoreId) {
       const saved = new Set<string>();
-      for (const session of this.history.listSessions()) {
+      for (const session of this.savedSessions()) {
         saved.add(session.id);
         if (session.id === live) continue;
-        if (files[session.id]?.stamp !== this.knowledgeStamp(session)) pending++;
+        // v0.15: these objects live for one saved revision, so their stamp (entry count included) is computed once.
+        let stamp = this.knowledgeStamps.get(session);
+        if (stamp === undefined) this.knowledgeStamps.set(session, stamp = this.knowledgeStamp(session));
+        if (files[session.id]?.stamp !== stamp) pending++;
       }
       for (const id of Object.keys(files)) if (!saved.has(id)) removals++;
     }
@@ -1159,7 +1176,10 @@ export class G2ConversationController {
    * replaces that fallback; without a key, with too little speech, or when the call fails, the
    * fallback stays (History → open the session → Generate summary retries).
    */
-  private async finalizeSession(ended: HistorySession, run?: { model: string; digest: DigestRunner }): Promise<void> {
+  private finalizeSession(ended: HistorySession, run?: { model: string; digest: DigestRunner }): Promise<void> {
+    return this.withinTeardown(this.finalizeSessionNow(ended, run)); // v0.15: Stop does not hang on an unanswered save
+  }
+  private async finalizeSessionNow(ended: HistorySession, run?: { model: string; digest: DigestRunner }): Promise<void> {
     let id = ended.id;
     try {
       const saved = this.history.getSession(id);
@@ -1458,8 +1478,7 @@ export class G2ConversationController {
     await this.audioDrained();
     await this.releaseClient();
     if (hadClient) this.clearLifecycle(); // a user disconnect is not an interrupted session
-    await this.archiveQueue;
-    this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined); // failures are reported in history status
+    await this.settleHistory(); // failures are reported in history status
     if (ended) await this.finalizeSession(ended, digest);
     if (this.initialized && !this.disposed) this.presentation.setStatus("ready");
   }
@@ -1490,8 +1509,7 @@ export class G2ConversationController {
       if (wasOn) await this.bridge.audioControl(false, this.micSource);
       await this.audioDrained();
       await this.releaseClient("shutdown");
-      await this.archiveQueue;
-      this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined);
+      await this.settleHistory();
       // The page may be going away: the on-phone title is saved first; the summary call may not finish.
       if (ended) await this.finalizeSession(ended, digest);
       this.historyListeners.clear();
@@ -2178,11 +2196,30 @@ export class G2ConversationController {
   private enqueueArchive(save: () => Promise<unknown>): void {
     this.archiveQueue = this.archiveQueue.then(() => {
       this.syncHistoryWriteDelay();
-      this.setHistoryStatus("Saving local history…");
+      // v0.15: a coalesced live write is announced when it is saved, not once more per line.
+      if (!this.history.writeDelayMs) this.setHistoryStatus("Saving local history…");
       let saved: Promise<unknown>;
       try { saved = save(); } catch (error) { saved = Promise.reject(error); }
       void saved.then(() => this.setHistoryStatus("Saved on this phone."), error => this.setHistoryStatus(errorMessage(error)));
     });
+  }
+  /**
+   * v0.15: resolves with `work`, or after historyTeardownWaitMs when storage has not answered by then.
+   * The work is not cancelled: the store's queue finishes it in the background.
+   */
+  private async withinTeardown(work: Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<"late">(resolve => { timer = setTimeout(() => resolve("late"), this.historyTeardownWaitMs); });
+    try {
+      if (await Promise.race([work.then(() => undefined, () => undefined), late]) === "late") countDiagnostic("history-teardown-late", this.historyTeardownWaitMs);
+    } finally { clearTimeout(timer); }
+  }
+  /** Session end: issued archive writes and the store's pending (coalesced) write are saved, within the teardown wait. */
+  private settleHistory(): Promise<void> {
+    return this.withinTeardown((async () => {
+      await this.archiveQueue;
+      this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined);
+    })());
   }
   /** Live sessions coalesce history writes; imports, deletions and idle time write through. */
   private syncHistoryWriteDelay(): void {
