@@ -55,6 +55,8 @@ export function speakerName(label: string | undefined, role: SpeakerRole | undef
  * merge into one paragraph; the live partial joins the open paragraph when the speaker matches.
  * Only a speaker change or a question/answer card closes a paragraph. Side cards (insight, note,
  * fact check, error) that arrive mid-paragraph are placed right after it so speech keeps flowing.
+ * A long single-speaker stretch is split: a paragraph that already holds PARAGRAPH_SPLIT_SEGMENTS
+ * finals closes at the next line spoken in a different wall-clock minute than its first one.
  */
 export type FeedBlock =
   | { readonly type: "paragraph"; readonly id: string; readonly speaker: string; readonly role: SpeakerRole;
@@ -64,10 +66,16 @@ type ParagraphBlock = Extract<FeedBlock, { type: "paragraph" }>;
 
 export const PARTIAL_TRANSCRIPT_ID = "transcript-partial";
 const INTERRUPTING_KINDS: ReadonlySet<FeedKind> = new Set<FeedKind>(["question", "answer"]);
+/** Finals a paragraph holds before a new wall-clock minute starts the next one. */
+export const PARAGRAPH_SPLIT_SEGMENTS = 12;
+/** Wall-clock minute of an ISO timestamp ("2026-11-08T20:00"), or undefined when the line has no time. */
+const clockMinute = (occurredAt: string | undefined) => occurredAt && occurredAt.length >= 16 ? occurredAt.slice(0, 16) : undefined;
 
 export function feedBlocks(feed: readonly FeedItem[]): FeedBlock[] {
   const blocks: FeedBlock[] = [];
   let open: ParagraphBlock | undefined;
+  // Segments of the open paragraph (the same array as open.segments, appended in place).
+  let segments: FeedItem[] = [];
   let deferred: FeedBlock[] = [];
   const close = () => {
     if (open) blocks.push(open);
@@ -84,9 +92,14 @@ export function feedBlocks(feed: readonly FeedItem[]): FeedBlock[] {
     }
     if (!item.body.trim()) continue;
     const speaker = item.speaker ?? speakerName(item.label, item.speakerRole);
-    if (open && open.speaker === speaker) { open = { ...open, segments: [...open.segments, item] }; continue; }
+    if (open && open.speaker === speaker) {
+      const started = segments.length >= PARAGRAPH_SPLIT_SEGMENTS ? clockMinute(segments[0]!.occurredAt) : undefined;
+      const minute = started === undefined ? undefined : clockMinute(item.occurredAt);
+      if (started === undefined || minute === undefined || minute === started) { segments.push(item); continue; }
+    }
     close();
-    open = { type: "paragraph", id: `para:${item.id}`, speaker, role: item.speakerRole ?? "unknown", segments: [item] };
+    segments = [item];
+    open = { type: "paragraph", id: `para:${item.id}`, speaker, role: item.speakerRole ?? "unknown", segments };
   }
   if (partial?.body.trim()) {
     const speaker = partial.speaker ?? speakerName(partial.label, partial.speakerRole);
@@ -168,8 +181,15 @@ export interface PresentationSnapshot {
   readonly verifying: readonly string[];
   /** Notes mode notebook of the live session (absent until something was captured). */
   readonly notebook?: NotebookView;
+  /**
+   * "hud": this snapshot was emitted only because the glasses mirror changed (setHud). The glasses
+   * renderer has nothing new to draw for it. Absent on every other emit and on snapshot().
+   */
+  readonly reason?: "hud";
 }
 
+/** Question ids whose saved-knowledge sources are kept for the answer cards. */
+export const MEMORY_SOURCE_LIMIT = 50;
 const LIMITS = { concepts: 100, conflicts: 50, asks: 50, verifications: 50, factChecks: 50, answerMeta: 100, people: 100 } as const;
 const emptyBucket = (): UsageBucket => ({ costUsd: 0, unknownCostCount: 0, inputTokens: 0, outputTokens: 0, requests: 0 });
 const emptyUnseen = (): Record<CompanionTab, number> => ({ answers: 0, concepts: 0, summary: 0, qa: 0, checks: 0, people: 0, history: 0, knowledge: 0, setup: 0 });
@@ -258,7 +278,7 @@ export class ConversationPresentation {
       && previous.caption === mirror.caption && previous.menuOpen === mirror.menuOpen && previous.selection === mirror.selection
       && previous.lastGesture === mirror.lastGesture) return;
     this.hud = { ...mirror };
-    this.emit();
+    this.emit("hud");
   }
 
   /** Checkable claims (deduped by id and by normalized text; newest wording wins, position kept). */
@@ -467,7 +487,13 @@ export class ConversationPresentation {
   }
 
   public setMemorySources(items: RetrievedMemory[], questionId?: string): void {
-    this.memorySources.set(questionId ?? "", structuredClone(items));
+    // The answer card reads the entry, the score and the session's id / title / source only; the saved
+    // session's summary, facts, people, to-dos and notes are not kept per answer.
+    const key = questionId ?? "";
+    this.memorySources.delete(key);
+    this.memorySources.set(key, items.map(({ entry, session, score }) => ({ entry: structuredClone(entry), score,
+      session: { id: session.id, source: session.source, title: session.title, startedAt: session.startedAt, updatedAt: session.updatedAt } })));
+    while (this.memorySources.size > MEMORY_SOURCE_LIMIT) this.memorySources.delete(this.memorySources.keys().next().value!);
   }
   public applyFactCheck(result: FactCheckResult, eligibleForGlasses = false): void {
     if (!ACTIVE_STATUSES.includes(this.status)) return;
@@ -857,8 +883,8 @@ export class ConversationPresentation {
     return questionId === undefined ? undefined : this.questions.get(questionId);
   }
 
-  private emit(): void {
-    const snapshot = this.snapshot();
+  private emit(reason?: "hud"): void {
+    const snapshot: PresentationSnapshot = reason ? { ...this.snapshot(), reason } : this.snapshot();
     for (const listener of [...this.listeners]) listener(snapshot);
   }
 }
