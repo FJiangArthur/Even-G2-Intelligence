@@ -35,6 +35,8 @@ const TURN_TIMEOUT_MS = 15_000;
 const EARLY_RESULT_TTL_MS = 60_000;
 /** Above this much unsent data the uplink is not keeping up: skip audio instead of buffering more. */
 const MAX_BUFFERED_BYTES = 1_000_000;
+/** While a commit is still in the socket's send buffer, look again this often. */
+const WIRE_POLL_MS = 500;
 const COMMIT_MESSAGE = JSON.stringify({ type: "input_audio_buffer.commit" });
 
 /** 16 kHz -> 24 kHz PCM16 by linear interpolation. 16000 samples -> 24000 samples. */
@@ -85,7 +87,17 @@ export interface RealtimeTranscriberOptions<T> {
   readonly reconnectBaseMs?: number;
   readonly maxReconnects?: number;
 }
-interface Turn<T> { meta: T; itemId?: string; text?: string; partial: string; failed?: boolean; completedAt?: number; committedAt: number }
+interface Turn<T> {
+  meta: T; itemId?: string; text?: string; partial: string; failed?: boolean; completedAt?: number; committedAt: number;
+  /** Bytes handed to the socket up to and including this turn's commit. */
+  mark?: number;
+  /** When the commit was first seen to have left the socket's send buffer. */
+  wiredAt?: number;
+  /** When this turn became the oldest unfinished one because the turns before it finished. */
+  headAt?: number;
+  /** Last acknowledgement or streamed words for this turn. */
+  activeAt?: number;
+}
 interface Queued { readonly data: string; readonly samples: number }
 
 /**
@@ -124,6 +136,11 @@ export class RealtimeTranscriber<T> {
   private connectAbort?: AbortController;
   private connectTimer?: ReturnType<typeof setTimeout>;
   private watchTimer?: ReturnType<typeof setTimeout>;
+  /** Bytes handed to the current socket; minus its bufferedAmount this is what has left the send buffer. */
+  private sentBytes = 0;
+  private wireSeen = -Infinity;
+  /** Last time more bytes were seen to have left the send buffer. */
+  private wireSeenAt = 0;
   constructor(private readonly options: RealtimeTranscriberOptions<T>) {}
 
   /** 16 kHz s16le mono samples. Opens the socket lazily on first audio. */
@@ -143,6 +160,7 @@ export class RealtimeTranscriber<T> {
     // The context prompt is sent once when the socket opens.
     this.sendRaw(COMMIT_MESSAGE, 0);
     const turn: Turn<T> = { meta, partial: "", committedAt: Date.now() };
+    if (this.socket && this.ready) { turn.mark = this.sentBytes; this.onWire(turn, turn.committedAt); }
     this.turns.push(turn); this.awaitingCommit.push(turn);
     this.replay = []; this.replaySamples = 0;
     this.armWatch();
@@ -218,7 +236,7 @@ export class RealtimeTranscriber<T> {
       // Slow or dead uplink: do not pile more audio into the socket buffer. Control messages still go,
       // so a commit keeps its acknowledgement deadline and a dead socket is still found.
       if (samples && (socket.bufferedAmount ?? 0) > MAX_BUFFERED_BYTES) return;
-      try { socket.send(message); return; } catch { /* fall through to queue */ }
+      try { socket.send(message); this.sentBytes += message.length; return; } catch { /* fall through to queue */ }
     }
     if (samples) {
       // Bound the open turn to its newest 30 s; committed turns ahead of it are left alone.
@@ -300,11 +318,14 @@ export class RealtimeTranscriber<T> {
         opened = true; clearTimeout(timer); this.reportedDown = undefined; this.lastServerEventAt = this.readyAt = Date.now();
         const prompt = this.options.prompt?.().replace(/\s+/g, " ").trim().slice(-200) ?? "";
         this.sentPrompt = prompt;
+        this.sentBytes = 0; this.wireSeen = -Infinity; this.wireSeenAt = this.readyAt;
         try {
           socket.send(JSON.stringify({ type: "session.update", session: realtimeSessionConfig(prompt, this.options.locale) }));
           const queued = this.outbox; this.outbox = []; this.outboxSamples = 0;
-          for (const message of queued) socket.send(message.data);
+          for (const message of queued) { socket.send(message.data); this.sentBytes += message.data.length; }
         } catch { /* close handler reconnects */ }
+        // Turns committed while disconnected went out in that burst; they are on the wire once it has drained.
+        for (const turn of this.turns) { turn.mark = this.sentBytes; turn.wiredAt = undefined; }
         this.ready = true;
         this.rearmWatch();
         resolve();
@@ -345,29 +366,62 @@ export class RealtimeTranscriber<T> {
     this.coolingDown = true;
     this.reconnectTimer = setTimeout(() => { this.reconnectTimer = undefined; this.coolingDown = false; this.ensureConnected(); }, RECONNECT_COOLDOWN_MS);
   }
+  /**
+   * True once this turn's commit has left the socket's send buffer. Until then the server cannot have
+   * answered it, so its deadlines have not started. Also notes whether the buffer is draining at all.
+   */
+  private onWire(turn: Turn<T>, now: number): boolean {
+    if (turn.wiredAt !== undefined) return true;
+    const left = this.sentBytes - (this.socket?.bufferedAmount ?? 0);
+    if (left > this.wireSeen) { this.wireSeen = left; this.wireSeenAt = now; }
+    if (left < (turn.mark ?? 0)) return false;
+    turn.wiredAt = now;
+    return true;
+  }
+  /** Start of the wait for the acknowledgement: commit, socket ready, or commit off the send buffer, whichever is last. */
+  private ackSince(turn: Turn<T>): number { return Math.max(turn.committedAt, this.readyAt, turn.wiredAt ?? 0); }
+  /** Start of the wait for the result: restarts when the turn becomes the head and whenever words arrive for it. */
+  private resultSince(turn: Turn<T>): number { return Math.max(this.ackSince(turn), turn.headAt ?? 0, turn.activeAt ?? 0); }
   /** One timer for the oldest unfinished turn; a timer because append() is not called during silence. */
   private armWatch(): void {
     if (this.closed || this.watchTimer || !this.ready) return;
     const head = this.turns[0];
     if (!head) return;
-    const since = Math.max(head.committedAt, this.readyAt);
-    const silent = !head.itemId && this.lastServerEventAt <= since;
-    const due = since + (silent ? COMMIT_ACK_TIMEOUT_MS : TURN_TIMEOUT_MS);
-    this.watchTimer = setTimeout(() => { this.watchTimer = undefined; this.checkHead(); }, Math.max(0, due - Date.now()));
+    const now = Date.now();
+    let due = now + WIRE_POLL_MS;
+    if (this.onWire(head, now)) {
+      const since = this.ackSince(head);
+      const silent = !head.itemId && this.lastServerEventAt <= since;
+      due = silent ? since + COMMIT_ACK_TIMEOUT_MS : this.resultSince(head) + TURN_TIMEOUT_MS;
+    }
+    this.watchTimer = setTimeout(() => { this.watchTimer = undefined; this.checkHead(); }, Math.max(0, due - now));
   }
   private rearmWatch(): void { clearTimeout(this.watchTimer); this.watchTimer = undefined; this.armWatch(); }
   private checkHead(): void {
     const head = this.turns[0];
     if (this.closed || !this.ready || !head) return;
-    const now = Date.now(), since = Math.max(head.committedAt, this.readyAt);
+    const now = Date.now();
+    if (!this.onWire(head, now)) {
+      // The commit is still queued behind unsent audio. A slow uplink that keeps draining is alive and is
+      // left alone; one that moved nothing for the acknowledgement timeout is dead.
+      if (now - Math.max(head.committedAt, this.readyAt, this.wireSeenAt) >= COMMIT_ACK_TIMEOUT_MS) this.forceReconnect(4001, "send buffer stalled");
+      else this.armWatch();
+      return;
+    }
+    const since = this.ackSince(head);
     if (!head.itemId && this.lastServerEventAt <= since && now - since >= COMMIT_ACK_TIMEOUT_MS) {
       // A commit is always answered. Silence since then means the socket is open but dead.
       this.forceReconnect(4001, "no commit acknowledgement");
       return;
     }
-    if (now - since < TURN_TIMEOUT_MS) { this.armWatch(); return; }
+    if (now - this.resultSince(head) < TURN_TIMEOUT_MS) { this.armWatch(); return; }
+    if (!head.itemId) {
+      // The server is alive but never acknowledged this commit. Acknowledgements carry no reference to their
+      // commit and are paired in order, so a late one would land on the next turn. Start a new socket instead.
+      this.forceReconnect(4001, "commit acknowledgement overdue");
+      return;
+    }
     // The server is alive but this turn never finished: keep the streamed words, or report it, and move on.
-    if (!head.itemId) this.awaitingCommit = this.awaitingCommit.filter(turn => turn !== head);
     const partial = head.partial.trim();
     if (partial) { head.text = partial; head.completedAt = now; } else head.failed = true;
     this.flush();
@@ -386,7 +440,7 @@ export class RealtimeTranscriber<T> {
         if (!turn) return;
         // Without an item id no result can ever be matched to this turn: fail it instead of holding the queue.
         if (!itemId) { turn.failed = true; this.flush(); return; }
-        turn.itemId = itemId; this.byItem.set(itemId, turn);
+        turn.itemId = itemId; this.byItem.set(itemId, turn); turn.activeAt = Date.now();
         // Words streamed before the commit belong to this turn.
         turn.partial = this.live.get(itemId) ?? turn.partial; this.live.delete(itemId);
         const early = this.earlyResults.get(itemId);
@@ -404,7 +458,7 @@ export class RealtimeTranscriber<T> {
           return;
         }
         if (!turn || typeof event.delta !== "string" || turn.text !== undefined) return;
-        turn.partial += event.delta;
+        turn.partial += event.delta; turn.activeAt = Date.now();
         try { this.options.onPartial(turn.meta, turn.partial.trim()); } catch { /* host isolation */ }
         return;
       }
@@ -448,6 +502,9 @@ export class RealtimeTranscriber<T> {
       this.turns.shift(); if (turn.itemId) this.byItem.delete(turn.itemId);
       if (turn.failed) this.options.onError(new DirectProviderError("provider-response", "OpenAI could not transcribe one speech turn.", true), turn.meta);
       else if (turn.text) { try { this.options.onCompleted(turn.meta, turn.text, turn.completedAt ?? Date.now()); } catch { /* host isolation */ } }
+      // The next turn was waiting behind this one; its own wait for a result starts now.
+      const next = this.turns[0];
+      if (next) next.headAt ??= Date.now();
     }
     // The deadline follows whichever turn is now the oldest unfinished one.
     this.rearmWatch();

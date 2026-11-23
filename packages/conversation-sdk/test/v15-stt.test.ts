@@ -185,17 +185,22 @@ describe("v0.15 realtime transcription reliability", () => {
     transcriber.close();
   });
 
-  it("an unacknowledged head turn on a live socket is failed after 15 s and later acknowledgements pair correctly", async () => {
-    const { transcriber, socket, errors, completed } = await connected();
+  it("an unacknowledged head turn on a live socket is given up after 15 s on a new socket, so later acknowledgements pair correctly", async () => {
+    const { transcriber, socket, sockets, errors, completed } = await connected();
     transcriber.append(chunk()); transcriber.commit("a");
     await tick(5_000);
     socket.server({ type: "session.updated" }); // the server is alive, the acknowledgement is just missing
-    await tick(10_100);
-    expect(socket.closed).toBe(false);
+    await tick(9_000);
+    expect(socket.closed).toBe(false); // not the 10 s dead-socket rule
+    await tick(1_100);
+    // Acknowledgements are paired in order, so the old socket's order can no longer be trusted.
+    expect(socket.closed).toBe(true);
     expect(errors.map(e => e.turn)).toEqual(["a"]);
     transcriber.append(chunk()); transcriber.commit("b");
-    socket.server({ type: "input_audio_buffer.committed", item_id: "B" });
-    socket.server({ type: "conversation.item.input_audio_transcription.completed", item_id: "B", transcript: "Next." });
+    await tick(600);
+    const next = sockets.at(-1)!; next.open();
+    next.server({ type: "input_audio_buffer.committed", item_id: "B" });
+    next.server({ type: "conversation.item.input_audio_transcription.completed", item_id: "B", transcript: "Next." });
     expect(completed).toEqual([{ turn: "b", text: "Next." }]);
     transcriber.close();
   });
