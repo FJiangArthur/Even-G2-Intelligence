@@ -51,6 +51,8 @@ interface AnswerClock { dispatch(firstTokenMs: number): void; token(): void; res
 /** Waiting automatic answers (beyond the one running), how long one may wait, and the repeat window. */
 const ANSWER_QUEUE_WAITING = 3, ANSWER_QUEUE_MAX_AGE_MS = 20_000, QUESTION_DEDUPE_MS = 10_000;
 const FIRST_TOKEN_TIMEOUT_MS = 15_000, ANSWER_RETRY_DELAY_MS = 400, BUSY_NOTICE_INTERVAL_MS = 10_000;
+/** GLOBAL BACKGROUND sent with an automatic answer: the newest whole sentences within this many characters. */
+const AUTO_BACKGROUND_CHARS = 20_000;
 /**
  * Interviewer mode with an unattributed speaker (phone microphone, or frames without a direction tag): the
  * question may be the interviewer's or the candidate's. An answer key would be wrong for a candidate's
@@ -709,7 +711,8 @@ export class DirectConversationTransport implements ConversationTransport, Copil
     try { this.options.onMemoryRetrieved?.(memories, questionId); } catch { /* isolate source UI failures */ }
     if (!current()) return false;
     const answerId = crypto.randomUUID(); let text = "", firstTokenMs: number | undefined;
-    let focus = runtime.transcript.local(), background = runtime.transcript.background(scope ?? "global");
+    // v0.15: automatic answers carry a bounded window of earlier speech; a manual request keeps the whole session.
+    let focus = runtime.transcript.local(), background = runtime.transcript.background(scope ?? "global", trigger === "manual" ? undefined : AUTO_BACKGROUND_CHARS);
     const request = scope ? `Answer the most recent unresolved question in the ${scope === "local" ? "recent focus, using relevant earlier background" : "whole captured session"}. If no question is present, suggest one useful follow-up question or next response.` : input;
     // The selected automatic target stays explicit even outside recent focus.
     // Remove its speech sentences from the quoted sections, not from raw storage.
@@ -814,7 +817,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
   private emit(runtime: Runtime, event: GatewayEvent): void { if (this.runtime === runtime && !runtime.abort.signal.aborted) for (const listener of this.listeners) { try { listener(event); } catch { /* isolate subscriber errors */ } } }
   private failure(runtime: Runtime, error: unknown): void {
     const safe = error instanceof DirectProviderError ? error : new DirectProviderError("provider-network", "Direct provider request failed. Check your connection and provider settings.", true);
-    const fatal = ["provider-authentication", "provider-billing", "context-limit", "model-access"].includes(safe.code);
+    const fatal = ["provider-authentication", "provider-billing", "model-access"].includes(safe.code);
     if (fatal) { runtime.blocked = true; runtime.answerQueue = []; }
     this.emit(runtime, { ...this.base(runtime), type: "error", code: safe.code, message: safe.message, retryable: safe.retryable, fatal });
   }
