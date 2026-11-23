@@ -93,6 +93,12 @@ export interface LocalHistoryOptions {
   retrievalSliceMs?: number;
   /** How they yield (default yieldToHost: one macrotask). For tests. */
   retrievalYield?: () => Promise<void>;
+  /**
+   * v0.15: longest wait for one storage reply (default 90 s). A reply that has not arrived by then is
+   * treated as lost: the read or save fails like any other storage error, so the queue behind it moves
+   * on. Keep it well above the latest reply a busy host produces; smaller values are for tests.
+   */
+  storageTimeoutMs?: number;
 }
 interface ShardMeta { bytes: number; entries: number; chunks?: number }
 /** What is stored for one session: its chunks' entry references and byte sizes (unchanged chunks are not rewritten). */
@@ -105,6 +111,15 @@ const MAX_WRITE_DELAY_MS = 60_000;
 const IO_CONCURRENCY = 8;
 /** After a failed v1 -> v2 migration retry, later saves keep writing v1 for this long before retrying. */
 const MIGRATION_RETRY_MS = 60_000;
+/** v0.15: default wait for one storage reply before it counts as lost (late replies of a busy host must still fit). */
+const STORAGE_TIMEOUT_MS = 90_000;
+/** v0.15: while a live session only adds lines, the index (every session's metadata) is written at most this often. */
+const INDEX_HOLD_MS = 60_000;
+/** v0.15: a deadline timer that fires this much later than set means the page was suspended, not that the reply is lost. */
+const SUSPEND_SLACK_MS = 2_000;
+/** v0.15: a live session's pending lines are saved again after a lost reply: this many attempts in all, this long apart at most. */
+const SAVE_ATTEMPTS = 3;
+const SAVE_RETRY_MS = 10_000;
 const LOAD_FAILED = "Could not load local history from storage.";
 const SAVE_FAILED = "Could not save local history. Storage may be full or unavailable.";
 const TOO_LARGE = "Local history exceeds the 5 MiB storage limit.";
@@ -268,6 +283,25 @@ function utf8Length(value: string): number {
   }
   return bytes;
 }
+class StorageTimeout extends Error {}
+/** A save whose storage reply was lost: what is stored is unknown. */
+class SaveLost extends Error { constructor() { super(SAVE_FAILED); } }
+/**
+ * Settles like `pending`, or rejects with StorageTimeout when no reply came within `ms`. Time the page
+ * spent suspended does not count: a timer that fires overdue (the clock moved on while timers stood
+ * still) can run ahead of a reply that is already queued, so the wait starts again.
+ */
+function within<T>(pending: PromiseLike<T> | T, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      const armed = Date.now();
+      timer = setTimeout(() => { if (Date.now() - armed > ms + SUSPEND_SLACK_MS) arm(); else reject(new StorageTimeout()); }, ms);
+    };
+    arm();
+    Promise.resolve(pending).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
+  });
+}
 /** Runs `run` over items with at most `limit` in flight; never rejects. */
 async function settleAll<T, R>(items: readonly T[], limit: number, run: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
   const results: PromiseSettledResult<R>[] = new Array(items.length);
@@ -353,6 +387,10 @@ interface Batch {
   state: State; owners: ReadonlyMap<string, string | null>; touched: ReadonlySet<string>;
   readonly waiters: { resolve: () => void; reject: (error: unknown) => void }[];
   timer?: ReturnType<typeof setTimeout>;
+  /** v0.15: holds mutations issued while writes were coalesced (a live session's lines). */
+  coalesced?: boolean;
+  /** v0.15: saves of this batch that ended in a lost storage reply. */
+  lost?: number;
 }
 
 /**
@@ -380,6 +418,18 @@ export class LocalHistoryStore {
   private readonly chunkEntries: number;
   /** Last saved index value ("" until v2 exists). */
   private indexRaw = "";
+  // ---- v0.15: index writes held back during a live session ----
+  /** What the stored index holds (sessions by reference, shard metas, byte size), known after an index write of this store. */
+  private indexStored?: { readonly sessions: readonly HistorySession[]; readonly shards: Record<string, unknown>; readonly bytes: number };
+  private indexWrittenAt = 0;
+  /** Shards written since the stored index: its byte and entry counts for them are behind. */
+  private readonly indexBehind = new Set<string>();
+  /** The stored index is behind the cache on updatedAt / shard counts only; flush() writes it. */
+  private indexHeld = false;
+  private forceIndex = false;
+  // ---- end held index ----
+  private rev = 0;
+  private readonly timeoutMs: number;
   /** source: the v1 key still holds the archive (migration pending). cleanup: v2 committed, v1 key still to clear. */
   private legacy: "none" | "source" | "cleanup" = "none";
   private migrationRetryAt = 0;
@@ -399,23 +449,29 @@ export class LocalHistoryStore {
     this.pause = typeof options.retrievalYield === "function" ? options.retrievalYield : yieldToHost;
     this.delay = writeDelay(options.writeDelayMs);
     this.chunkEntries = bounded(options.chunkEntries, HISTORY_CHUNK_ENTRIES, 100_000) || HISTORY_CHUNK_ENTRIES;
+    this.timeoutMs = bounded(options.storageTimeoutMs, STORAGE_TIMEOUT_MS, 600_000) || STORAGE_TIMEOUT_MS;
   }
+  /**
+   * v0.15: changes whenever what reads return may have changed (a load or a saved mutation), and never
+   * otherwise. Callers cache listSessions() (a copy and a sort of every session) against it.
+   */
+  get revision(): number { return this.rev; }
   /** See LocalHistoryOptions.writeDelayMs. Setting 0 saves pending mutations now. */
   get writeDelayMs(): number { return this.delay; }
   set writeDelayMs(value: number) {
     this.delay = writeDelay(value);
-    if (!this.delay && this.batch) void this.flush().catch(() => undefined);
+    if (!this.delay && (this.batch || this.indexHeld)) void this.flush().catch(() => undefined);
   }
   private enqueue(operation: () => Promise<void>): Promise<void> {
     const result = this.queue.then(operation); this.queue = result.catch(() => {}); return result;
   }
   private async get(key: string): Promise<string> {
-    let raw: unknown; try { raw = await this.storage.getLocalStorage(key); } catch { throw new Error(LOAD_FAILED); }
+    let raw: unknown; try { raw = await within(this.storage.getLocalStorage(key), this.timeoutMs); } catch { throw new Error(LOAD_FAILED); }
     if (typeof raw !== "string") throw invalid();
     return raw;
   }
   private async put(key: string, value: string): Promise<void> {
-    let saved: unknown; try { saved = await this.storage.setLocalStorage(key, value); } catch { throw new Error(SAVE_FAILED); }
+    let saved: unknown; try { saved = await within(this.storage.setLocalStorage(key, value), this.timeoutMs); } catch (error) { throw error instanceof StorageTimeout ? new SaveLost() : new Error(SAVE_FAILED); }
     if (saved !== true) throw new Error(SAVE_FAILED);
   }
   private setBytes(id: string, bytes: number | undefined): void {
@@ -440,7 +496,7 @@ export class LocalHistoryStore {
         void this.enqueue(() => this.migrate()).catch(() => undefined);
       }
     }
-    this.loaded = true; this.flat = undefined;
+    this.loaded = true; this.flat = undefined; this.rev++;
   }
   private async readIndex(raw: string): Promise<void> {
     let data: unknown; try { data = JSON.parse(raw); } catch { throw invalid(); }
@@ -450,7 +506,11 @@ export class LocalHistoryStore {
     // Sessions recorded as empty have no shard to read (a stale key under their id is ignored).
     const stored = sessions.filter(s => { const meta = own(metas, s.id); return meta !== undefined && !(shardMeta(meta) && meta.entries === 0); });
     const plan = stored.flatMap((s, i) => Array.from({ length: chunkCount(own(metas, s.id)) }, (_, k) => ({ i, key: historyChunkKey(s.id, k) })));
-    const settled = await settleAll(plan, IO_CONCURRENCY, read => this.storage.getLocalStorage(read.key));
+    let lost = false;
+    const settled = await settleAll(plan, IO_CONCURRENCY, read => within(this.storage.getLocalStorage(read.key), this.timeoutMs)
+      .catch(error => { if (error instanceof StorageTimeout) lost = true; throw error; }));
+    // v0.15: a reply that never came says nothing about the shard: fail the load (it can be retried), do not mark it unreadable.
+    if (lost) throw new Error(LOAD_FAILED);
     const values = stored.map(() => [] as (string | undefined)[]);
     plan.forEach((read, j) => { const result = settled[j]!; values[read.i]!.push(result.status === "fulfilled" && typeof result.value === "string" ? result.value : undefined); });
     const entries = new Map<string, HistoryEntry[]>(), owners = new Map<string, string>(), bytes = new Map<string, number>();
@@ -492,7 +552,15 @@ export class LocalHistoryStore {
   }
   load(): Promise<void> { return this.enqueue(() => this.read()); }
   /** Saves pending (coalesced) mutations now; resolves after every earlier mutation has settled. */
-  flush(): Promise<void> { return this.enqueue(async () => { if (this.batch) await this.persist(this.batch); }); }
+  flush(): Promise<void> {
+    return this.enqueue(async () => {
+      this.forceIndex = true; // v0.15: also brings a held-back index up to date
+      try {
+        if (this.batch) await this.persist(this.batch);
+        if (this.indexHeld) await this.cleanup(await this.writeShards(this.state, []));
+      } finally { this.forceIndex = false; }
+    });
+  }
   /** v0.9: sessions whose stored entries could not be read or validated. They are listed without entries and their shard is kept until deleted. */
   corruptSessionIds(): string[] { return [...this.corrupt.keys()]; }
   private mutate(change: (draft: Draft) => void): Promise<void> {
@@ -508,12 +576,15 @@ export class LocalHistoryStore {
         batch.waiters.push({ resolve, reject });
         this.batch = batch;
         if (!this.delay) await this.persist(batch);
-        else batch.timer ??= setTimeout(() => {
-          batch.timer = undefined;
-          void this.enqueue(async () => { if (this.batch === batch) await this.persist(batch); }).catch(() => undefined);
-        }, this.delay);
+        else { batch.coalesced = true; this.saveLater(batch, this.delay); }
       }).catch(reject);
     });
+  }
+  private saveLater(batch: Batch, ms: number): void {
+    batch.timer ??= setTimeout(() => {
+      batch.timer = undefined;
+      void this.enqueue(async () => { if (this.batch === batch) await this.persist(batch); }).catch(() => undefined);
+    }, ms);
   }
   /** Saves a batch; its callers settle with the outcome. The cache changes only on success. */
   private async persist(batch: Batch): Promise<void> {
@@ -522,7 +593,16 @@ export class LocalHistoryStore {
     try {
       if (this.legacy === "source") await this.persistLegacy(batch);
       else { const clears = await this.writeShards(batch.state, batch.touched); this.commit(batch); await this.cleanup(clears); }
-    } catch (error) { for (const waiter of batch.waiters) waiter.reject(error); throw error; }
+    } catch (error) {
+      // v0.15: a lost reply (not a refusal) does not drop a live session's pending lines: the batch stays
+      // open, later lines join it, and the next save (a line, flush() or this timer) writes them all.
+      // Whoever asked for this save is told it failed; the lines' writers settle with the retry.
+      if (error instanceof SaveLost && batch.coalesced && !this.batch && (batch.lost = (batch.lost ?? 0) + 1) < SAVE_ATTEMPTS) {
+        this.batch = batch; this.saveLater(batch, Math.min(this.delay || SAVE_RETRY_MS, SAVE_RETRY_MS, this.timeoutMs));
+        throw error;
+      }
+      for (const waiter of batch.waiters) waiter.reject(error); throw error;
+    }
     for (const waiter of batch.waiters) waiter.resolve();
   }
   /** Migration pending: retry it with this save; until it succeeds, save the whole archive to v1 as before v0.9. */
@@ -574,27 +654,70 @@ export class LocalHistoryStore {
     // A save that fails part-way may leave new chunk keys behind: remember them so they are cleared later.
     for (const [id, layout] of nextLayouts) this.chunkHigh.set(id, Math.max(this.chunkHigh.get(id) ?? 0, layout.refs.length));
     for (const key of this.garbage) if (!clears.has(key)) clears.set(key, undefined);
-    const shards = Object.fromEntries(next.sessions.map(s => {
-      if (this.corrupt.has(s.id)) return [s.id, this.corrupt.get(s.id)];
+    const metaOf = (s: HistorySession): unknown => {
+      if (this.corrupt.has(s.id)) return this.corrupt.get(s.id);
       const entries = next.entries.get(s.id)?.length ?? 0, chunks = entries ? this.layouts.get(s.id)?.refs.length ?? 1 : 1;
-      return [s.id, written.get(s.id) ?? { bytes: entries ? this.shardBytes.get(s.id) ?? 0 : 0, entries, ...(chunks > 1 ? { chunks } : {}) }];
-    }));
-    const index: V2Index = { version: 2, sessions: next.sessions as HistorySession[], shards, ...(this.legacy !== "none" ? { legacyV1: true as const } : {}) };
-    const indexRaw = JSON.stringify(index);
-    if (total + utf8Length(indexRaw) > MAX_BYTES) throw new Error(TOO_LARGE_SAVE);
+      return written.get(s.id) ?? { bytes: entries ? this.shardBytes.get(s.id) ?? 0 : 0, entries, ...(chunks > 1 ? { chunks } : {}) };
+    };
+    // v0.15: a live save that only adds lines leaves the index (every session's metadata) for later.
+    const heldBytes = clears.size ? undefined : this.heldIndexBytes(next, written, metaOf);
+    let indexRaw: string | undefined, shards: Record<string, unknown> | undefined, indexBytes = heldBytes ?? 0;
+    if (heldBytes === undefined) {
+      shards = Object.fromEntries(next.sessions.map(s => [s.id, metaOf(s)]));
+      const index: V2Index = { version: 2, sessions: next.sessions as HistorySession[], shards, ...(this.legacy !== "none" ? { legacyV1: true as const } : {}) };
+      indexRaw = JSON.stringify(index); indexBytes = utf8Length(indexRaw);
+    }
+    if (total + indexBytes > MAX_BYTES) throw new Error(TOO_LARGE_SAVE);
     const results = await settleAll(writes, IO_CONCURRENCY, write => this.put(write.key, write.raw));
     // Written or not, those shards may now differ from the cache: the next save rewrites them.
-    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    const failed = rejected.find(result => !(result.reason instanceof SaveLost)) ?? rejected[0]; // a refusal outranks a lost reply
     if (failed) { for (const write of writes) this.diverged.add(write.id); throw failed.reason; }
-    if (indexRaw !== this.indexRaw) {
-      try { await this.put(HISTORY_INDEX_KEY, indexRaw); } catch (error) { for (const write of writes) this.diverged.add(write.id); throw error; }
+    if (indexRaw !== undefined && indexRaw !== this.indexRaw) {
+      // A failed index write may still have landed: what is stored is unknown until the next index write.
+      try { await this.put(HISTORY_INDEX_KEY, indexRaw); } catch (error) { for (const write of writes) this.diverged.add(write.id); this.indexStored = undefined; throw error; }
+      this.indexWrittenAt = Date.now();
     }
     // Committed.
-    this.indexRaw = indexRaw;
+    if (indexRaw !== undefined) {
+      this.indexRaw = indexRaw; this.indexStored = { sessions: next.sessions, shards: shards!, bytes: indexBytes };
+      this.indexBehind.clear(); this.indexHeld = false;
+    } else {
+      this.indexHeld = true; for (const id of written.keys()) this.indexBehind.add(id);
+      // Coalescing was switched off while the chunks were being written: nothing else would write the index.
+      if (!this.delay) void this.flush().catch(() => undefined);
+    }
     for (const [id, layout] of nextLayouts) { this.layouts.set(id, layout); this.setBytes(id, layout.bytes.reduce((n, b) => n + b, 0)); this.diverged.delete(id); }
     for (const id of clears.values()) if (id !== undefined) { this.setBytes(id, undefined); this.diverged.delete(id); this.corrupt.delete(id); this.layouts.delete(id); }
     if (this.legacy === "source") this.legacy = "cleanup";
     return clears;
+  }
+  /**
+   * v0.15: byte size of the index as it would be written, when that write can wait; undefined when it
+   * must happen now. It can wait only while writes are coalesced (a live session), not during flush(),
+   * for at most INDEX_HOLD_MS after the last index write, and only when the stored index differs from
+   * `next` in nothing but updatedAt values and the byte/entry counts of shards that keep their chunk
+   * count and already had entries. A reload from such an index finds every saved line: it reads chunks
+   * by the stored chunk count, skips only shards recorded as empty, and recounts bytes from what it reads.
+   */
+  private heldIndexBytes(next: State, written: ReadonlyMap<string, ShardMeta>, metaOf: (session: HistorySession) => unknown): number | undefined {
+    const stored = this.indexStored, age = Date.now() - this.indexWrittenAt;
+    if (!stored || !this.delay || this.forceIndex || this.legacy !== "none" || age < 0 || age >= INDEX_HOLD_MS) return undefined;
+    if (next.sessions.length !== stored.sessions.length) return undefined;
+    const size = (value: unknown) => utf8Length(JSON.stringify(value));
+    let bytes = stored.bytes;
+    for (let i = 0; i < next.sessions.length; i++) {
+      const now = next.sessions[i]!, was = stored.sessions[i]!;
+      if (now !== was) {
+        if (now.id !== was.id || JSON.stringify({ ...now, updatedAt: "" }) !== JSON.stringify({ ...was, updatedAt: "" })) return undefined;
+        bytes += size(now.updatedAt) - size(was.updatedAt);
+      }
+      if (!written.has(now.id) && !this.indexBehind.has(now.id)) continue;
+      const meta = metaOf(now), before = own(stored.shards, now.id);
+      if (!shardMeta(meta) || !shardMeta(before) || !meta.entries || !before.entries || chunkCount(meta) !== chunkCount(before)) return undefined;
+      bytes += size(meta) - size(before);
+    }
+    return bytes;
   }
   /** Best effort after commit: unreachable keys are retried by later saves. */
   private async cleanup(clears: Map<string, string | undefined>): Promise<void> {
@@ -604,7 +727,7 @@ export class LocalHistoryStore {
     if (this.legacy === "cleanup") { try { await this.put(LEGACY_HISTORY_KEY, ""); this.legacy = "none"; } catch { /* Retried by the next save. */ } }
   }
   private commit(batch: Batch): void {
-    this.state = batch.state; this.flat = undefined;
+    this.state = batch.state; this.flat = undefined; this.rev++;
     for (const [id, session] of batch.owners) if (session === null) this.owners.delete(id); else this.owners.set(id, session);
   }
   private entries(): HistoryEntry[] { return this.flat ??= flatten(this.state); }
