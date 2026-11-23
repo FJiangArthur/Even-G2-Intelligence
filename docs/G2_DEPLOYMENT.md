@@ -28,7 +28,7 @@ The phone needs internet to reach OpenAI. “Phone-only” describes where Helix
 - Authentication: check key permissions and provider account. Billing/rate limits require provider account action, not a Helix server.
 - Transcription delay: Whisper processes submitted WAV clips, not word-by-word deltas. Speech uploads no longer wait for the answer to finish, but STT provider latency can still cause queueing. Natural pauses, hold release and the continuous-speech segment cap trigger submission.
 - Blank glasses: expected when idle or after the last answer page expires. Transcript, notes and errors are intentionally phone-only. Ask local/global help to generate fresh output.
-- Session context limit: start a new session when the explicit 96,000-byte warning appears; the app will not quietly truncate old captured speech.
+- Session context limit (v0.15): past 96,000 bytes of captured speech the oldest lines roll off and the session keeps running. There is no on-screen notice when this happens; the saved transcript in History is complete.
 - Network failure on a real phone: verify the direct provider request and Even App network permissions. Do not silently introduce a proxy as a workaround.
 - Notes say “Captured this session”: these notes are session-only. Automatic Omi sync is not available; History import separately saves Omi conversations on this phone.
 

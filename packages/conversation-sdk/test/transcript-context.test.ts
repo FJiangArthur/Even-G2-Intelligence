@@ -13,10 +13,12 @@ it("retains the session independently of recent focus and retrieves relevant ear
   expect(context.background("global")).not.toContain("Who owns delivery?");
 });
 
-it("counts UTF-8 bytes and rejects overflow without silently losing committed text", () => {
+// v0.15: the 96,000-byte limit is a rolling window, not a session-ending error.
+it("counts UTF-8 bytes and rolls the oldest line off at the limit instead of throwing", () => {
   const context = new TranscriptContext();
   expect(context.global()).toBe("");
   context.append("界".repeat(32000));
-  expect(() => context.append("a")).toThrow("context-limit");
   expect(context.global()).toBe("界".repeat(32000));
+  expect(() => context.append("a")).not.toThrow();
+  expect(context.global()).toBe("a");
 });

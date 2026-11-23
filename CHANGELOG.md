@@ -2,6 +2,68 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
+## v0.15.1 — Even Hub SDK 0.0.16 (timer fix reported by Even Realities as the cause of the iPhone freeze)
+
+An Even Realities engineer reported the cause of the iPhone freeze and the white page after unlock: a defect in the timer implementation inside `@evenrealities/even_hub_sdk` 0.0.14. They repacked this plugin with SDK 0.0.16 and ran it in the background for 10 minutes with no freeze and no white page. The SDK 0.0.16 changelog reads "Fixed repeated execution of `setTimeout` / `setInterval` callbacks".
+
+- `@evenrealities/even_hub_sdk` 0.0.14 -> 0.0.16. No plugin source changed.
+- Minimum Even App is now 2.2.10 (required since SDK 0.0.15).
+- Not verified by us: the fix on our own phone, and whether the mic probe (`mic-probe.ts`), which watches an SDK-internal entry point found in 0.0.14, still sees audio in 0.0.16. The probe is passive; if the entry point moved it reports `none` and nothing else is affected.
+- The earlier explanation in this file (page heap growth from the saved-knowledge search) was a hypothesis and is superseded. A timer callback running repeatedly fits the same evidence: per-call cost that steps up and never recovers, and a heap of hundreds of MB.
+
+Gate: conversation-sdk 635, gateway 104, g2-plugin 516 passed + 1 skipped.
+
+## v0.15.0 — hang prevention, microphone on-time, long-session cost
+
+Nothing in this release was run on real glasses, an iPhone or a live provider. Every change is covered by unit tests on fakes (fake socket, fake bridge, fake timers). None of it is confirmed as the cause of the iPhone freeze described under v0.12.x; that root cause is still open.
+
+How it was produced: five audit agents (microphone path, hangs, rendering, memory, network) each followed by a verifier that tried to refute the findings, then six implementation agents in separate worktrees, each followed by an independent reviewer and a fix pass. 37 findings were verified (many duplicates); the reviewers found 14 further problems in the first fixes, all handled.
+
+**Speech-to-text connection**
+- After five failed reconnects, every 100 ms audio batch used to start a new connection attempt and a new error event (about ten a second, microphone open). Now the outage is reported once and retried every 30 s; coming back to the page retries at once.
+- 10 s deadline on the token request and on the socket handshake. Before, a stalled connect stopped captions for good with no error.
+- A turn the server never acknowledges or never finishes no longer blocks every later caption: the socket is replaced after 10 s without acknowledgement, and a turn with no result after 15 s is delivered with what was streamed. Deadlines start only once the commit has left the send buffer.
+- Audio is skipped while more than 1 MB waits in the socket send buffer; audio queued while disconnected is capped at the newest 30 s and dropped when the turn was cleared.
+
+**Microphone**
+- The microphone pauses after 10 minutes with no detected speech (realtime transcription only), with `PAUSED · NO SPEECH · TAP TO RESUME` on the phone. There is no Setup switch yet; `MIC_IDLE_PAUSE_MS` in `controller.ts`.
+- Stop, Pause, Connect and Exit no longer wait without limit on the host's microphone reply (2 s on teardown, 5 s on open). A close that got no reply is sent once more after the session is released.
+- The close is sent from `pagehide` as well as `beforeunload`.
+- Audio that keeps arriving while the app considers the microphone off is detected and the close is sent again. An open that got no reply is checked: if no audio arrives it is retried once, then reported.
+- Coming back from the background re-opens the microphone before the glasses page is pushed again, not after.
+- Not done on purpose: pausing when the glasses report "not worn" or "in case". Host semantics are unverified on hardware and a wrong report would stop a live conversation.
+
+**Glasses display**
+- Every bridge write has a deadline (15 s text, 20 s image and page). One write that never answered used to halt the whole write queue. A text answer that arrives late is still accepted for 30 s, so slow links do not cause resends.
+- The diagnostics mirror recovers after an unanswered storage write instead of switching itself off.
+- Answer text on the glasses is rate-limited while its first page streams, like captions.
+
+**History**
+- Saving a line no longer copies and sorts the whole session list twice; the index is written when a session changes, not every 10 s.
+- Storage writes have a deadline. A lost reply keeps a live session's pending lines and retries; Stop no longer hangs behind it.
+
+**Phone page**
+- Feed signatures no longer serialise every answer's saved-knowledge sources on every render; hidden panels are not rebuilt; the glasses mirror is not redrawn while off screen.
+- A long single-speaker stretch is split into paragraphs (12 lines, then two-minute windows) so one paragraph is not re-laid-out on every partial.
+
+**Long sessions**
+- The session used to end with a fatal `context-limit` error at 96,000 bytes of transcript (roughly 100–130 minutes of speech). Now the oldest speech rolls off.
+- Automatic answers and typed questions carry the newest 20,000 characters instead of the whole transcript; an explicit whole-session ask still sends everything. The request tells the model when earlier speech is not included. Side effect: "Ask about <name>" on the People panel sees only the newest 20,000 characters in long sessions.
+- A failing copilot analysis backs off instead of retrying every 8 s.
+
+**Left out**
+- Soniox upload pacing (needs the provider's ingest limits checked with a real key).
+- Background lanes yielding to a live answer (kept as a design choice).
+- A notice on the phone when old speech rolls off.
+
+Gate: conversation-sdk 635, gateway 104, g2-plugin 516 passed + 1 skipped.
+
+**Device-only gates**
+- That WKWebView reports `bufferedAmount` falling as data leaves the page (the send-buffer rules rely on it).
+- That the host tolerates a second `audioControl(true)` while the first is still queued.
+- Whether a quiet room really reaches 10 minutes without a transcript event, and whether the pause notice is readable on the glasses.
+- That the provider acknowledges a commit within 10 s under normal load; if not, the new rule reconnects needlessly.
+
 ## v0.14.0 — interview reliability: Candidate mode, answer queue, suggested questions on the glasses, scenario harness
 
 Nothing in this release was run on real glasses or against a live provider. Numbers come from the scripted interview harness (`apps/g2-plugin/qa/interview.html`, `tests/interview-scenario.test.ts`): the real controller, display and transport on a fake bridge and a fake provider.

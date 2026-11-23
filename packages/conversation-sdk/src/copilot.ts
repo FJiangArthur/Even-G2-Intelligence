@@ -1,7 +1,7 @@
 import type {
   Citation, CopilotAsk, CopilotCallbacks, CopilotClaim, CopilotConcept, CopilotConflict, CopilotPerson, CopilotSettings, CopilotSuggestion, CopilotSummary, UsageKind, UsageRecord, VerificationResult,
 } from "./copilot-types.js";
-import { directFetch, OPENAI_BASE, parseResponseOutput, stripCitationMarkers, type DirectFetch } from "./direct-providers.js";
+import { directFetch, DirectProviderError, OPENAI_BASE, parseResponseOutput, stripCitationMarkers, type DirectFetch } from "./direct-providers.js";
 import { answerModelInfo, liveReasoningEffort, usageRecord, type RawUsage } from "./model-catalog.js";
 import { DEFAULT_FACT_CHECK_MODEL, NO_WEB_SEARCH_MESSAGE, verifyClaim } from "./fact-check.js";
 import { answerLengthProfile } from "./answer-length.js";
@@ -40,6 +40,10 @@ const ASK_QUEUE = 3, MAX_VERIFICATIONS = 2, MAX_STORED = 200, MAX_PEOPLE = 200, 
 export const SUGGESTION_TTL_MS = 180_000;
 /** A reply that is not valid JSON is re-analysed this many times before its speech is skipped. */
 const MAX_BAD_REPLY_RETRIES = 2;
+/** Longest wait between analysis attempts while requests keep failing. */
+const MAX_FAILURE_COOLDOWN_MS = 120_000;
+/** Failures that the same request cannot get past. */
+const NO_RETRY_CODES: readonly string[] = ["provider-authentication", "provider-billing", "model-access"];
 /** Share of a suggestion's content words that must be heard in one sentence for it to count as asked. */
 const ASKED_OVERLAP = 0.7;
 /** Pronouns, speaker labels, teams and generic roles are never people. */
@@ -217,6 +221,8 @@ export class ConversationCopilot {
   private expiryTimer?: ReturnType<typeof setTimeout>;
   /** Replies in a row that were not valid JSON. */
   private badReplies = 0;
+  /** Analysis requests in a row that failed (network, HTTP error, timeout); lengthens the cooldown. */
+  private failures = 0;
   private readonly askQueue: CopilotAsk[] = [];
   private askActive?: AbortController;
   private readonly verifications = new Set<AbortController>();
@@ -247,6 +253,12 @@ export class ConversationCopilot {
     if (live) this.syncSuggestionMode(live.mode);
     this.pruneSuggestions();
     this.markAsked(clean, role);
+    if (this.failures) {
+      // New speech ends the failure back-off: wait at most one base cooldown from now.
+      this.failures = 0;
+      const soonest = Date.now() + (this.options.cooldownMs ?? 8000);
+      if (this.nextAt > soonest) { this.nextAt = soonest; clearTimeout(this.timer); this.timer = undefined; }
+    }
     this.pump();
   }
   /** Bypasses cooldown; still one active request. */
@@ -311,7 +323,7 @@ export class ConversationCopilot {
     this.verifications.clear();
     clearTimeout(this.timer); this.timer = undefined; this.immediate = false;
     clearTimeout(this.expiryTimer); this.expiryTimer = undefined;
-    this.processed = this.lines.length; this.badReplies = 0;
+    this.processed = this.lines.length; this.badReplies = 0; this.failures = 0;
   }
 
   // ---- suggestions lifecycle: asked, expired, mode change ----
@@ -420,6 +432,7 @@ export class ConversationCopilot {
     const epoch = this.epoch, target = this.lines.length;
     const current = () => this.active === controller && epoch === this.epoch && !controller.signal.aborted;
     const timer = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
+    let failed = false;
     try {
       const settings = this.settings();
       if (!settings) return;
@@ -462,10 +475,22 @@ export class ConversationCopilot {
       const parsed = parseResponseOutput(value);
       this.report("copilot", model, parsed.usage, body, parsed.text, parsed.webSearchCalls);
       this.settle(this.apply(settings, parsed.text, target, notebook, model), target);
-    } catch { /* Optional lane: errors are nonfatal; unprocessed speech is retried after cooldown. */ }
+    } catch (error) {
+      // Optional lane: errors are nonfatal. Unprocessed speech is retried after a cooldown that doubles per
+      // failure in a row; a rejected key, exhausted balance or unavailable model is not retried for this speech.
+      failed = true;
+      if (this.active === controller && epoch === this.epoch && error instanceof DirectProviderError && NO_RETRY_CODES.includes(error.code)) {
+        this.processed = Math.max(this.processed, Math.min(target, this.lines.length));
+      }
+    }
     finally {
       clearTimeout(timer);
-      if (this.active === controller) { this.active = undefined; this.nextAt = Date.now() + (this.options.cooldownMs ?? 8000); this.pump(); }
+      if (this.active === controller) {
+        this.active = undefined;
+        this.failures = failed ? this.failures + 1 : 0;
+        this.nextAt = Date.now() + Math.min((this.options.cooldownMs ?? 8000) * 2 ** Math.min(this.failures, 10), MAX_FAILURE_COOLDOWN_MS);
+        this.pump();
+      }
     }
   }
   /**

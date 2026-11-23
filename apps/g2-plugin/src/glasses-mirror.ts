@@ -115,35 +115,54 @@ export function mirrorImageMarkup(key: string): string {
 }
 
 /**
- * Renders (or re-renders) the mirror into `container`, replacing its children. Without a
- * mirror it draws an empty, dimmed display. Returns the <svg> element.
+ * Renders (or re-renders) the mirror into `container`. Without a mirror it draws an empty, dimmed
+ * display. Returns the <svg> element. The <svg> and the pixel-art <g> groups of an earlier call are
+ * kept (a group is rebuilt only when its image key or slot changed); only the boxes and text lines
+ * are replaced, so a caption or body change does not re-parse the art.
  */
 export function renderGlassesMirror(container: HTMLElement, mirror?: HudMirror): SVGSVGElement {
   const document = container.ownerDocument;
-  const svg = document.createElementNS(SVG_NS, "svg");
-  svg.setAttribute("viewBox", "0 0 576 288");
-  svg.setAttribute("class", "glasses-mirror");
-  svg.setAttribute("role", "img");
-  svg.setAttribute("style", "display:block;width:100%;height:auto;background:#000;border-radius:10px");
+  const current = container.firstElementChild;
+  const reused = container.childElementCount === 1 && current?.localName === "svg" && current.getAttribute("class") === "glasses-mirror";
+  const svg = reused ? current as SVGSVGElement : document.createElementNS(SVG_NS, "svg");
+  if (!reused) {
+    svg.setAttribute("viewBox", "0 0 576 288");
+    svg.setAttribute("class", "glasses-mirror");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("style", "display:block;width:100%;height:auto;background:#000;border-radius:10px");
+  }
+  // Image groups already in the svg, by image key + position.
+  const groups = new Map<string, Element>();
+  if (reused) for (const child of [...svg.children]) {
+    const key = child.getAttribute("data-image");
+    if (key !== null) groups.set(`${key} ${child.getAttribute("transform")}`, child);
+  }
+  const nodes: Element[] = [];
   const add = (name: string, attributes: Record<string, string | number>, text?: string) => {
     const element = document.createElementNS(SVG_NS, name);
     for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
     if (text !== undefined) element.textContent = text;
-    svg.append(element);
+    nodes.push(element);
     return element;
   };
+  const commit = () => {
+    svg.replaceChildren(...nodes);
+    if (!reused) container.replaceChildren(svg);
+    return svg;
+  };
+  const flag = (name: string, value: string | undefined) => { if (value === undefined) svg.removeAttribute(name); else svg.setAttribute(name, value); };
   add("rect", { x: 0, y: 0, width: 576, height: 288, rx: 10, fill: "#000" });
   if (!mirror) {
     svg.setAttribute("aria-label", "Glasses display (not connected)");
+    flag("data-view", undefined); flag("data-menu", undefined); flag("data-ambient", undefined);
     add("text", { x: 288, y: 150, "text-anchor": "middle", fill: GREEN[2], "font-size": 20, "font-family": "system-ui, sans-serif" }, "glasses not connected");
-    container.replaceChildren(svg);
-    return svg;
+    return commit();
   }
   const model = glassesMirrorModel(mirror);
   svg.setAttribute("aria-label", model.label);
-  svg.dataset.view = model.view;
-  svg.dataset.menu = String(model.menuOpen);
-  if (mirror.ambient) svg.dataset.ambient = "true";
+  flag("data-view", model.view);
+  flag("data-menu", String(model.menuOpen));
+  flag("data-ambient", mirror.ambient ? "true" : undefined);
   const body = HUD_FRAME;
   // The one BODY box: border width and grey level as on the glasses (2 px, level 9). The ambient page has no box.
   if (!mirror.ambient) add("rect", { x: body.xPosition + body.borderWidth / 2, y: body.yPosition + body.borderWidth / 2, width: body.width - body.borderWidth, height: body.height - body.borderWidth,
@@ -152,7 +171,10 @@ export function renderGlassesMirror(container: HTMLElement, mirror?: HudMirror):
     const box = HUD_IMAGES[image.slot];
     // Image containers are opaque on G2: black first, then the art.
     add("rect", { x: box.xPosition, y: box.yPosition, width: box.width, height: box.height, fill: "#000" });
-    const group = add("g", { transform: `translate(${box.xPosition} ${box.yPosition})`, "shape-rendering": "crispEdges", "data-image": image.key });
+    const transform = `translate(${box.xPosition} ${box.yPosition})`;
+    const kept = groups.get(`${image.key} ${transform}`);
+    if (kept) { nodes.push(kept); continue; }
+    const group = add("g", { transform, "shape-rendering": "crispEdges", "data-image": image.key });
     group.innerHTML = mirrorImageMarkup(image.key);
   }
   if (model.highlight) {
@@ -166,6 +188,5 @@ export function renderGlassesMirror(container: HTMLElement, mirror?: HudMirror):
       style: "white-space:pre", textLength: line.width, lengthAdjust: "spacingAndGlyphs", ...(line.anchor === "end" ? { "text-anchor": "end" } : {}),
       ...(line.highlight ? { "font-weight": 600 } : {}) }, line.text);
   }
-  container.replaceChildren(svg);
-  return svg;
+  return commit();
 }

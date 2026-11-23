@@ -46,7 +46,7 @@ Code and release records were committed on the existing main checkout per the us
 
 ## Acceptance boundaries
 
-“Global” is the whole captured transcript in the current session, not unrelated past conversations or private files. Local focus is recent sentences with relevant earlier background. The raw session context has an explicit size ceiling; exceeding it must be visible rather than silently dropping the beginning.
+“Global” is the whole captured transcript in the current session, not unrelated past conversations or private files. Local focus is recent sentences with relevant earlier background. The raw session context has a size ceiling of 96,000 bytes. Since v0.15 the beginning rolls off at the ceiling and the model is told that earlier speech is not included; before v0.15 the session ended with an error.
 
 Whisper `whisper-1` produces completed audio-clip transcripts, not word-by-word streaming. Phone updates should arrive as each bounded segment is transcribed; real provider partial events, when available, are phone-only. Cloud AI still requires internet; Helix itself has no server.
 

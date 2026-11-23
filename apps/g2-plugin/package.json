@@ -9,10 +9,10 @@
     "test": "vitest run",
     "preview": "vite preview",
     "simulate": "evenhub-simulator http://localhost:5173 --automation-port 9898",
-    "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.14 -o helix-g2.ehpk"
+    "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.16 -o helix-g2.ehpk"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "0.0.14",
+    "@evenrealities/even_hub_sdk": "0.0.16",
     "@helix/conversation-sdk": "0.7.0",
     "pdfjs-dist": "4.10.38"
   },
