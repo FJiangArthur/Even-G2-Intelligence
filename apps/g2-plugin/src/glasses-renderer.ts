@@ -17,6 +17,12 @@ export const GLASSES_CONTAINER_NAME = "helix-main";
 const MIN_RENDER_DEBOUNCE_MS = 120;
 /** v0.15: how long a glasses write may stay unanswered before it counts as failed (the Even bridge has no timeout of its own). */
 export const TEXT_WRITE_DEADLINE_MS = 15_000, PAGE_WRITE_DEADLINE_MS = 20_000;
+/**
+ * How long after it was started an unanswered text write may still be answered before the same text
+ * is sent again. On a link whose answers are steadily later than the deadline the write did reach the
+ * glasses: the HUD goes on with the other containers and takes the late answer when it comes.
+ */
+export const TEXT_LATE_ANSWER_MS = 30_000;
 /** Pause before the next write after an unanswered one: 5 s, doubling to 30 s while it keeps happening. */
 export const WRITE_TIMEOUT_BACKOFF_MS = 5000, WRITE_TIMEOUT_BACKOFF_MAX_MS = 30_000;
 export function writeTimeoutBackoff(consecutive: number): number {

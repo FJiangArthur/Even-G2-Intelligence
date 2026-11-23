@@ -52,7 +52,7 @@ import type { CopilotClaim, CopilotConcept, CopilotSuggestion, HudMirror, Verifi
 import { AnswerPager, pageReadingMs, paginateAnswer, type PageLayout } from "./answer-pager";
 import { blankImage, centeredImage, drawBitmap, encodeGrayPng, type GrayImage } from "./glasses-image";
 import { ICONS, MASCOT_FRAMES, modeIcon, textBitmap, type MascotState } from "./pixel-art";
-import { BridgeTimeoutError, PAGE_WRITE_DEADLINE_MS, TEXT_WRITE_DEADLINE_MS, withDeadline, writeTimeoutBackoff } from "./glasses-renderer";
+import { BridgeTimeoutError, PAGE_WRITE_DEADLINE_MS, TEXT_LATE_ANSWER_MS, TEXT_WRITE_DEADLINE_MS, withDeadline, writeTimeoutBackoff } from "./glasses-renderer";
 import type { GlassesConversationState, GlassesRenderBridge } from "./glasses-renderer";
 import { FEED_LIMIT } from "./presentation";
 import type { FeedItem, PresentationSnapshot } from "./presentation";
@@ -704,6 +704,14 @@ export class GlassesHud implements GlassesSurface {
   private timeoutUntil = 0;
   private timeoutTimer?: ReturnType<typeof setTimeout>;
   private repushOwed = false;
+  // A text write that passed its deadline may still be answered (a link that is steadily slower than the
+  // deadline). Until TEXT_LATE_ANSWER_MS after its start the same text is not sent again, and a late
+  // "accepted" counts as sent. `writeSeq` orders the writes; `sentSeq` is the newest one each container shows.
+  private readonly awaited = new Map<PanelKey, { content: string; seq: number; until: number }>();
+  private readonly sentSeq = new Map<PanelKey, number>();
+  private writeSeq = 0;
+  /** Unanswered writes whose outcome is still unknown; at 0 no re-push is owed. */
+  private unknownWrites = 0;
   /** True while render() runs ingest(): the pager callback leaves the refresh to render(). */
   private ingesting = false;
   /** What ingest() last handed to the pager; an unchanged answer is not handed over again. */
@@ -2180,6 +2188,7 @@ export class GlassesHud implements GlassesSurface {
       for (const key of PANEL_ORDER) {
         if (key === "views" && target === "menu") continue;
         this.sent.set(key, panelText(frame, key)); this.sentAt.set(key, at);
+        this.sentSeq.set(key, this.writeSeq); this.awaited.delete(key); // a late answer to an older text write no longer counts
       }
       if (target === "menu") this.sent.set("views", frame.views); // the list is in its place
       this.imagesSent.clear(); // rebuilt image containers start empty
@@ -2211,7 +2220,10 @@ export class GlassesHud implements GlassesSurface {
     let interval = this.slowUntil > this.now() ? Math.max(this.intervals[key], key === "caption" ? SLOW_CAPTION_MS : SLOW_PANEL_MS) : this.intervals[key];
     // A streaming answer changes at every token: a few body writes per page are enough.
     if (key === "body" && this.pager.text && this.pager.isStreaming) interval = Math.max(interval, STREAMING_BODY_MS);
-    return Math.max(since + this.debounce, (this.sentAt.get(key) ?? 0) + interval, this.blockedUntil);
+    const due = Math.max(since + this.debounce, (this.sentAt.get(key) ?? 0) + interval, this.blockedUntil);
+    // This very text is on its way in a write that passed its deadline: wait for the late answer first.
+    const awaited = this.awaited.get(key);
+    return awaited && awaited.content === panelText(this.frameValue, key) ? Math.max(due, awaited.until) : due;
   }
 
   private schedule(): void {
@@ -2252,15 +2264,25 @@ export class GlassesHud implements GlassesSurface {
           if (panelText(this.frameValue, key) !== content) continue; // changed while waiting: next pass sends the newer text
         }
         const startedAt = this.now();
-        const accepted = await withDeadline(this.bridge.textContainerUpgrade(new TextContainerUpgrade({
+        const seq = ++this.writeSeq;
+        this.awaited.delete(key); // a newer write of this container replaces the one still waited for
+        const call = this.bridge.textContainerUpgrade(new TextContainerUpgrade({
           containerID: panel.containerID, containerName: panel.containerName, content,
-        })), TEXT_WRITE_DEADLINE_MS, `${panel.containerName} text update`);
+        }));
+        let accepted: boolean;
+        try {
+          accepted = await withDeadline(call, TEXT_WRITE_DEADLINE_MS, `${panel.containerName} text update`);
+        } catch (error) {
+          if (error instanceof BridgeTimeoutError && generation === this.generation) this.awaitLateAnswer(key, content, seq, startedAt, call, generation);
+          throw error;
+        }
         this.nextWriteAt = this.now() + this.writeGap;
         this.noteLatency("text", this.now() - startedAt);
         if (generation !== this.generation) return;
         if (!accepted) throw new Error(`G2 rejected the ${panel.containerName} text update`);
         this.sent.set(key, content);
         this.sentAt.set(key, this.now());
+        this.sentSeq.set(key, seq);
         if (panelText(this.frameValue, key) === content) this.dirtySince.delete(key);
         else this.dirtySince.set(key, this.now());
         if (this.writeAnswered()) return; // the re-push carries every container
@@ -2276,8 +2298,43 @@ export class GlassesHud implements GlassesSurface {
   }
 
   /**
-   * A glasses write got no answer within its deadline: it counts as failed (nothing is marked as sent,
-   * a late answer is ignored). All writes pause for a growing back-off, so retries do not add a call per
+   * A text write passed its deadline. The call cannot be cancelled and on a link that is steadily slower
+   * than the deadline it still arrives: the same text is held back until TEXT_LATE_ANSWER_MS after the
+   * write started (the queue goes on with the other containers after the back-off), and an "accepted"
+   * that comes late marks the container as sent. Without this the first changed container would be sent
+   * again after every back-off and the ones behind it never.
+   */
+  private awaitLateAnswer(key: PanelKey, content: string, seq: number, startedAt: number, call: Promise<boolean>, generation: number): void {
+    this.awaited.set(key, { content, seq, until: startedAt + TEXT_LATE_ANSWER_MS });
+    const settled = (accepted: boolean): void => {
+      if (this.awaited.get(key)?.seq === seq) this.awaited.delete(key);
+      if (this.disposed || generation !== this.generation) return;
+      if (!accepted || !this.initialized || seq <= (this.sentSeq.get(key) ?? 0)) { this.schedule(); return; }
+      const now = this.now();
+      this.sent.set(key, content);
+      this.sentAt.set(key, now);
+      this.sentSeq.set(key, seq);
+      if (panelText(this.frameValue, key) === content) this.dirtySince.delete(key);
+      else if (!this.dirtySince.has(key)) this.dirtySince.set(key, now);
+      recordDiagnostic("bridge-timeout", `${HUD_PANELS[key].containerName} text update answered late · ${((now - startedAt) / 1000).toFixed(1)} s`);
+      // The link answers: the back-off ends, and with no write left unknown no re-push is owed.
+      this.timeouts = 0;
+      if (this.blockedUntil <= this.timeoutUntil) this.blockedUntil = Math.min(this.blockedUntil, now);
+      this.timeoutUntil = 0;
+      this.unknownWrites = Math.max(0, this.unknownWrites - 1);
+      if (!this.unknownWrites) this.repushOwed = false;
+      if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+      this.timeoutTimer = undefined;
+      if (this.timer) clearTimeout(this.timer); // it was set for the end of the back-off
+      this.timer = undefined;
+      try { this.refresh(); } catch (cause) { this.reportRenderError(cause); }
+    };
+    call.then(settled, () => settled(false));
+  }
+
+  /**
+   * A glasses write got no answer within its deadline: it counts as failed (nothing is marked as sent;
+   * only a text write may still be answered late, see awaitLateAnswer). All writes pause for a growing back-off, so retries do not add a call per
    * deadline to a host that is already behind, and the HUD goes into its lighter mode.
    */
   private writeUnanswered(kind: "text" | "image" | "page", error: BridgeTimeoutError): void {
@@ -2286,6 +2343,7 @@ export class GlassesHud implements GlassesSurface {
     this.timeoutUntil = now + wait;
     this.blockedUntil = Math.max(this.blockedUntil, this.timeoutUntil);
     this.repushOwed = true;
+    this.unknownWrites += 1;
     recordDiagnostic("bridge-timeout", `${error.message} · next glasses write in ${wait / 1000} s`);
     if (kind === "text") this.noteLatency(kind, TEXT_WRITE_DEADLINE_MS); // image and page writes report their own duration
     // Page swaps wait for the back-off too; this wakes them (and the text queue) when it is over.
@@ -2300,6 +2358,7 @@ export class GlassesHud implements GlassesSurface {
   /** The glasses answered a write. After unanswered ones, redraw the whole page once (returns true then). */
   private writeAnswered(): boolean {
     this.timeouts = 0;
+    this.unknownWrites = 0;
     if (!this.repushOwed) return false;
     this.repushOwed = false;
     if (this.disposed || !this.initialized || !this.bridge.rebuildPageContainer) return false;
