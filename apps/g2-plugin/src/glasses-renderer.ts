@@ -15,6 +15,30 @@ import { SHORTCUT_ACTIONS } from "./shortcut-actions";
 export const GLASSES_CONTAINER_ID = 1;
 export const GLASSES_CONTAINER_NAME = "helix-main";
 const MIN_RENDER_DEBOUNCE_MS = 120;
+/** v0.15: how long a glasses write may stay unanswered before it counts as failed (the Even bridge has no timeout of its own). */
+export const TEXT_WRITE_DEADLINE_MS = 15_000, PAGE_WRITE_DEADLINE_MS = 20_000;
+/**
+ * How long after it was started an unanswered text write may still be answered before the same text
+ * is sent again. On a link whose answers are steadily later than the deadline the write did reach the
+ * glasses: the HUD goes on with the other containers and takes the late answer when it comes.
+ */
+export const TEXT_LATE_ANSWER_MS = 30_000;
+/** Pause before the next write after an unanswered one: 5 s, doubling to 30 s while it keeps happening. */
+export const WRITE_TIMEOUT_BACKOFF_MS = 5000, WRITE_TIMEOUT_BACKOFF_MAX_MS = 30_000;
+export function writeTimeoutBackoff(consecutive: number): number {
+  return Math.min(WRITE_TIMEOUT_BACKOFF_MAX_MS, WRITE_TIMEOUT_BACKOFF_MS * 2 ** Math.max(0, Math.min(8, consecutive - 1)));
+}
+export class BridgeTimeoutError extends Error {}
+/**
+ * `promise`, or a BridgeTimeoutError when it has not settled after `ms`. The call itself cannot be
+ * cancelled; a late answer is ignored.
+ */
+export function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new BridgeTimeoutError(`G2 did not answer the ${what} within ${Math.round(ms / 1000)} s`)), ms);
+    Promise.resolve(promise).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
+  });
+}
 
 export interface GlassesRenderBridge {
   createStartUpPageContainer(container: CreateStartUpPageContainer): Promise<StartUpPageCreateResult>;
@@ -75,6 +99,9 @@ export class GlassesRenderer {
   private generation = 0;
   private initializing?: Promise<void>;
   private inFlight?: Promise<void>;
+  /** v0.15: no scheduled write before this time (set after an unanswered write). */
+  private blockedUntil = 0;
+  private timeouts = 0;
   private cueTimer?: ReturnType<typeof setTimeout>;
   private cueText = "";
   private cueId?: string;
@@ -144,7 +171,7 @@ export class GlassesRenderer {
     this.timer = globalThis.setTimeout(() => {
       this.timer = undefined;
       void this.flush();
-    }, this.debounceMs);
+    }, Math.max(this.debounceMs, this.blockedUntil - Date.now()));
   }
 
   public flush(): Promise<void> {
@@ -170,19 +197,22 @@ export class GlassesRenderer {
       for (const panel of frame) {
         if (!this.initialized || generation !== this.generation) return;
         if (this.lastRendered.get(panel.containerID) === panel.content) continue;
-        const updated = await this.bridge.textContainerUpgrade(
+        const updated = await withDeadline(this.bridge.textContainerUpgrade(
           new TextContainerUpgrade({
             containerID: panel.containerID,
             containerName: panel.containerName,
             content: panel.content,
           }),
-        );
+        ), TEXT_WRITE_DEADLINE_MS, `${panel.containerName} text update`);
         if (generation !== this.generation) return;
+        this.timeouts = 0;
         if (!updated) throw new Error(`G2 rejected the ${panel.containerName} text update`);
         this.lastRendered.set(panel.containerID, panel.content);
       }
     } catch (error) {
       if (generation === this.generation) {
+        // Unanswered: wait before the next write so retries do not pile up in a backed-up host.
+        if (error instanceof BridgeTimeoutError) this.blockedUntil = Date.now() + writeTimeoutBackoff(++this.timeouts);
         this.options.onError?.(error instanceof Error ? error : new Error(String(error)));
       }
     }
