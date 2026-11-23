@@ -163,6 +163,10 @@ export class CompanionUi {
   private lastTouchAt = Number.NEGATIVE_INFINITY;
   private lastHud?: { readonly view: string; readonly lastGesture?: string };
   private mirrorSignature = "";
+  /** The mirror screen is scrolled out of view (IntersectionObserver; stays false where there is none). */
+  private mirrorOffscreen = false;
+  /** A frame changed while the mirror was off screen: repaint when it comes back. */
+  private mirrorStale = false;
   private loadModePrompt?: () => void;
   private controller?: G2ConversationController;
   private actions?: CompanionUiActions;
@@ -178,7 +182,7 @@ export class CompanionUi {
     string,
     { readonly element: HTMLElement; signature: string }
   >();
-  private readonly panelSignatures = new Map<string, string>();
+  private readonly panelGate = new PanelGate();
   private activeTab: CompanionTab = "answers";
   private lastSnapshot?: PresentationSnapshot;
   private lastPeekSeq = 0;
@@ -376,6 +380,18 @@ export class CompanionUi {
       if (this.lastSnapshot) this.renderMirror(this.lastSnapshot);
     };
     try { if (globalThis.localStorage?.getItem(MIRROR_OPEN_KEY) === "false") setMirrorOpen(false); } catch { /* storage unavailable */ }
+    // The page is one scroller: while the mirror is scrolled away its screen is not rebuilt.
+    if (typeof IntersectionObserver === "function") {
+      new IntersectionObserver(entries => {
+        const entry = entries[entries.length - 1];
+        if (!entry) return;
+        this.mirrorOffscreen = !entry.isIntersecting;
+        if (!entry.isIntersecting || !this.mirrorStale) return;
+        this.mirrorStale = false;
+        this.mirrorSignature = "";
+        if (this.lastSnapshot) this.renderMirror(this.lastSnapshot);
+      }).observe(this.element("mirror-screen"));
+    }
     this.button("mirror-toggle").addEventListener("click", () => {
       const open = this.element("mirror").dataset.open !== "true";
       setMirrorOpen(open);
@@ -508,6 +524,8 @@ export class CompanionUi {
       this.element(`panel-${definition.id}`).hidden = !selected;
     }
     this.root.querySelector<HTMLElement>(".shell")?.setAttribute("data-tab", tab);
+    // A copilot panel is not built while hidden: bring it up to date before it is measured.
+    if (this.lastSnapshot && this.panelGate.isStale(tab)) this.renderCopilotPanel(tab, this.lastSnapshot);
     this.alignPanel(tab, previousTab);
     this.revealTab(tab);
     if (tab === "history") this.historyPanel?.refresh();
@@ -570,10 +588,7 @@ export class CompanionUi {
     this.renderHud(snapshot);
     this.renderMirror(snapshot);
     this.renderFeed(snapshot, connected, connecting);
-    this.renderPanel("concepts", snapshot, () => this.renderConcepts(snapshot));
-    this.renderPanel("summary", snapshot, () => this.renderSummary(snapshot));
-    this.renderPanel("qa", snapshot, () => this.renderQa(snapshot, connected));
-    this.renderPanel("checks", snapshot, () => this.renderChecks(snapshot));
+    for (const tab of COPILOT_PANELS) this.renderCopilotPanel(tab, snapshot);
     this.peoplePanel?.renderLive(snapshot);
     this.followGlasses(snapshot);
     this.renderBadges(snapshot);
@@ -585,6 +600,7 @@ export class CompanionUi {
   private renderMirror(snapshot: PresentationSnapshot): void {
     const hud = snapshotHud(snapshot);
     const strip = this.element("mirror");
+    const stripWasHidden = strip.hidden;
     strip.hidden = !hud;
     if (!hud) return;
     const open = strip.dataset.open === "true";
@@ -596,8 +612,11 @@ export class CompanionUi {
     const firstBody = hud.body.split("\n").map(line => line.replace(/^▶\s*/u, "").trim()).find(Boolean);
     this.element("mirror-line").textContent = oneLine(firstBody || hud.caption || hud.header || "");
     const screen = this.element("mirror-screen");
+    const wasHidden = stripWasHidden || screen.hidden;
     screen.hidden = !open;
     if (!open) return;
+    this.mirrorStale = !shouldPaintMirror({ offscreen: this.mirrorOffscreen, wasHidden, painted: screen.childElementCount > 0 });
+    if (this.mirrorStale) return;
     if (MIRROR.renderGlassesMirror) {
       try { MIRROR.renderGlassesMirror(screen, hud); return; } catch { /* fall back to the text mirror */ }
     }
@@ -1206,10 +1225,17 @@ export class CompanionUi {
   /* ---------------------------------------------------- copilot tabs */
 
   private renderPanel(tab: CompanionTab, snapshot: PresentationSnapshot, build: () => Node[]): void {
-    const signature = panelSignature(tab, snapshot);
-    if (this.panelSignatures.get(tab) === signature) return;
-    this.panelSignatures.set(tab, signature);
+    if (!this.panelGate.due(tab, tab === this.activeTab, () => panelSignature(tab, snapshot))) return;
     this.element(`${tab}-content`).replaceChildren(...build());
+  }
+  private renderCopilotPanel(tab: CompanionTab, snapshot: PresentationSnapshot): void {
+    switch (tab) {
+      case "concepts": this.renderPanel(tab, snapshot, () => this.renderConcepts(snapshot)); break;
+      case "summary": this.renderPanel(tab, snapshot, () => this.renderSummary(snapshot)); break;
+      case "qa": this.renderPanel(tab, snapshot, () => this.renderQa(snapshot, ACTIVE.includes(snapshot.status))); break;
+      case "checks": this.renderPanel(tab, snapshot, () => this.renderChecks(snapshot)); break;
+      default: break;
+    }
   }
 
   private renderConcepts(snapshot: PresentationSnapshot): Node[] {
@@ -2090,10 +2116,42 @@ export function mascotStateFor(snapshot: Pick<PresentationSnapshot, "status" | "
   return "idle";
 }
 
-function panelSignature(tab: CompanionTab, snapshot: PresentationSnapshot): string {
+/** Copilot tabs whose content is built from the snapshot (renderPanel). */
+const COPILOT_PANELS = ["concepts", "summary", "qa", "checks"] as const satisfies readonly CompanionTab[];
+
+/**
+ * Decides when a copilot panel is rebuilt. A hidden tab's panel is neither signed nor built: it is
+ * marked stale and built when the tab is shown. A shown one is built when its signature changed.
+ */
+export class PanelGate {
+  private readonly signatures = new Map<string, string>();
+  private readonly stale = new Set<string>();
+  /** True when the panel must be rebuilt now. `signature` is only called for a shown tab. */
+  public due(tab: string, shown: boolean, signature: () => string): boolean {
+    if (!shown) { this.stale.add(tab); return false; }
+    this.stale.delete(tab);
+    const next = signature();
+    if (this.signatures.get(tab) === next) return false;
+    this.signatures.set(tab, next);
+    return true;
+  }
+  /** The tab was skipped while hidden since it was last shown. */
+  public isStale(tab: string): boolean { return this.stale.has(tab); }
+}
+
+/** The mirror screen is rebuilt unless it is already painted, was visible before, and is scrolled out of view. */
+export function shouldPaintMirror(state: { readonly offscreen: boolean; readonly wasHidden: boolean; readonly painted: boolean }): boolean {
+  return !(state.offscreen && !state.wasHidden && state.painted);
+}
+
+export function panelSignature(tab: CompanionTab, snapshot: PresentationSnapshot): string {
   const connected = ACTIVE.includes(snapshot.status);
   switch (tab) {
-    case "concepts": return JSON.stringify([snapshot.concepts, snapshot.feed.filter(item => item.kind === "transcript").map(item => item.id)]);
+    case "concepts": {
+      // What renderConcepts reads from the feed: whether each concept's transcript line is still there.
+      const ids = snapshot.concepts.some(concept => concept.transcriptId) ? new Set(snapshot.feed.map(item => item.id)) : undefined;
+      return JSON.stringify([snapshot.concepts, snapshot.concepts.map(concept => !!concept.transcriptId && !!ids?.has(concept.transcriptId))]);
+    }
     case "summary": return JSON.stringify([snapshot.summary ?? null, snapshot.notebook?.todos, snapshot.notebook?.notes, snapshot.glasses.mode, connected]);
     case "qa": return JSON.stringify([snapshot.suggestions, snapshot.asks, connected, modeProfile(snapshot.glasses.mode).id,
       snapshot.feed.filter(item => item.kind === "question").map(item => [item.id, item.questionKind, item.body])]);
@@ -2142,7 +2200,18 @@ export function panelScrollTop(metrics: { readonly scrollTop: number; readonly p
   return overshoot > 1 ? Math.max(0, metrics.scrollTop - overshoot) : undefined;
 }
 
-function feedItemSignature(item: FeedItem, meta?: AnswerMeta): string {
+/**
+ * JSON of a snapshot array / object, serialized once per reference. The presentation keeps the
+ * same sources, memory sources and meta objects between snapshots and replaces them on change.
+ */
+const jsonByReference = new WeakMap<object, string>();
+function stableJson(value: object): string {
+  let json = jsonByReference.get(value);
+  if (json === undefined) { json = JSON.stringify(value); jsonByReference.set(value, json); }
+  return json;
+}
+
+export function feedItemSignature(item: FeedItem, meta?: AnswerMeta): string {
   return [
     item.kind,
     item.partial ? "cut-off" : "",
@@ -2150,9 +2219,9 @@ function feedItemSignature(item: FeedItem, meta?: AnswerMeta): string {
     item.body,
     item.meta ?? "",
     item.streaming ? "streaming" : "settled",
-    JSON.stringify(item.sources ?? []),
-    JSON.stringify(item.memorySources ?? []),
-    meta ? JSON.stringify(meta) : "",
+    item.sources ? stableJson(item.sources) : "[]",
+    item.memorySources ? stableJson(item.memorySources) : "[]",
+    meta ? stableJson(meta) : "",
   ].join("\u001f");
 }
 

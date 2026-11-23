@@ -750,7 +750,10 @@ export class G2ConversationController {
       onAnswerMeta: meta => { if (this.session?.id === session.id) this.presentation.applyAnswerMeta(meta); },
       onMemoryRetrieved: (items, questionId) => {
         if (this.session?.id !== session.id) return;
+        // Kept for the most recent 50 questions (archiveEvent reads it when the answer completes).
+        this.memoryByQuestion.delete(questionId ?? "");
         this.memoryByQuestion.set(questionId ?? "", items);
+        if (this.memoryByQuestion.size > 50) this.memoryByQuestion.delete(this.memoryByQuestion.keys().next().value!);
         this.presentation.setMemorySources(items, questionId);
       },
       factCheck: { enabled: () => this.webCheckEnabled, onResult: result => this.handleFactCheck(result), news: () => this.config.newsSearch !== false },
