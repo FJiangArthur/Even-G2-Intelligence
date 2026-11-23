@@ -2,6 +2,17 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
+## v0.15.1 — Even Hub SDK 0.0.16 (timer fix reported by Even Realities as the cause of the iPhone freeze)
+
+An Even Realities engineer reported the cause of the iPhone freeze and the white page after unlock: a defect in the timer implementation inside `@evenrealities/even_hub_sdk` 0.0.14. They repacked this plugin with SDK 0.0.16 and ran it in the background for 10 minutes with no freeze and no white page. The SDK 0.0.16 changelog reads "Fixed repeated execution of `setTimeout` / `setInterval` callbacks".
+
+- `@evenrealities/even_hub_sdk` 0.0.14 -> 0.0.16. No plugin source changed.
+- Minimum Even App is now 2.2.10 (required since SDK 0.0.15).
+- Not verified by us: the fix on our own phone, and whether the mic probe (`mic-probe.ts`), which watches an SDK-internal entry point found in 0.0.14, still sees audio in 0.0.16. The probe is passive; if the entry point moved it reports `none` and nothing else is affected.
+- The earlier explanation in this file (page heap growth from the saved-knowledge search) was a hypothesis and is superseded. A timer callback running repeatedly fits the same evidence: per-call cost that steps up and never recovers, and a heap of hundreds of MB.
+
+Gate: conversation-sdk 635, gateway 104, g2-plugin 516 passed + 1 skipped.
+
 ## v0.15.0 — hang prevention, microphone on-time, long-session cost
 
 Nothing in this release was run on real glasses, an iPhone or a live provider. Every change is covered by unit tests on fakes (fake socket, fake bridge, fake timers). None of it is confirmed as the cause of the iPhone freeze described under v0.12.x; that root cause is still open.

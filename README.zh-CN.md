@@ -9,7 +9,7 @@
 <a href="https://github.com/FJiangArthur/Even-G2-Intelligence/actions/workflows/ci.yml"><img src="https://github.com/FJiangArthur/Even-G2-Intelligence/actions/workflows/ci.yml/badge.svg" alt="Gate"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="许可证：MIT"></a>
 <img src="https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg" alt="Node.js 22 或更高">
-<img src="https://img.shields.io/badge/Even%20Hub%20SDK-0.0.14-blue.svg" alt="Even Hub SDK 0.0.14">
+<img src="https://img.shields.io/badge/Even%20Hub%20SDK-0.0.16-blue.svg" alt="Even Hub SDK 0.0.16">
 <img src="https://img.shields.io/badge/status-pre--1.0-orange.svg" alt="状态：1.0 之前">
 </p>
 
