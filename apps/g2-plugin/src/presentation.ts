@@ -55,8 +55,10 @@ export function speakerName(label: string | undefined, role: SpeakerRole | undef
  * merge into one paragraph; the live partial joins the open paragraph when the speaker matches.
  * Only a speaker change or a question/answer card closes a paragraph. Side cards (insight, note,
  * fact check, error) that arrive mid-paragraph are placed right after it so speech keeps flowing.
- * A long single-speaker stretch is split: a paragraph that already holds PARAGRAPH_SPLIT_SEGMENTS
- * finals closes at the next line spoken in a different wall-clock minute than its first one.
+ * A long single-speaker stretch is split at fixed wall-clock windows (PARAGRAPH_WINDOW_MINUTES),
+ * once PARAGRAPH_SPLIT_SEGMENTS finals of that stretch precede the line. A boundary depends only on
+ * the two lines around it, never on where the previous paragraph began, so trimming the head of the
+ * feed (FEED_LIMIT) can change the first paragraph only: every later `para:<id>` stays put.
  */
 export type FeedBlock =
   | { readonly type: "paragraph"; readonly id: string; readonly speaker: string; readonly role: SpeakerRole;
@@ -66,16 +68,25 @@ type ParagraphBlock = Extract<FeedBlock, { type: "paragraph" }>;
 
 export const PARTIAL_TRANSCRIPT_ID = "transcript-partial";
 const INTERRUPTING_KINDS: ReadonlySet<FeedKind> = new Set<FeedKind>(["question", "answer"]);
-/** Finals a paragraph holds before a new wall-clock minute starts the next one. */
+/** Finals of one speaker's stretch that must precede a line before a new clock window can start a paragraph. */
 export const PARAGRAPH_SPLIT_SEGMENTS = 12;
-/** Wall-clock minute of an ISO timestamp ("2026-11-08T20:00"), or undefined when the line has no time. */
-const clockMinute = (occurredAt: string | undefined) => occurredAt && occurredAt.length >= 16 ? occurredAt.slice(0, 16) : undefined;
+/** Width of the fixed wall-clock windows a long stretch is cut on. Must divide 60. */
+export const PARAGRAPH_WINDOW_MINUTES = 2;
+/** Clock window of an ISO timestamp ("2026-11-08T20:" + window index within the hour), or undefined when the line has no time. */
+function clockWindow(occurredAt: string | undefined): string | undefined {
+  if (!occurredAt || occurredAt.length < 16) return undefined;
+  const minute = Number(occurredAt.slice(14, 16));
+  return Number.isInteger(minute) ? `${occurredAt.slice(0, 14)}${Math.floor(minute / PARAGRAPH_WINDOW_MINUTES)}` : undefined;
+}
 
 export function feedBlocks(feed: readonly FeedItem[]): FeedBlock[] {
   const blocks: FeedBlock[] = [];
   let open: ParagraphBlock | undefined;
   // Segments of the open paragraph (the same array as open.segments, appended in place).
   let segments: FeedItem[] = [];
+  // Finals in the current same-speaker stretch (across its split paragraphs), and the last of them.
+  let stretch = 0;
+  let previous: FeedItem | undefined;
   let deferred: FeedBlock[] = [];
   const close = () => {
     if (open) blocks.push(open);
@@ -93,11 +104,15 @@ export function feedBlocks(feed: readonly FeedItem[]): FeedBlock[] {
     if (!item.body.trim()) continue;
     const speaker = item.speaker ?? speakerName(item.label, item.speakerRole);
     if (open && open.speaker === speaker) {
-      const started = segments.length >= PARAGRAPH_SPLIT_SEGMENTS ? clockMinute(segments[0]!.occurredAt) : undefined;
-      const minute = started === undefined ? undefined : clockMinute(item.occurredAt);
-      if (started === undefined || minute === undefined || minute === started) { segments.push(item); continue; }
+      const before = stretch >= PARAGRAPH_SPLIT_SEGMENTS ? clockWindow(previous?.occurredAt) : undefined;
+      const now = before === undefined ? undefined : clockWindow(item.occurredAt);
+      stretch++; previous = item;
+      if (before === undefined || now === undefined || now === before) { segments.push(item); continue; }
+      close();
+    } else {
+      close();
+      stretch = 1; previous = item;
     }
-    close();
     segments = [item];
     open = { type: "paragraph", id: `para:${item.id}`, speaker, role: item.speakerRole ?? "unknown", segments };
   }

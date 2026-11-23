@@ -110,7 +110,7 @@ describe("finding 18: hidden copilot panels", () => {
 describe("finding 19: a single-speaker stretch is split into bounded paragraphs", () => {
   const paragraphs = (feed: readonly FeedItem[]) => feedBlocks(feed).filter(block => block.type === "paragraph");
 
-  it("closes a paragraph of 12 or more finals when the wall-clock minute changes", () => {
+  it("after 12 finals of one speaker, starts a new paragraph at each two-minute clock window", () => {
     const p = live();
     for (let index = 0; index < 60; index++) p.apply(final(`t${index}`, `Sentence ${index}.`, index * 10)); // 6 per minute, 10 minutes
     const blocks = paragraphs(p.snapshot().feed);
