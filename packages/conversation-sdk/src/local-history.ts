@@ -115,6 +115,11 @@ const MIGRATION_RETRY_MS = 60_000;
 const STORAGE_TIMEOUT_MS = 90_000;
 /** v0.15: while a live session only adds lines, the index (every session's metadata) is written at most this often. */
 const INDEX_HOLD_MS = 60_000;
+/** v0.15: a deadline timer that fires this much later than set means the page was suspended, not that the reply is lost. */
+const SUSPEND_SLACK_MS = 2_000;
+/** v0.15: a live session's pending lines are saved again after a lost reply: this many attempts in all, this long apart at most. */
+const SAVE_ATTEMPTS = 3;
+const SAVE_RETRY_MS = 10_000;
 const LOAD_FAILED = "Could not load local history from storage.";
 const SAVE_FAILED = "Could not save local history. Storage may be full or unavailable.";
 const TOO_LARGE = "Local history exceeds the 5 MiB storage limit.";
@@ -279,10 +284,21 @@ function utf8Length(value: string): number {
   return bytes;
 }
 class StorageTimeout extends Error {}
-/** Settles like `pending`, or rejects with StorageTimeout when no reply came within `ms`. */
+/** A save whose storage reply was lost: what is stored is unknown. */
+class SaveLost extends Error { constructor() { super(SAVE_FAILED); } }
+/**
+ * Settles like `pending`, or rejects with StorageTimeout when no reply came within `ms`. Time the page
+ * spent suspended does not count: a timer that fires overdue (the clock moved on while timers stood
+ * still) can run ahead of a reply that is already queued, so the wait starts again.
+ */
 function within<T>(pending: PromiseLike<T> | T, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new StorageTimeout()), ms);
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      const armed = Date.now();
+      timer = setTimeout(() => { if (Date.now() - armed > ms + SUSPEND_SLACK_MS) arm(); else reject(new StorageTimeout()); }, ms);
+    };
+    arm();
     Promise.resolve(pending).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
   });
 }
@@ -371,6 +387,10 @@ interface Batch {
   state: State; owners: ReadonlyMap<string, string | null>; touched: ReadonlySet<string>;
   readonly waiters: { resolve: () => void; reject: (error: unknown) => void }[];
   timer?: ReturnType<typeof setTimeout>;
+  /** v0.15: holds mutations issued while writes were coalesced (a live session's lines). */
+  coalesced?: boolean;
+  /** v0.15: saves of this batch that ended in a lost storage reply. */
+  lost?: number;
 }
 
 /**
@@ -451,7 +471,7 @@ export class LocalHistoryStore {
     return raw;
   }
   private async put(key: string, value: string): Promise<void> {
-    let saved: unknown; try { saved = await within(this.storage.setLocalStorage(key, value), this.timeoutMs); } catch { throw new Error(SAVE_FAILED); }
+    let saved: unknown; try { saved = await within(this.storage.setLocalStorage(key, value), this.timeoutMs); } catch (error) { throw error instanceof StorageTimeout ? new SaveLost() : new Error(SAVE_FAILED); }
     if (saved !== true) throw new Error(SAVE_FAILED);
   }
   private setBytes(id: string, bytes: number | undefined): void {
@@ -556,12 +576,15 @@ export class LocalHistoryStore {
         batch.waiters.push({ resolve, reject });
         this.batch = batch;
         if (!this.delay) await this.persist(batch);
-        else batch.timer ??= setTimeout(() => {
-          batch.timer = undefined;
-          void this.enqueue(async () => { if (this.batch === batch) await this.persist(batch); }).catch(() => undefined);
-        }, this.delay);
+        else { batch.coalesced = true; this.saveLater(batch, this.delay); }
       }).catch(reject);
     });
+  }
+  private saveLater(batch: Batch, ms: number): void {
+    batch.timer ??= setTimeout(() => {
+      batch.timer = undefined;
+      void this.enqueue(async () => { if (this.batch === batch) await this.persist(batch); }).catch(() => undefined);
+    }, ms);
   }
   /** Saves a batch; its callers settle with the outcome. The cache changes only on success. */
   private async persist(batch: Batch): Promise<void> {
@@ -570,7 +593,16 @@ export class LocalHistoryStore {
     try {
       if (this.legacy === "source") await this.persistLegacy(batch);
       else { const clears = await this.writeShards(batch.state, batch.touched); this.commit(batch); await this.cleanup(clears); }
-    } catch (error) { for (const waiter of batch.waiters) waiter.reject(error); throw error; }
+    } catch (error) {
+      // v0.15: a lost reply (not a refusal) does not drop a live session's pending lines: the batch stays
+      // open, later lines join it, and the next save (a line, flush() or this timer) writes them all.
+      // Whoever asked for this save is told it failed; the lines' writers settle with the retry.
+      if (error instanceof SaveLost && batch.coalesced && !this.batch && (batch.lost = (batch.lost ?? 0) + 1) < SAVE_ATTEMPTS) {
+        this.batch = batch; this.saveLater(batch, Math.min(this.delay || SAVE_RETRY_MS, SAVE_RETRY_MS, this.timeoutMs));
+        throw error;
+      }
+      for (const waiter of batch.waiters) waiter.reject(error); throw error;
+    }
     for (const waiter of batch.waiters) waiter.resolve();
   }
   /** Migration pending: retry it with this save; until it succeeds, save the whole archive to v1 as before v0.9. */
@@ -638,7 +670,8 @@ export class LocalHistoryStore {
     if (total + indexBytes > MAX_BYTES) throw new Error(TOO_LARGE_SAVE);
     const results = await settleAll(writes, IO_CONCURRENCY, write => this.put(write.key, write.raw));
     // Written or not, those shards may now differ from the cache: the next save rewrites them.
-    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    const failed = rejected.find(result => !(result.reason instanceof SaveLost)) ?? rejected[0]; // a refusal outranks a lost reply
     if (failed) { for (const write of writes) this.diverged.add(write.id); throw failed.reason; }
     if (indexRaw !== undefined && indexRaw !== this.indexRaw) {
       // A failed index write may still have landed: what is stored is unknown until the next index write.

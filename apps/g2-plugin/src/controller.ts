@@ -1177,7 +1177,9 @@ export class G2ConversationController {
    * fallback stays (History → open the session → Generate summary retries).
    */
   private finalizeSession(ended: HistorySession, run?: { model: string; digest: DigestRunner }): Promise<void> {
-    return this.withinTeardown(this.finalizeSessionNow(ended, run)); // v0.15: Stop does not hang on an unanswered save
+    // v0.15: Stop does not hang on an unanswered save. The end time, title and summary are still worked out
+    // from the whole saved session: behind the session-end save, also when that outlasts the wait.
+    return this.withinTeardown(this.historySettled.then(() => this.finalizeSessionNow(ended, run)));
   }
   private async finalizeSessionNow(ended: HistorySession, run?: { model: string; digest: DigestRunner }): Promise<void> {
     let id = ended.id;
@@ -2216,11 +2218,13 @@ export class G2ConversationController {
   }
   /** Session end: issued archive writes and the store's pending (coalesced) write are saved, within the teardown wait. */
   private settleHistory(): Promise<void> {
-    return this.withinTeardown((async () => {
+    return this.withinTeardown(this.historySettled = (async () => {
       await this.archiveQueue;
       this.syncHistoryWriteDelay(); await this.history.flush().catch(() => undefined);
     })());
   }
+  /** The latest session-end save (never rejects); finalizeSession() runs behind it. */
+  private historySettled: Promise<void> = Promise.resolve();
   /** Live sessions coalesce history writes; imports, deletions and idle time write through. */
   private syncHistoryWriteDelay(): void {
     this.history.writeDelayMs = this.archiveSessionId && !this.bulkHistoryWrites && !this.disposed ? this.liveHistoryWriteDelayMs : 0;

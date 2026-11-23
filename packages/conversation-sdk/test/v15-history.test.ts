@@ -239,7 +239,8 @@ describe("v15 history: a lost storage reply does not stop saving for good (findi
     d.stuck.clear();
     const retried = line(store, "a", 2);
     await store.flush(); await retried;
-    expect(store.getEntries("a").map(e => e.id)).toEqual(["a:e2"]);
+    await saved; // the line whose reply was lost is kept and saved with the next save
+    expect(store.getEntries("a").map(e => e.id)).toEqual(["a:e1", "a:e2"]);
   });
   it("load() rejects instead of hanging when a read is never answered, and a later load works", async () => {
     vi.useFakeTimers();
