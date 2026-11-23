@@ -711,9 +711,13 @@ export class DirectConversationTransport implements ConversationTransport, Copil
     try { this.options.onMemoryRetrieved?.(memories, questionId); } catch { /* isolate source UI failures */ }
     if (!current()) return false;
     const answerId = crypto.randomUUID(); let text = "", firstTokenMs: number | undefined;
-    // v0.15: automatic answers carry a bounded window of earlier speech; a manual request keeps the whole session.
-    let focus = runtime.transcript.local(), background = runtime.transcript.background(scope ?? "global", trigger === "manual" ? undefined : AUTO_BACKGROUND_CHARS);
-    const request = scope ? `Answer the most recent unresolved question in the ${scope === "local" ? "recent focus, using relevant earlier background" : "whole captured session"}. If no question is present, suggest one useful follow-up question or next response.` : input;
+    // v0.15: answers carry a bounded window of earlier speech; only an explicit whole-session ask sends the whole window.
+    const window = runtime.transcript.backgroundWindow(scope ?? "global", scope === "global" ? undefined : AUTO_BACKGROUND_CHARS);
+    let focus = runtime.transcript.local(), background = window.text;
+    // A manual request is told when speech was left out or has rolled off, so the answer can say so.
+    const omitted = trigger === "manual" && (window.cut || runtime.transcript.truncated);
+    const request = (scope ? `Answer the most recent unresolved question in the ${scope === "local" ? "recent focus, using relevant earlier background" : omitted ? "captured session" : "whole captured session"}. If no question is present, suggest one useful follow-up question or next response.` : input)
+      + (omitted ? "\nEarlier speech from this session is not included above; if the answer may depend on it, say so briefly." : "");
     // The selected automatic target stays explicit even outside recent focus.
     // Remove its speech sentences from the quoted sections, not from raw storage.
     if (trigger !== "manual") {
