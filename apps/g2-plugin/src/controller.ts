@@ -865,10 +865,12 @@ export class G2ConversationController {
     }
     const source = this.micSource;
     let opened: boolean | "timeout";
+    const attempt = ++this.micOpenSeq;
     this.micOpening++; // audio that arrives before the reply is not "audio while the microphone is off"
-    try { opened = await this.micControl(true, source, MIC_OPEN_DEADLINE_MS); } finally { this.micOpening--; }
+    try { opened = await this.micControl(true, source, MIC_OPEN_DEADLINE_MS, ok => this.lateOpenReply(attempt, ok)); } finally { this.micOpening--; }
     // No reply in time (replies wait behind queued audio events): carry on as open so the control chain is
-    // never held. A microphone that did not open is caught by the silent-microphone check and the user's next tap.
+    // never held. The open stays unconfirmed: the reply is still read when it comes, and a microphone that
+    // delivers nothing is opened once more and then reported (noteUnconfirmedOpen, micWatch).
     if (opened === "timeout") recordDiagnostic("mic-open-unconfirmed", `no reply in ${MIC_OPEN_DEADLINE_MS / 1000} s · treated as open`);
     else if (!opened) throw new Error(`G2 refused to start the ${source === AudioInputSource.Phone ? "phone" : "glasses"} microphone`);
     if (client !== this.client || this.disposed || this.exiting) {
@@ -876,17 +878,25 @@ export class G2ConversationController {
       return;
     }
     this.micOn = true; this.audioLastAt = 0; this.micWrongSource = 0; this.micRightSource = 0;
-    this.micIdlePaused = false; this.micQuietSince = Date.now(); this.micHeardAt = 0; this.micSilentTried = false;
+    this.micIdlePaused = false; this.micQuietSince = Date.now(); this.micHeardAt = 0; this.micSilentTried = false; this.micUnconfirmed = 0;
+    this.uplinkOpenAt = this.uplinkIdle ? 0 : Date.now(); // until the gate reports otherwise the uplink is open from here
+    if (opened === "timeout") this.noteUnconfirmedOpen(attempt);
     this.startMicWatch();
     this.presentation.setStatus("listening");
     this.persistLifecycle();
   }
 
   /** One audioControl call that cannot hold its caller forever: "timeout" when the host has not answered by the deadline. */
-  private async micControl(open: boolean, source: AudioInputSource, deadlineMs: number): Promise<boolean | "timeout"> {
+  private async micControl(open: boolean, source: AudioInputSource, deadlineMs: number, onLate?: (ok: boolean) => void): Promise<boolean | "timeout"> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<"timeout">(done => { timer = setTimeout(() => done("timeout"), deadlineMs); });
-    try { return await Promise.race([this.bridge.audioControl(open, source), late]); } finally { clearTimeout(timer); }
+    const call = this.bridge.audioControl(open, source);
+    try {
+      const reply = await Promise.race([call, late]);
+      // The call is still queued in the host: its answer, when it comes, goes to onLate (a failure counts as a refusal).
+      if (reply === "timeout" && onLate) void call.then(ok => onLate(ok === true), () => onLate(false));
+      return reply;
+    } finally { clearTimeout(timer); }
   }
   /** Best-effort microphone command: not awaited, never throws. */
   private sendMic(open: boolean): void {
@@ -1722,6 +1732,10 @@ export class G2ConversationController {
     if (now - this.lastResumeAt < 1500) return;
     this.lastResumeAt = now;
     recordDiagnostic("glasses-repush", reason);
+    // The microphone re-open below is this function's: the silent-microphone check must not send one of its
+    // own while the re-push is awaited, so its clock starts over now.
+    if (this.micHeardAt) this.micHeardAt = now;
+    this.micWasHidden = false;
     // First, because it is local and needs nothing from the glasses: a socket that looks open after
     // suspension may be dead, and the transport replaces it when no server event arrived for 10 s (optional
     // SDK method; reconnect-on-close still applies). A glasses overlay (foreground-*) does not suspend the
@@ -2160,10 +2174,22 @@ export class G2ConversationController {
     // Session not active right now (reconnecting): the microphone must not stay closed with listening on,
     // so this is retried like a refusal, and at once when the session becomes active (handleClientState).
     const active = this.client.state === "active";
-    let opened = false;
-    if (active) { try { opened = await this.micControl(true, this.micSource, MIC_OPEN_DEADLINE_MS) === true; } catch { /* retried below */ } }
+    let opened: boolean | "timeout" = false;
+    const attempt = ++this.micOpenSeq;
+    if (active) { try { opened = await this.micControl(true, this.micSource, MIC_OPEN_DEADLINE_MS, ok => this.lateOpenReply(attempt, ok, { reason, generation })); } catch { /* retried below */ } }
     if (generation !== this.audioFlushGeneration || !this.micOn || this.disposed) return; // paused, stopped or held meanwhile
+    if (opened === "timeout") {
+      // No reply in 5 s is not a refusal: the call is queued in the host and opens the microphone when its
+      // turn comes. Audio is accepted from now on; a refusal that arrives later is handled in lateOpenReply.
+      this.audioReopenFails = 0; this.noteUnconfirmedOpen(attempt);
+      recordDiagnostic("audio-resume", `${reason} · no reply in ${MIC_OPEN_DEADLINE_MS / 1000} s · treated as open`);
+      return;
+    }
     if (opened) { this.audioReopenFails = 0; if (this.micHeardAt) this.micHeardAt = Date.now(); recordDiagnostic("audio-resume", `${reason} · microphone re-opened`); return; }
+    this.reopenRefused(reason, active);
+  }
+
+  private reopenRefused(reason: string, active: boolean): void {
     // Stay closed and try again (5 s once, then the long-pause back-off), never in a tight loop.
     const retry = this.audioReopenFails++ ? this.audioRetryMs : AUDIO_REOPEN_RETRY_MS;
     recordDiagnostic("audio-resume", `${reason} · ${active ? "re-open refused" : "session not active"} · retry in ${Math.round(retry / 1000)} s`);
@@ -2183,6 +2209,13 @@ export class G2ConversationController {
   private micIdlePaused = false;
   private micHeardAt = 0;
   private micSilentTried = false;
+  private micOpenSeq = 0;
+  /** The open (micOpenSeq) whose reply did not come in time and has not been confirmed since; 0: none. */
+  private micUnconfirmed = 0;
+  private micUnconfirmedAt = 0;
+  private micWatchDueAt = 0;
+  private micWasHidden = false;
+  private uplinkOpenAt = 0;
   private strayWindowAt = 0;
   private strayCount = 0;
   private strayLastAt = 0;
@@ -2207,25 +2240,63 @@ export class G2ConversationController {
     this.sendMic(false);
   }
 
+  /**
+   * The gate opens on any frame a little above the noise floor (a door, a keyboard) and closes 3 s later, so
+   * a short opening is not speech and does not restart the idle clock. Sound that kept it open for
+   * MIC_IDLE_SOUND_MS does; speech restarts it through the transcript events it produces.
+   */
   private noteUplink(state: "paused" | "resumed"): void {
+    const now = Date.now();
     this.uplinkIdle = state === "paused";
-    this.micQuietSince = Date.now();
+    if (state === "resumed") { this.uplinkOpenAt = now; return; }
+    if (this.uplinkOpenAt && now - this.uplinkOpenAt >= MIC_IDLE_SOUND_MS) this.micQuietSince = now;
+    this.uplinkOpenAt = 0;
+  }
+
+  /** An open with no reply in time is treated as open; this arms the silent-microphone check for it although nothing was heard yet. */
+  private noteUnconfirmedOpen(attempt: number): void {
+    this.micUnconfirmed = attempt; this.micUnconfirmedAt = this.micHeardAt = Date.now(); this.micSilentTried = false;
+  }
+
+  /** The host answered an open after its deadline had passed. */
+  private lateOpenReply(attempt: number, ok: boolean, guard?: { readonly reason: string; readonly generation: number }): void {
+    if (this.micUnconfirmed !== attempt) return; // closed, opened again or warned about meanwhile
+    this.micUnconfirmed = 0;
+    const heard = this.micHeardAt !== this.micUnconfirmedAt;
+    // Confirmed: as after any confirmed open, a microphone that was never heard is left alone (after the
+    // guard it was heard before, so the silent-microphone check counts from the confirmation).
+    if (ok) { if (!heard) this.micHeardAt = guard ? Date.now() : 0; return; }
+    // Refused, but audio is arriving: the microphone is open, whatever the reply says.
+    if (heard || !this.micOn || this.disposed || this.exiting) return;
+    if (guard) {
+      if (guard.generation === this.audioFlushGeneration && !this.audioGuardClosed) this.reopenRefused(guard.reason, true);
+      return;
+    }
+    const name = this.micSource === AudioInputSource.Phone ? "phone" : "glasses";
+    this.micOn = false; this.clearAudioPause(); this.holding = false; this.holdOpenedMic = false;
+    recordDiagnostic("mic-open-refused", `the ${name} microphone open was refused after the ${MIC_OPEN_DEADLINE_MS / 1000} s deadline · listening ended`);
+    this.presentation.setStatus("paused");
+    this.presentation.setInteraction("MIC DID NOT START / RESUME ON PHONE");
+    this.presentation.notice("mic-open", "Microphone", `The ${name} microphone did not start: the Even app refused it. Tap Resume to try again, and check that the glasses are connected.`);
+    this.persistLifecycle();
   }
 
   /** One slow check while the microphone is on (every 10 s): idle auto-pause and a microphone that went silent. */
   private startMicWatch(): void {
     clearTimeout(this.micWatchTimer);
+    this.micWatchDueAt = Date.now() + MIC_WATCH_MS;
     this.micWatchTimer = setTimeout(() => this.micWatch(), MIC_WATCH_MS);
   }
 
   private micWatch(): void {
     this.micWatchTimer = undefined;
     if (!this.micOn || this.disposed || this.exiting) return;
+    const overdue = Date.now() - this.micWatchDueAt > MIC_WATCH_LATE_MS; // the page was suspended, or the main thread is blocked
     this.startMicWatch();
     const now = Date.now(), active = this.client?.state === "active";
-    // Idle: the uplink gate has been closed the whole time (any sound a little above the noise floor opens
-    // it), and nothing was transcribed, asked or answered. Transcription profiles without the gate never
-    // report idle, so they are never paused here.
+    // Idle: nothing was transcribed, asked or answered, the uplink gate is closed now, and it was not kept
+    // open by sound in that time (noteUplink). Transcription profiles without the gate never report idle,
+    // so they are never paused here.
     if (this.micIdlePauseMs > 0 && this.uplinkIdle && active && !this.holding && now - this.micQuietSince >= this.micIdlePauseMs) {
       void this.pauseForIdle().catch((error: unknown) => this.handleError(error));
       return;
@@ -2233,9 +2304,19 @@ export class G2ConversationController {
     // Silent: audio was arriving and stopped (glasses link dropped and came back, host stopped capture). One
     // re-open per silence. Not while hidden (resumeFromBackground owns that) or while the guard has it closed.
     const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
-    if (!active || hidden || this.audioGuardClosed || this.micOpening || !this.micHeardAt) return;
+    // The first check after the page was hidden or suspended only notes it: on the way back the re-open is
+    // resumeFromBackground's (it restarts this clock), and this timer can fire before that handler has run.
+    if (hidden || overdue || this.micWasHidden) { this.micWasHidden = hidden; return; }
+    if (!active || this.audioGuardClosed || this.micOpening || !this.micHeardAt) return;
     if (now - this.micHeardAt <= MIC_SILENT_MS) { this.micSilentTried = false; return; }
-    if (this.micSilentTried) return;
+    if (this.micSilentTried) {
+      // An open that was never confirmed, opened once more, and still not one audio event: say so, once.
+      if (!this.micUnconfirmed || this.micHeardAt !== this.micUnconfirmedAt) return;
+      this.micUnconfirmed = 0;
+      recordDiagnostic("mic-silent", `no audio event ${Math.round((now - this.micHeardAt) / 1000)} s after an unconfirmed open and one more try · user told`);
+      this.presentation.notice("mic-silent", "Microphone", "No audio has arrived since the microphone was started, so it may not be on. Pause and resume to try again, and check that the glasses are connected.");
+      return;
+    }
     this.micSilentTried = true;
     recordDiagnostic("mic-silent", `no audio event for ${Math.round((now - this.micHeardAt) / 1000)} s while listening · microphone opened again`);
     this.sendMic(true);
@@ -2490,6 +2571,8 @@ const MIC_OPEN_DEADLINE_MS = 5000, MIC_CLOSE_DEADLINE_MS = 3000, MIC_TEARDOWN_DE
 const MIC_STRAY_EVENTS = 60, MIC_STRAY_WINDOW_MS = 2000, MIC_STRAY_RESEND_MS = 5000;
 // The slow microphone check, how long without an audio event counts as silent, and the least gap between two link re-opens.
 const MIC_WATCH_MS = 10_000, MIC_SILENT_MS = 10_000, MIC_RELINK_DEBOUNCE_MS = 2000;
+// A check this late was not running (suspended page); an uplink open for less than this is a noise, not a reason to keep listening.
+const MIC_WATCH_LATE_MS = 3000, MIC_IDLE_SOUND_MS = 10_000;
 /** Flush: microphone closed at least 1 s, re-opened after 0.5 s without an audio event; close repeated at 3 s; given up at 10 s. */
 const AUDIO_FLUSH_MIN_MS = 1000, AUDIO_FLUSH_QUIET_MS = 500, AUDIO_FLUSH_SOFT_MS = 3000, AUDIO_FLUSH_HARD_MS = 10_000, AUDIO_FLUSH_POLL_MS = 100;
 /** No new flush this soon after re-opening; the third confirmed flush within a minute becomes a long pause. */
