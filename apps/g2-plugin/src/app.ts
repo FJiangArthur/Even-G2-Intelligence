@@ -130,6 +130,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   let lastDevice = "";
   const stopDevice = (bridge as { onDeviceStatusChanged?: (callback: (status: { connectType?: string; isWearing?: boolean; isInCase?: boolean; batteryLevel?: number }) => void) => () => void })
     .onDeviceStatusChanged?.(status => {
+      controller.setGlassesLink(status); // re-opens the glasses microphone when the link comes back while listening
       const text = `${status.connectType ?? "?"}${status.isWearing === undefined ? "" : status.isWearing ? " · worn" : " · not worn"}${status.isInCase ? " · in case" : ""}`;
       if (text === lastDevice) return;
       lastDevice = text;
@@ -253,7 +254,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   const precheck = () => { if (keyInput?.value.trim()) void controller.checkModelAccess(keyInput.value).catch(() => undefined); };
   precheck();
 
-  window.addEventListener("beforeunload", () => {
+  installPageTeardown(window, () => {
     stopWatching();
     try { stopDevice?.(); } catch { /* optional */ }
     unsubscribeResume();
@@ -262,8 +263,23 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
     unsubscribeUi();
     ui.dispose();
     void controller.dispose();
-  }, { once: true });
+  });
   return { controller, presentation, ui, renderer };
+}
+
+/**
+ * Runs `teardown` once when the page goes away. iOS WebKit does not reliably deliver `beforeunload` when
+ * the host closes or replaces the web view; `pagehide` is the documented event. A page kept in the
+ * back/forward cache (`persisted`) may return, so it is left running.
+ */
+export function installPageTeardown(
+  target: { addEventListener(type: string, listener: (event: { persisted?: boolean }) => void): void },
+  teardown: () => void,
+): void {
+  let done = false;
+  const run = (): void => { if (done) return; done = true; teardown(); };
+  target.addEventListener("beforeunload", run);
+  target.addEventListener("pagehide", event => { if (!event.persisted) run(); });
 }
 
 /**
