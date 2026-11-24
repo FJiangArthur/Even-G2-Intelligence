@@ -55,10 +55,14 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
   // v0.11.2: Setup → Diagnostics switch for a text-only glasses display (saved on this phone).
   const pixelArt = await Promise.race([bridge.getLocalStorage(GLASSES_IMAGES_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]) !== "off";
   const display = resolveGlassesDisplay(await Promise.race([bridge.getLocalStorage(GLASSES_DISPLAY_KEY).catch(() => ""), new Promise<string>(done => setTimeout(() => done(""), 1500))]));
+  let saidLine: (id: string) => void = () => undefined;
   const renderer = resolveGlassesLayout(new URLSearchParams(options.search ?? location.search).get("glasses")) === "hud"
-    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap, display, answerLength: config.answerLength })
+    ? new GlassesHud(bridge, { onError: onGlassesError, images: pixelArt, writeGapMs: writeGap, display, answerLength: config.answerLength,
+      // v0.16: a line marked said on the glasses is marked on the phone and in the copilot too.
+      onSaid: line => { if (line.id) saidLine(line.id); } })
     : new GlassesRenderer(bridge, { debounceMs: 120, onError: onGlassesError });
   const controller = new G2ConversationController(bridge, renderer, presentation, ...(options.transportFactory ? [options.transportFactory] as const : []));
+  saidLine = id => controller.markLineSaid(id);
   // Battery: batch live-session history saves (one shard + one index write per ~3 s, flushed on hide/stop).
   controller.liveHistoryWriteDelayMs = LIVE_HISTORY_WRITE_DELAY_MS;
   // Heat / lock screen: accept microphone audio only at its real-time rate (a backlog queued while the
@@ -172,6 +176,7 @@ export async function bootstrap(root: HTMLElement, bridge: G2BridgePort & { rebu
     onDisconnect: () => controller.disconnect(),
     onAsk: (question) => controller.ask(question),
     onAskLocal: () => controller.askContext("local"),
+    onSayLine: id => controller.markLineSaid(id),
     onAskGlobal: () => controller.askContext("global"),
     onShortcut: id => controller.runShortcut(id),
     onAutoExplainTerms: enabled => controller.setAutoExplainTermsEnabled(enabled),

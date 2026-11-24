@@ -374,5 +374,42 @@
         "on-call rotation organized"
       ]
     }
+  },
+  {
+    "id": "talk-being-present",
+    "title": "Talk · a podcast on being present (you are listening)",
+    "kind": "talk",
+    "mode": "general",
+    "lines": [
+      { "speaker": "other", "expect": "none", "text": "Welcome back to the show. Today I want to stay with one simple idea, being present, and the plain practice of actually being here." },
+      { "speaker": "self", "expect": "none", "case": "wearer-turn", "text": "Yeah." },
+      { "speaker": "other", "expect": "none", "text": "Most of us spend the day somewhere else. We replay yesterday, we rehearse tomorrow, and the one moment we really have goes by without us noticing it." },
+      { "speaker": "other", "expect": "none", "case": "self-answered", "text": "So what does that mean? It means the mind is busy narrating, and the narration is not the same thing as the life it describes." },
+      { "speaker": "other", "expect": "none", "text": "In meditation you sit down and you watch the breath. Not to control it, just to feel the air at the nose, the chest rising, the weight of the body on the chair." },
+      { "speaker": "other", "expect": "none", "case": "garbled", "text": "And the the thing about sensory where ness is that it cut through the, it cuts through thinking, because you can not feel your feet tomorrow." },
+      { "speaker": "other", "expect": "none", "case": "mixed-language", "text": "My teacher used to say 当下, right now, and in Korean 지금 여기, here and now. Different words, same instruction, come back to what you can sense." },
+      { "speaker": "other", "expect": "none", "text": "Listen to the sounds in the room. Feel your hands. Notice that seeing is already happening before you put a name on what you see." },
+      { "speaker": "other", "expect": "none", "case": "rhetorical-guarded", "text": "Is there anything we can do in this moment?" },
+      { "speaker": "other", "expect": "none", "text": "There is. You can drop the next thought before it finishes, the way you would set down a bag you never needed to carry." },
+      { "speaker": "other", "expect": "none", "case": "cut-off", "text": "Reducing thinking is not about fighting thoughts, it is more like you stop feeding the, um, the loop, and then it it just" },
+      { "speaker": "self", "expect": "none", "case": "wearer-turn", "text": "And" },
+      { "speaker": "other", "expect": "none", "case": "audience-question", "text": "And then it gets quiet. You might be wondering whether this is just zoning out." },
+      { "speaker": "other", "expect": "none", "text": "It is the opposite. Zoning out is being lost in thought without knowing it. Presence is knowing exactly what is happening while it happens." },
+      { "speaker": "other", "expect": "none", "case": "mixed-language", "text": "There is a Zen phrase, 只管打坐, just sitting. Nothing to achieve. 그냥 앉아 있는 거예요, you just sit, and the sitting is the whole practice." },
+      { "speaker": "other", "expect": "none", "case": "garbled", "text": "Try it now for ten seconds. Feel the breath at the knows, hear the far the sound, and let the commentary go quiet by it self." },
+      { "speaker": "other", "expect": "none", "text": "Attention that rests in the senses slows the stream of thinking down on its own. You do not have to push anything away." },
+      { "speaker": "other", "expect": "none", "text": "People tell me they have no time for this. But presence does not take time, it gives the time you already have back to you." },
+      { "speaker": "other", "expect": "none", "text": "It is a bit like tuning an instrument. You are not adding a new note, you are bringing the one that is already there back into pitch." },
+      { "speaker": "other", "expect": "none", "case": "rhetorical-guarded", "text": "So why do we keep leaving the present?" },
+      { "speaker": "other", "expect": "none", "text": "Mostly habit. The mind believes that if it stops planning something will go wrong, so it keeps running even when there is nothing to solve." },
+      { "speaker": "self", "expect": "none", "case": "wearer-turn", "text": "Yeah" },
+      { "speaker": "other", "expect": "none", "text": "So here is the practice for this week. Three times a day, stop, feel one full breath, and name one thing you can hear." },
+      { "speaker": "other", "expect": "none", "text": "Try only that, and see what changes. Thanks for listening, and I will see you next time." }
+    ],
+    "expectations": {
+      "sayLines": true,
+      "unanswered": ["Is there anything we can do in this moment", "why do we keep leaving the present"],
+      "forbiddenLabels": ["Strong answer", "Probe:", "Flag:"]
+    }
   }
 ]

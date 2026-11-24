@@ -296,6 +296,8 @@ export function visibleLimit(row: { readonly heldBehindAnswer?: boolean }): numb
 /** How a cut-off answer may be marked (phone label / meta, glasses title / status / body). */
 export const PARTIAL_WORDING = /\b(?:partial|cut[ -]?off|cut short|incomplete|interrupted|unfinished)\b/iu;
 const BODY_CONTAINERS = ["hud-body", "helix-main"];
+/** Lines of the one container of the hidden-display page (glasses-hud.ts AMBIENT_LINES). */
+const AMBIENT_ROWS = 10;
 const median = (values: number[]): number | undefined => {
   if (!values.length) return undefined;
   const sorted = [...values].sort((a, b) => a - b), middle = Math.floor(sorted.length / 2);
@@ -457,8 +459,12 @@ export class InterviewRecorder {
   }
 
   public onScreen(containers: ReadonlyMap<string, string>): void {
-    const body = BODY_CONTAINERS.map(name => containers.get(name)).find(text => text !== undefined) ?? "";
-    const entry: ScreenEntry = { t: this.t(), body, title: containers.get("hud-header") ?? "", status: containers.get("hud-status") ?? "",
+    // v0.16: the hidden display is one container. Its last line (of AMBIENT_ROWS) carries what the status
+    // corner carried before: a problem, the page marker, a hint. The lines above it are the pop-up.
+    const hidden = containers.get("hud-ambient")?.split("\n");
+    const footer = hidden && hidden.length >= AMBIENT_ROWS ? hidden[AMBIENT_ROWS - 1]!.trim() : "";
+    const body = hidden ? hidden.slice(0, AMBIENT_ROWS - 1).join("\n") : BODY_CONTAINERS.map(name => containers.get(name)).find(text => text !== undefined) ?? "";
+    const entry: ScreenEntry = { t: this.t(), body, title: containers.get("hud-header") ?? "", status: hidden ? footer : containers.get("hud-status") ?? "",
       ambient: this.options.ambient?.() ?? false, ...(this.presentationAnswerId ? { answerId: this.presentationAnswerId } : {}) };
     const last = this.screens.at(-1);
     if (last && last.body === entry.body && last.title === entry.title && last.status === entry.status && last.ambient === entry.ambient) return;

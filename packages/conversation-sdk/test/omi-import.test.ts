@@ -18,18 +18,21 @@ describe("explicit Omi conversation import", () => {
     for (const [url, init] of fetcher.mock.calls) {
       expect(new URL(url).origin + new URL(url).pathname).toBe("https://api.omi.me/v1/dev/user/conversations");
       expect(new URL(url).searchParams.get("include_transcript")).toBe("true"); expect(new URL(url).searchParams.get("limit")).toBe("25");
-      expect(new URL(url).searchParams.get("start_date")).toBe("2026-09-01T00:00:00.000Z");
+      // v0.16: a plain date is a day in the phone's time zone (first moment for the start, last for the end).
+      expect(new URL(url).searchParams.get("start_date")).toBe(new Date(2026, 8, 1).toISOString());
+      expect(new URL(url).searchParams.get("end_date")).toBe(new Date(2026, 8, 10, 23, 59, 59, 999).toISOString());
       expect(init).toMatchObject({ redirect: "error", headers: { Authorization: `Bearer ${key}` } });
     }
     expect(progress).toHaveBeenLastCalledWith({ imported: 26, pages: 2 }); expect(store.exportJson()).not.toContain(key);
   });
-  it("retains titles and overviews with no fabricated transcript or summary retrieval", async () => {
+  it("retains titles and overviews with no fabricated transcript; the summary is searchable at answer time (v0.16)", async () => {
     const { store } = await setup(); const c = { ...conversation("summary"), transcript_segments: null };
     await importOmiConversations({ key, store, fetch: async () => Response.json([c]) });
     expect(store.listSessions()[0]?.title).toBe("Launch summary");
     expect(store.getEntries("omi:summary").some(x => x.kind === "transcript")).toBe(false);
     expect(store.search("overview")[0]?.entry.text).toContain("Launch plan overview");
-    expect(store.retrieve("overview")).toEqual([]);
+    // v0.16: the overview entry itself is still not evidence, but the session's summary is searched as its own record.
+    expect(store.retrieve("overview").map(hit => [hit.entry.id, hit.entry.speaker, hit.entry.text])).toEqual([["omi:summary:knowledge:summary", "Summary", "Launch plan overview"]]);
   });
   it("preserves earlier pages when cancelled and discards a late response", async () => {
     const { store } = await setup(); const abort = new AbortController();
@@ -60,12 +63,14 @@ describe("explicit Omi conversation import", () => {
   });
   it("reports storage failure without counting a conversation as imported", async () => {
     const { store, disk } = await setup(); const progress = vi.fn(); disk.setLocalStorage.mockResolvedValueOnce(false);
-    await expect(importOmiConversations({ key, store, onProgress: progress, fetch: async () => Response.json([conversation("a")]) })).rejects.toThrow(/sav|storage/i);
+    // v0.16: a conversation that cannot be saved is counted as failed with the reason, instead of the import throwing.
+    const result = await importOmiConversations({ key, store, onProgress: progress, fetch: async () => Response.json([conversation("a")]) });
+    expect(result).toEqual({ imported: 0, pages: 0, failed: 1, failReason: expect.stringMatching(/sav|storage/i) });
     expect(store.listSessions()).toEqual([]); expect(progress).not.toHaveBeenCalledWith(expect.objectContaining({ imported: 1 }));
   });
   it("ends explicitly incomplete at the 200-page cap", async () => {
     const { store } = await setup(), progress = vi.fn();
-    vi.spyOn(store, "upsertSession").mockResolvedValue(); vi.spyOn(store, "upsertEntries").mockResolvedValue();
+    vi.spyOn(store, "replaceSession").mockResolvedValue(); // v0.16: the import saves each conversation with replaceSession
     const fetcher = vi.fn(async (url: string) => { const offset = Number(new URL(url).searchParams.get("offset")); return Response.json(Array.from({ length: 25 }, (_, i) => conversation(String(offset + i)))); });
     await expect(importOmiConversations({ key, store, fetch: fetcher, onProgress: progress })).rejects.toThrow(/incomplete.*200-page/i);
     expect(fetcher).toHaveBeenCalledTimes(200); expect(progress).toHaveBeenLastCalledWith({ imported: 5000, pages: 200 });
@@ -83,6 +88,7 @@ describe("explicit Omi conversation import", () => {
     const c = { ...conversation("a:transcript/id"), started_at: null, finished_at: null, transcript_segments: [{ text: "A launch note", speaker_id: 4, start: 0 }] };
     await importOmiConversations({ key, store, fetch: async () => Response.json([c]) });
     expect(store.listSessions()[0]?.id).toBe("omi:a%3Atranscript%2Fid");
-    expect(store.retrieve("launch")[0]?.entry).toMatchObject({ speaker: "Speaker 4", occurredAt: "2026-09-01T00:00:00.000Z" });
+    // v0.16: unnamed voices are numbered from 1, like "SPEAKER_00" -> "Speaker 1" (speaker id 4 is the fifth voice).
+    expect(store.getEntries("omi:a%3Atranscript%2Fid").find(entry => entry.kind === "transcript")).toMatchObject({ speaker: "Speaker 5", occurredAt: "2026-09-01T00:00:00.000Z" });
   });
 });

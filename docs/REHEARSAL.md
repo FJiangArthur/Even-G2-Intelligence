@@ -21,10 +21,11 @@ All three layers use one source, `apps/g2-plugin/src/rehearsal-scripts.json`. `r
 | `team-standup` | meeting | Decisions, owners, a ship-date change (Friday, then next Wednesday), and questions |
 | `interview-interviewer` | interview | Interview harness (section 4): you interview a backend candidate, mode `interviewer` |
 | `interview-candidate` | interview | Interview harness (section 4): you are the candidate, mode `interviewee` |
+| `talk-being-present` | talk | Talk scenario (section 5): you listen to a podcast on being present, mode `general` (Meeting). One other speaker for several minutes, garbled lines, Chinese and Korean fragments, rhetorical questions, three one-word wearer turns |
 
 Each script has `expectations` (concepts, conflict, lookups, proposes, questions, implicitQuestions). The tests and the harness check results against them.
 
-The two `interview-*` scripts also state an outcome on every line (section 4). They contain lines that must not be answered, so the suites of section 2, which expect every detected question to be answered, leave them out.
+The two `interview-*` scripts and `talk-being-present` also state an outcome on every line (sections 4 and 5). They contain lines that must not be answered, so the suites of section 2, which expect every detected question to be answered, leave them out.
 
 ## 1. In-app rehearsal
 
@@ -213,6 +214,50 @@ The tests use fake timers, so a two-minute script takes about 100 ms and gives t
 - The fake provider's answers are templates. Nothing here measures whether an answer is correct or useful, or how a real model reacts to the prompts. First-token time is the fake's configured 400 ms.
 - There are no glasses. A write is "visible" when the fake bridge accepted it; Bluetooth latency, the real font and wrapping, and gestures on hardware are not covered. `?writeMs=` only delays each write.
 - The copilot is the fake's keyword analysis, so suggested questions are canned.
+
+## 5. Talk scenario: a podcast you listen to (no key, no network)
+
+`talk-being-present` models a session where the wearer is not in a conversation at all: a podcast host talks for about three and a half minutes about being present, meditation, sensory awareness and thinking less. The lines are original, written in that spirit; they are not taken from a real broadcast. It uses the per-line format of the interview scripts (`expect`, `case`) and runs on the same rig (`tests/interview-rig.ts`, `tests/interview-harness.ts`, `tests/fake-openai.ts`).
+
+| case | Line | Expected |
+|---|---|---|
+| `wearer-turn` | "Yeah.", "And", "Yeah" | not a question; each one starts the other side's floor again |
+| `self-answered` | "So what does that mean? It means…" | not answered: the speaker answers it in the same line (on-device filter) |
+| `audience-question` | "You might be wondering whether…" | not answered (on-device filter) |
+| `rhetorical-guarded` | "Is there anything we can do in this moment?", "So why do we keep leaving the present?" | detected as questions, listed on the phone, not answered: the other side has held the floor for 60 s (monologue guard) |
+| `garbled`, `cut-off` | Wrong words, a repeated word, a sentence that stops | no answer, and no output about the transcript |
+| `mixed-language` | 当下, 지금 여기, 只管打坐, 그냥 앉아 있는 거예요 inside English sentences | no answer |
+
+The script's `expectations` block is different from the other scripts: `sayLines` (the suggestions are lines to say), `unanswered` (the two guarded questions) and `forbiddenLabels` ("Strong answer", "Probe:", "Flag:").
+
+```bash
+cd apps/g2-plugin && npx vitest run tests/v16-talk-scenario.test.ts
+```
+
+What the test asserts:
+
+- With tagged roles (`self` / `other`): every line is heard with its speaker, no answer request reaches the provider, and the two guarded questions are detected but not answered. The script test also checks, from the script's own pauses, that each guarded question comes at least 60 s into the host's floor and that the on-device detector finds no question in any other line, so it is the guard that is tested and not the filter.
+- The phone gets at most three suggestions, all of kind `say`, and the Q&A tab heads them "Say next".
+- With the wearer's three turns left out (every line tagged `other`, the wearer only listens): still no answer request. The guard does not need a turn from the wearer.
+- Without speaker tags (every line `unknown`) the same two questions are answered once each. The guard needs tagged roles, and a turn of unknown role between the host's turns starts the host's floor again.
+- The copilot request and every answer request carry the speech-recognition rule (`SPEECH_RECOGNITION_RULE`).
+- A manual tap ("last few sentences") after the talk sends the "say next" request (`lineRequest("local")`) with no answer-key instruction, and the phone feed labels the reply "Helix · say next". The same holds for a manual tap in Interviewer mode, where the wearer's own spoken question still gets its answer key.
+- No provider output, event, feed item, suggestion or glasses text of the run contains "Strong answer", "Probe:" or "Flag:".
+
+In the app, pick the script under Rehearsal with Meeting mode selected. In-app rehearsal does not switch the mode, and it plays in real time: the guard counts 60 s of wall clock, so at speed 2 or 4 the guarded questions arrive before the guard applies and are answered. The same is true of `scripts/live-rehearsal.mjs --script talk-being-present --speed 1`.
+
+### What the talk scenario does and does not prove
+
+It proves plumbing: which lines lead to an answer request, which kind of suggestion reaches the phone, what the requests say, and that the interviewer answer-key format is not asked for outside its place.
+
+It does not prove:
+
+- The quality of a real model's lines. The fake provider's suggestion is a canned sentence ("What is the next concrete step and who owns it?") and its answer a template. Whether a real model offers a line worth saying about presence, stays quiet about the transcript, or follows Chinese and Korean speech is only seen in a billed live run with your key.
+- That a real model obeys the speech-recognition rule. The test shows the rule is in the request, not that the reply follows it. The fake never writes "transcript", "cuts off" or "clarify", so their absence from its output says nothing.
+- Speech recognition. The garbled and mixed-language lines are typed in; no audio is recognised. The "Mixed languages" speech setting is not exercised by this script.
+- Speaker tags on the glasses. The run tags every line; whether a real G2 session tags the podcast as `other` and the wearer as `self` is a device check. Untagged, the guard does not apply and the questions are answered.
+- The glasses pop-up layout for a line to say.
+- Phrasing the on-device detector gets wrong. While writing the script, three statements were answered as questions within a minute of a wearer turn: "Today I want to stay with one simple idea, which is being present, and what it takes…", "When attention rests in the senses, the stream of thinking slows down on its own." and "Do only that, and see what changes." So was "You might be wondering, is this just zoning out?" (the comma splits off the question). The script was reworded around them; the detector was not changed.
 
 ## What is and is not verified
 

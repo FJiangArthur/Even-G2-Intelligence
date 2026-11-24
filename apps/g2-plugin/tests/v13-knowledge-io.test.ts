@@ -318,10 +318,11 @@ describe("v0.13 PDFs in the controller", () => {
     await controller.dispose();
   });
 
-  it("a PDF that does not fit the 5 MiB archive fails whole: no empty document is left and an earlier copy survives", async () => {
-    // An archive that is already about 4.6 MiB full.
+  it("a PDF that does not fit the 5 MiB import budget fails whole: no empty document is left and an earlier copy survives", async () => {
+    // v0.16: PDFs count against the import budget (Omi, notes, PDFs), not against live sessions.
+    // Imported knowledge that is already about 4.6 MiB full.
     const storage = new Map<string, string>(), at = "2026-11-10T10:00:00.000Z", filler = "calibration rig lead time ".repeat(40);
-    storage.set(LEGACY_HISTORY_KEY, JSON.stringify({ version: 1, sessions: [{ id: "s1", source: "helix", title: "Long call", startedAt: at, updatedAt: at }],
+    storage.set(LEGACY_HISTORY_KEY, JSON.stringify({ version: 1, sessions: [{ id: "s1", source: "obsidian", title: "Long note", startedAt: at, updatedAt: at }],
       entries: Array.from({ length: 4200 }, (_, i) => ({ id: `s1:e${i}`, sessionId: "s1", kind: "transcript", text: filler, occurredAt: at, speaker: "Them" })) }));
     const { controller } = await controllerWith(storage);
     const small = async () => ({ pages: [{ page: 1, text: "Orin lead time is twelve weeks." }, { page: 2, text: "The budget is sixty thousand." }], pageCount: 2 });
@@ -331,7 +332,7 @@ describe("v0.13 PDFs in the controller", () => {
     const id = pdfSessionId(vendor);
     // Re-import of the same file with far more text, and a new large file: neither fits.
     const files = await controller.importPdfs([vendor, big], { parser: "local", extractLocal: huge });
-    expect(files).toMatchObject([{ state: "failed", detail: expect.stringMatching(/5 MiB storage limit/u) }, { state: "failed", detail: expect.stringMatching(/5 MiB storage limit/u) }]);
+    expect(files).toMatchObject([{ state: "failed", detail: expect.stringMatching(/Imported knowledge is full \(5 MiB/u) }, { state: "failed", detail: expect.stringMatching(/Imported knowledge is full \(5 MiB/u) }]);
     // The earlier working copy is intact and still found.
     expect(controller.historyEntryCount(id)).toBe(2);
     expect(controller.searchHistory("budget sixty thousand")[0]).toMatchObject({ session: { id } });

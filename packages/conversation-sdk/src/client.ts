@@ -219,7 +219,8 @@ export class HelixConversationClient {
 
   public async askContext(scope: ContextScope, speaker?: Speaker): Promise<string> {
     if (scope !== "local" && scope !== "global") throw new Error("Invalid context scope");
-    return this.submitQuery(scope === "local" ? "Help me respond to the recent conversation." : "Help me respond using the whole captured session.", speaker, scope);
+    // v0.16: the reply is a line the wearer can read aloud (the transport builds the request: modes.ts lineRequest).
+    return this.submitQuery(scope === "local" ? "Give me a line to say about the last few sentences." : "Give me a line to say from the whole conversation.", speaker, scope);
   }
 
   private async submitQuery(text: string, speaker?: Speaker, contextScope?: ContextScope): Promise<string> {

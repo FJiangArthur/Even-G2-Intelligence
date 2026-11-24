@@ -9,9 +9,31 @@ import type { HistoryEntry, HistorySession, SessionPerson } from "./local-histor
 import { MAX_TODOS, parseTodoLine, todoLine, type TodoItem } from "./todo-list.js";
 
 export interface SessionWithEntries { readonly session: HistorySession; readonly entries: readonly HistoryEntry[] }
-export interface MarkdownSession { session: HistorySession; entries: HistoryEntry[]; /** Original Helix session id when the note was exported by Helix. */ helixSessionId?: string }
+export interface MarkdownSession {
+  session: HistorySession; entries: HistoryEntry[];
+  /** Original Helix session id when the note was exported by Helix. */ helixSessionId?: string;
+  /** v0.16: the id this note had before ids became unique per note ("obsidian:<file name>"), when it differs from session.id. */
+  legacySessionId?: string;
+  /** v0.16: stable hash of the note's text: the same text twice in one import is one note. */
+  contentHash: string;
+  /**
+   * v0.16: nothing names this note but its file name, or its file name and a frontmatter date: another
+   * note can arrive at the same id. MarkdownImportPlanner then looks at the saved copy before replacing it.
+   */
+  weakId?: true;
+  /** v0.16: what the import limits left out or shortened, as one sentence. Absent: the whole note was kept. */
+  truncated?: string;
+}
 export interface VaultFile { path: string; content: string }
-export interface MarkdownImportOptions { /** Fallback timestamp when the note has no date (default: now). */ now?: string }
+export interface MarkdownImportOptions {
+  /** Timestamp of a note without any date (default: now). Used after `lastModified`. */ now?: string;
+  /** v0.16: the note's path inside the vault, or the link it was loaded from, when known. Two notes with the same file name and different paths are different notes. */
+  path?: string;
+  /** v0.16: when the file was last changed (File.lastModified, ms, or an ISO time). A note without a date is filed under that day, not under today. */
+  lastModified?: number | string;
+  /** v0.16: pasted text has no file behind it: its id comes from its text, so another pasted note with the same title is kept beside it. */
+  pasted?: boolean;
+}
 
 const MAX_MARKDOWN_CHARS = 2_000_000, MAX_ENTRY_CHARS = 4000, MAX_ENTRIES = 5000, MAX_ITEMS = 20, MAX_ITEM_CHARS = 500;
 const SECTION = { summary: "Summary", keyFacts: "Key facts", people: "People", concepts: "Concepts", diagram: "Diagram", transcript: "Transcript", todos: "To-dos", notes: "Notes" } as const;
@@ -220,6 +242,8 @@ function isoOf(value: string | undefined): string | undefined {
   return Number.isFinite(time) && Math.abs(time) <= 8.64e15 ? new Date(time).toISOString() : undefined;
 }
 /** Obsidian inline syntax -> plain text; collects inline #tags. */
+/** v0.16: counts what the current markdownToSession call shortens (the parser is synchronous). */
+let cuts: { lines: number } | undefined;
 function plain(text: string, tags?: Set<string>): string {
   let value = text
     .replace(/!\[\[[^\]]*\]\]/gu, "").replace(/!\[[^\]]*\]\([^)]*\)/gu, "")
@@ -229,7 +253,15 @@ function plain(text: string, tags?: Set<string>): string {
     .replace(/(^|[^\p{L}\p{N}*])\*(\S(?:[^*]*\S)?)\*(?![\p{L}\p{N}])/gu, "$1$2")
     .replace(/\^[A-Za-z0-9-]+$/u, "");
   value = value.replace(/(^|\s)#([\p{L}\p{N}_\-/]*[\p{L}_\-/][\p{L}\p{N}_\-/]*)/gu, (_m, lead: string, tag: string) => { tags?.add(tag); return `${lead}${tag}`; });
-  return bounded(cleanLine(value), MAX_ENTRY_CHARS);
+  const clean = cleanLine(value);
+  if (cuts && clean.length > MAX_ENTRY_CHARS && Array.from(clean).length > MAX_ENTRY_CHARS) cuts.lines++;
+  return bounded(clean, MAX_ENTRY_CHARS);
+}
+/** FNV-1a, 8 hex digits. For telling notes apart, not for security. */
+function hash8(value: string, seed = 0x811c9dc5): string {
+  let hash = seed >>> 0;
+  for (let i = 0; i < value.length; i++) { hash ^= value.charCodeAt(i); hash = Math.imul(hash, 0x01000193) >>> 0; }
+  return hash.toString(16).padStart(8, "0");
 }
 function idPart(value: string): string {
   const encoded = Array.from(value.normalize("NFC")).map(ch => /[A-Za-z0-9_.-]/u.test(ch) ? ch : encodeURIComponent(ch).replace(/[!'()*~]/gu, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)).join("");
@@ -238,6 +270,8 @@ function idPart(value: string): string {
   for (let i = 0; i < encoded.length; i++) { hash ^= encoded.charCodeAt(i); hash = Math.imul(hash, 0x01000193) >>> 0; }
   return `${encoded.slice(0, 150)}-${hash.toString(16)}`;
 }
+/** The id exportToOmi gives Omi for a session (Omi import reads it back to find that session). */
+export function helixClientSessionId(sessionId: string): string { return `helix-${idPart(sessionId)}`.slice(0, 200); }
 function parsePerson(text: string): SessionPerson | undefined {
   const bold = /^\*\*([^*]+)\*\*\s*(?:[—–:-]\s*(.*))?$/u.exec(text.trim());
   const [name, role] = bold ? [bold[1]!, bold[2] ?? ""] : (() => {
@@ -262,8 +296,14 @@ type Draft = { kind: HistoryEntry["kind"]; text: string; speaker?: string; origi
  * bullets become entries. Mermaid blocks are skipped. Round-trips sessionToMarkdown output.
  */
 export function markdownToSession(markdown: string, fileName: string, options: MarkdownImportOptions = {}): MarkdownSession {
+  const counted = { lines: 0 };
+  cuts = counted;
+  try { return parseMarkdown(markdown, fileName, options, counted); } finally { cuts = undefined; }
+}
+function parseMarkdown(markdown: string, fileName: string, options: MarkdownImportOptions, counted: { lines: number }): MarkdownSession {
   if (typeof markdown !== "string" || typeof fileName !== "string") throw new Error("Markdown note and file name must be text.");
   if (markdown.length > MAX_MARKDOWN_CHARS) throw new Error("Markdown note is too large to import (2 MB limit).");
+  let droppedLines = 0, droppedItems = 0;
   let lines = markdown.replace(/^﻿/u, "").replace(/\r\n?/gu, "\n").replace(/%%[\s\S]*?%%/gu, "").replace(/<!--[\s\S]*?-->/gu, "").split("\n");
   let front: Front = {};
   if (lines[0]?.trim() === "---") {
@@ -274,7 +314,7 @@ export function markdownToSession(markdown: string, fileName: string, options: M
   const drafts: Draft[] = [], todos: TodoItem[] = [];
   let h1: string | undefined, section: keyof typeof SECTION | undefined, heading: string | undefined;
   let paragraph: string[] = [], fence: { marker: string; mermaid: boolean; lines: string[] } | undefined;
-  const add = (draft: Draft) => { if (draft.text && drafts.length < MAX_ENTRIES) drafts.push(draft); };
+  const add = (draft: Draft) => { if (!draft.text) return; if (drafts.length < MAX_ENTRIES) drafts.push(draft); else droppedLines++; };
   const note = (text: string, origin = "obsidian-note") => add({ kind: "transcript", text, origin, ...(heading ? { section: heading } : {}) });
   const knowledge = (text: string): boolean => {
     if (!text) return true;
@@ -345,6 +385,7 @@ export function markdownToSession(markdown: string, fileName: string, options: M
       if (section === "todos") {
         // Task checkboxes written by sessionToMarkdown (or by hand) come back as the session's to-do list.
         const fields = parseTodoLine(plain(bullet[1]!, tags));
+        if (fields.text && todos.length >= MAX_TODOS) droppedItems++;
         if (fields.text && todos.length < MAX_TODOS) todos.push({ id: `todo-${todos.length + 1}`, ...fields, done: /^\s*(?:[-*+]|\d+[.)])\s+\[[xX]\]/u.test(line), origin: "user", createdAt: "", updatedAt: "" });
         continue;
       }
@@ -364,20 +405,45 @@ export function markdownToSession(markdown: string, fileName: string, options: M
   const baseName = fileName.replace(/^.*[\\/]/u, "").replace(/\.md$/iu, "");
   const datePrefix = /^(\d{4}-\d{2}-\d{2})\s+(.*)$/u.exec(baseName);
   const title = bounded(plain(frontString(front, "title") ?? h1 ?? datePrefix?.[2] ?? baseName) || "Obsidian note", 300);
-  const fallback = isoOf(options.now) ?? new Date().toISOString();
+  // v0.16: a note without a date is as old as its file, not as new as this import.
+  const modified = typeof options.lastModified === "number" ? (Number.isFinite(options.lastModified) && options.lastModified > 0 && Math.abs(options.lastModified) <= 8.64e15 ? new Date(options.lastModified).toISOString() : undefined) : isoOf(options.lastModified);
+  const fallback = modified ?? isoOf(options.now) ?? new Date().toISOString();
   const startedAt = isoOf(frontString(front, "started_at", "startedat")) ?? isoOf(frontString(front, "date", "created")) ?? isoOf(datePrefix?.[1]) ?? fallback;
   const updatedAt = isoOf(frontString(front, "updated_at", "updatedat", "updated", "modified")) ?? startedAt;
-  const sessionId = `obsidian:${idPart(helixSessionId ?? fileName.replace(/\.md$/iu, ""))}`;
+  /*
+   * v0.16 ids. Until now the id was the file name alone, so two "Untitled.md" (or two pasted notes with
+   * one title) were one session and the second replaced the first. Now the name is joined by a short
+   * hash of what tells the note apart and does not change when the note is edited: its path or link
+   * when known, else the frontmatter id, created or date; for pasted text, the text itself. A note with
+   * none of these keeps the plain name (MarkdownImportPlanner numbers a second such note in one import).
+   * A note exported by Helix keeps the id of its session.
+   */
+  const contentHash = hash8(markdown) + hash8(markdown, 0x9747b28c);
+  const legacyId = `obsidian:${idPart(helixSessionId ?? fileName.replace(/\.md$/iu, ""))}`;
+  const path = typeof options.path === "string" ? options.path.trim().replace(/\\/gu, "/") : "";
+  const frontId = frontString(front, "id", "uid", "uuid"), created = frontString(front, "created"), dated = frontString(front, "date");
+  const mark = helixSessionId ? undefined
+    : path && path !== fileName ? `path:${path}`
+    : frontId ? `id:${frontId}` : created ? `created:${created}` : dated ? `date:${dated}`
+    : options.pasted ? `text:${contentHash}` : undefined;
+  const sessionId = mark ? `${legacyId}:h${hash8(mark)}` : legacyId;
+  // A path, a frontmatter id, a Helix session id or the pasted text itself names one note. A file name, alone or with a day, does not.
+  const weakId = !helixSessionId && (mark === undefined || mark.startsWith("created:") || mark.startsWith("date:"));
   for (const tag of frontList(front, "tags", /[,\s]+/u)) tags.add(tag);
   const byName = new Map<string, SessionPerson>();
   for (const name of frontList(front, "people", /,/u).map(value => plain(value))) if (name && !byName.has(normal(name))) byName.set(normal(name), { name: bounded(name, MAX_ITEM_CHARS) });
   for (const person of people) byName.set(normal(person.name), { ...byName.get(normal(person.name)), ...person });
-  const items = (values: Iterable<string>) => [...new Set([...values].map(v => bounded(v, MAX_ITEM_CHARS)).filter(Boolean))].slice(0, MAX_ITEMS);
+  const items = (values: Iterable<string>) => {
+    const all = [...values].filter(Boolean), unique = [...new Set(all.map(v => bounded(v, MAX_ITEM_CHARS)).filter(Boolean))];
+    droppedItems += Math.max(0, unique.length - MAX_ITEMS) + all.filter(v => Array.from(v).length > MAX_ITEM_CHARS).length;
+    return unique.slice(0, MAX_ITEMS);
+  };
   const cleanTags = items([...tags].map(obsidianTag));
   const session: HistorySession = { id: sessionId, source: "obsidian", title, startedAt, updatedAt };
   if (summary.length) session.summary = items(summary);
   if (keyFacts.length) session.keyFacts = items(keyFacts);
   if (byName.size) session.people = [...byName.values()].slice(0, MAX_ITEMS);
+  droppedItems += Math.max(0, byName.size - MAX_ITEMS);
   if (concepts.length) session.concepts = items(concepts);
   if (cleanTags.length) session.tags = cleanTags;
   if (todos.length) session.todos = todos.map(item => ({ ...item, createdAt: startedAt, updatedAt }));
@@ -388,7 +454,107 @@ export function markdownToSession(markdown: string, fileName: string, options: M
     ...(draft.speaker ? { speaker: draft.speaker } : {}),
     metadata: { origin: draft.origin, ...(draft.section ? { section: bounded(draft.section, 200) } : {}) },
   }));
-  return { session, entries, ...(helixSessionId ? { helixSessionId } : {}) };
+  const count = (n: number, one: string, many: string) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
+  const left = [
+    ...(droppedLines ? [`${count(droppedLines, "line", "lines")} past the ${MAX_ENTRIES.toLocaleString("en-US")}-line limit left out`] : []),
+    ...(counted.lines ? [`${count(counted.lines, "long line", "long lines")} cut to ${MAX_ENTRY_CHARS.toLocaleString("en-US")} characters`] : []),
+    ...(droppedItems ? [`${count(droppedItems, "summary or list item", "summary or list items")} left out or shortened (${MAX_ITEMS} of ${MAX_ITEM_CHARS} characters each are kept)`] : []),
+  ];
+  return { session, entries, contentHash, ...(weakId ? { weakId: true as const } : {}), ...(helixSessionId ? { helixSessionId } : {}), ...(sessionId !== legacyId ? { legacySessionId: legacyId } : {}), ...(left.length ? { truncated: `${left.join("; ")}.` } : {}) };
+}
+
+/** The same note under another session id (its lines are numbered under that id). */
+export function renameMarkdownSession(note: MarkdownSession, id: string): MarkdownSession {
+  return { ...note, session: { ...note.session, id }, entries: note.entries.map((entry, index) => ({ ...entry, id: `${id}:${index}`, sessionId: id })) };
+}
+export interface MarkdownPlacement {
+  /** The note under the id to save it with. */ note: MarkdownSession;
+  /** The session saved for this note by an earlier version, under its old id: replaceSession removes it in the same save. */
+  supersedes?: string;
+  /** The same text was already placed in this import: nothing to save. */
+  duplicate?: true;
+}
+/** What the planner reads from the saved archive (LocalHistoryStore has both). */
+export interface MarkdownImportLookup { getSession(id: string): HistorySession | undefined; getEntries(id: string): HistoryEntry[] }
+/** Words of a note, lower-cased; Chinese, Japanese and Korean text as pairs of characters. */
+function noteWords(entries: readonly HistoryEntry[]): Set<string> {
+  const words = new Set<string>();
+  for (const entry of entries) for (const run of entry.text.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+    if (!/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(run)) { if (run.length > 2) words.add(run); continue; }
+    const chars = Array.from(run);
+    if (chars.length === 1) words.add(run);
+    for (let i = 0; i + 1 < chars.length; i++) words.add(chars[i]! + chars[i + 1]!);
+  }
+  return words;
+}
+/** At least this share of the shorter note's words must be in the other for the two to be one note, edited. */
+const SAME_NOTE_SHARE = 0.5;
+/**
+ * How much of the shorter of two notes is in the other (0..1). A saved note without lines counts as the
+ * same note (nothing of it can be lost); a new note without lines is not taken for a saved one that has some.
+ */
+function noteLikeness(saved: readonly HistoryEntry[], next: readonly HistoryEntry[]): number {
+  const a = noteWords(saved), b = noteWords(next);
+  if (!a.size) return 1;
+  if (!b.size) return 0;
+  let shared = 0;
+  for (const word of b) if (a.has(word)) shared++;
+  return shared / Math.min(a.size, b.size);
+}
+/**
+ * v0.16: gives the notes of one import their final ids, one note at a time.
+ * - A second, different note that arrives at an id already taken in this import gets ":n2", ":n3", ...
+ *   (two "Untitled.md" without a path or frontmatter): both are kept.
+ * - The same text twice is reported as a duplicate.
+ * - A note that only its file name identifies (`weakId`) is compared with the copies saved under that
+ *   name (the plain id and its ":nN" siblings): it replaces the one it shares most words with, when that
+ *   is at least half of the shorter note (the same note, edited). When none is alike it is another note
+ *   with the same name and gets the next free ":nN", so a later import does not overwrite the saved one.
+ * - A note that an earlier version saved under its old id ("obsidian:<file name>") takes that copy's
+ *   place: the first note of the import that maps to the old id replaces it instead of being added
+ *   beside it. Pasted text does so only when its lines are the same, and a note with a weak id only
+ *   when the two are alike, because one title can be two notes.
+ */
+export class MarkdownImportPlanner {
+  private readonly used = new Map<string, string>();
+  private readonly claimed = new Set<string>();
+  constructor(private readonly archive: MarkdownImportLookup) {}
+  /** The id for a note that its file name alone identifies: the saved copy it is an edit of, else the next free one. */
+  private weakPlace(note: MarkdownSession): string {
+    const base = note.session.id, sibling = (n: number) => n === 1 ? base : `${base}:n${n}`;
+    let best: string | undefined, share = SAME_NOTE_SHARE, free: string | undefined;
+    // Siblings are numbered without gaps unless one was removed: look a little past the first free number.
+    for (let n = 1, misses = 0; misses < 8 && n < 1000; n++) {
+      const id = sibling(n), saved = this.archive.getSession(id);
+      if (!saved) { misses++; if (!this.used.has(id)) free ??= id; continue; }
+      misses = 0;
+      if (this.used.has(id) || saved.source !== "obsidian") continue;
+      const likeness = noteLikeness(this.archive.getEntries(id), note.entries);
+      if (likeness > share || (likeness === share && !best)) { best = id; share = likeness; }
+    }
+    return best ?? free ?? base;
+  }
+  place(note: MarkdownSession, options: { pasted?: boolean } = {}): MarkdownPlacement {
+    const base = note.session.id;
+    let id = base;
+    if (note.weakId) {
+      for (const [taken, hash] of this.used) if (hash === note.contentHash && (taken === base || taken.startsWith(`${base}:n`))) return { note, duplicate: true };
+      id = this.weakPlace(note);
+    } else {
+      for (let n = 2; this.used.has(id) && this.used.get(id) !== note.contentHash; n++) id = `${base}:n${n}`;
+      if (this.used.get(id) === note.contentHash) return { note, duplicate: true };
+    }
+    this.used.set(id, note.contentHash);
+    const placed = id === note.session.id ? note : renameMarkdownSession(note, id);
+    const legacy = note.legacySessionId;
+    if (!legacy || this.used.has(legacy) || this.claimed.has(legacy) || this.archive.getSession(id)) return { note: placed };
+    const old = this.archive.getSession(legacy);
+    if (!old || old.source !== "obsidian") return { note: placed };
+    if (options.pasted && this.archive.getEntries(legacy).map(entry => entry.text).join("\n") !== note.entries.map(entry => entry.text).join("\n")) return { note: placed };
+    if (note.weakId && noteLikeness(this.archive.getEntries(legacy), note.entries) < SAME_NOTE_SHARE) return { note: placed };
+    this.claimed.add(legacy);
+    return { note: placed, supersedes: legacy };
+  }
 }
 
 /* ------------------------------------------------------------------ Helix -> Omi */
@@ -476,7 +642,7 @@ export async function exportToOmi(options: OmiExportOptions): Promise<OmiExportR
   let endpoint: "from-segments" | "from-text", body: Record<string, unknown>;
   if (segments.length) {
     endpoint = "from-segments";
-    body = { transcript_segments: segments, client_session_id: `helix-${idPart(session.id)}`.slice(0, 200), source: "external_integration", started_at: new Date(Date.parse(session.startedAt)).toISOString(), ...(language ? { language } : {}) };
+    body = { transcript_segments: segments, client_session_id: helixClientSessionId(session.id), source: "external_integration", started_at: new Date(Date.parse(session.startedAt)).toISOString(), ...(language ? { language } : {}) };
   } else {
     const summary = [...(session.summary ?? []), ...facts].map(cleanLine).filter(Boolean);
     if (!summary.length) return { status: "skipped", reason: "This session has no transcript or summary to export." };

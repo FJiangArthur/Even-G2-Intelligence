@@ -129,8 +129,11 @@ export interface CopilotSuggestion {
   /**
    * Candidate mode only. "they-ask" = a question the interviewer is likely to ask next (panel heading
    * "They may ask"); "ask-them" = a question the wearer could ask ("Ask them"). Absent = ask-them.
+   * "say" (v0.16) = a line the wearer can read aloud word for word: a question, a comparison, a
+   * counterpoint or a link to a named idea. `question` holds the line. Hosts show it bare, with no
+   * heading, and a tap marks it said instead of asking Helix about it.
    */
-  readonly kind?: "they-ask" | "ask-them";
+  readonly kind?: "they-ask" | "ask-them" | "say";
 }
 
 /**

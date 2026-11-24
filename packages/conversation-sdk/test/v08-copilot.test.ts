@@ -122,11 +122,11 @@ describe("copilot people", () => {
     await settle();
     expect(h.people.map(p => p.name)).toEqual(["Priya", "王伟"]);
   });
-  it("asks for wearer-phrased suggestions (the ask kind)", async () => {
+  it("asks for wearer-phrased suggestions: lines to say in Meeting (v0.16), questions to ask in the question modes", async () => {
     const h = harness([{}]);
     h.copilot.submit("t1", "Our lead time is long.");
     await settle();
-    expect(h.analyses()[0]!.instructions).toMatch(/questions the WEARER could ask the other party/);
+    expect(h.analyses()[0]!.instructions).toMatch(/lines the WEARER can say next, each written to be read aloud word for word/);
     expect(h.analyses()[0]!.instructions).toMatch(/never invent or complete a name/);
   });
 });

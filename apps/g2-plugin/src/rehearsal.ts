@@ -7,7 +7,7 @@
 import type { Speaker } from "@helix/conversation-sdk";
 import scriptData from "./rehearsal-scripts.json";
 
-export type RehearsalKind = "interview" | "technical" | "meeting";
+export type RehearsalKind = "interview" | "technical" | "meeting" | "talk";
 
 export interface RehearsalLine {
   readonly speaker: "self" | "other";
@@ -31,6 +31,12 @@ export interface RehearsalExpectations {
   readonly questions?: readonly string[];
   /** Substrings of question-intent lines not phrased as questions (copilot ask kind "question"). */
   readonly implicitQuestions?: readonly string[];
+  /** v0.16 talk scripts: suggestions of kind "say" must appear. */
+  readonly sayLines?: boolean;
+  /** v0.16: substrings of the speaker's rhetorical questions that must NOT be answered. */
+  readonly unanswered?: readonly string[];
+  /** v0.16: labels that must not appear in any output (e.g. the interviewer answer key). */
+  readonly forbiddenLabels?: readonly string[];
 }
 
 export interface RehearsalScript {

@@ -55,6 +55,24 @@ function evidence(entry: HistoryEntry): boolean {
     // Imported Omi overviews are vendor-generated summaries, not evidence.
     && entry.metadata?.origin !== "omi-summary" && !/^omi summary$/i.test(entry.speaker?.trim() ?? "");
 }
+/*
+ * v0.16: what an imported session (Omi, Obsidian, PDF) knows beyond its lines. Its summary, key facts and
+ * concepts are searched as three records of that session, so a question can be answered from a
+ * conversation whose transcript was not imported ("Summaries only") or whose summary says it better.
+ * They are not stored: they are made from the session record when the index reads the archive. Live
+ * Helix sessions are indexed exactly as before.
+ */
+const KNOWLEDGE_FIELDS = [["summary", "Summary"], ["keyFacts", "Key facts"], ["concepts", "Concepts"]] as const;
+const KNOWLEDGE_ID = /^(.+):knowledge:(?:summary|keyFacts|concepts)$/u;
+/** The session a summary record belongs to, or undefined when the id is not one. */
+export function knowledgeEntrySession(entryId: string): string | undefined { return KNOWLEDGE_ID.exec(entryId)?.[1]; }
+function knowledgeTexts(session: HistorySession): [key: string, speaker: string, text: string][] {
+  if (session.source === "helix") return [];
+  return KNOWLEDGE_FIELDS.flatMap(([key, speaker]) => {
+    const text = (session[key] ?? []).filter(item => typeof item === "string" && item.trim()).join("\n");
+    return text ? [[key, speaker, text] as [string, string, string]] : [];
+  });
+}
 export function bounded(value: number | undefined, fallback: number, max: number): number {
   return value === undefined ? fallback : Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : fallback;
 }
@@ -130,6 +148,8 @@ export class RetrievalIndex {
   private readonly shelves = new Map<string, Shelf>();
   private readonly unfinished = new Set<Shelf>();
   private source?: RetrievalSource;
+  /** v0.16: per imported session, its entry list with the summary records added (kept while neither changes). */
+  private readonly extended = new Map<string, { session: HistorySession; base: readonly HistoryEntry[]; made: Map<string, HistoryEntry>; list: readonly HistoryEntry[] }>();
   private eligible = 0;
   private lengths = 0;
   /** Bumped on every change, so a paused query can tell that it must start over. */
@@ -188,6 +208,21 @@ export class RetrievalIndex {
     for (const doc of shelf.docs) if (doc) { const size = span(doc); ids.set(shelf.ids.subarray(doc.at, doc.at + size), at); doc.at = at; at += size; }
     shelf.ids = ids; shelf.filled = live; shelf.wasted = 0;
   }
+  /** A session's entries as indexed: its saved lines, plus the summary records of an imported session. */
+  private listOf(session: HistorySession, base: readonly HistoryEntry[]): readonly HistoryEntry[] {
+    if (session.source === "helix") return base;
+    const cached = this.extended.get(session.id);
+    if (cached && cached.session === session && cached.base === base) return cached.list;
+    const made = new Map<string, HistoryEntry>();
+    for (const [key, speaker, text] of knowledgeTexts(session)) {
+      const sign = `${key}\u0000${session.startedAt}\u0000${text}`;
+      made.set(sign, cached?.made.get(sign) ?? { id: `${session.id}:knowledge:${key}`, sessionId: session.id, kind: "transcript", text, occurredAt: session.startedAt, speaker, metadata: { origin: "session-summary" } });
+    }
+    const same = cached && cached.base === base && cached.made.size === made.size && [...made.keys()].every(sign => cached.made.has(sign));
+    const list = same ? cached.list : made.size ? [...base, ...made.values()] : base;
+    this.extended.set(session.id, { session, base, made, list });
+    return list;
+  }
   /** Forgets every token and tokenizes the archive again (in slices, by sync). */
   private reset(): void {
     this.ids.clear(); this.names.length = 0; this.counts = new Uint32Array(0); this.refs = new Uint32Array(0); this.used = 0; this.byHead.clear();
@@ -204,7 +239,7 @@ export class RetrievalIndex {
     const present = new Set<string>();
     let dropped = false;
     for (const session of source.sessions) {
-      const list = source.entries.get(session.id) ?? NO_ENTRIES; let shelf = this.shelves.get(session.id);
+      const list = this.listOf(session, source.entries.get(session.id) ?? NO_ENTRIES); let shelf = this.shelves.get(session.id);
       present.add(session.id);
       if (!shelf) {
         if (!list.length) continue;
@@ -229,6 +264,7 @@ export class RetrievalIndex {
       shelf.list = list;
       if (shelf.pending) this.unfinished.add(shelf); else { this.unfinished.delete(shelf); this.pack(shelf); }
     }
+    for (const id of this.extended.keys()) if (!present.has(id)) this.extended.delete(id);
     for (const [id, shelf] of this.shelves) {
       if (present.has(id)) continue;
       for (const doc of shelf.docs) if (doc) { this.count(doc, -1); dropped = true; }

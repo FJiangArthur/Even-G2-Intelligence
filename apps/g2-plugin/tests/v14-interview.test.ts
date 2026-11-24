@@ -6,7 +6,7 @@ import {
 import { MODE_PROFILES, PICKER_MODES, type CopilotSuggestion, type GatewayEvent } from "@helix/conversation-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AnswerPager, CUT_OFF_MARK, MAX_WAITING_AGE_MS, STREAM_STALL_MS, pageReadingMs } from "../src/answer-pager";
-import { BODY_LINES, GlassesHud, HUD_LINE_WIDTH, NOTICE_MS, SUGGESTION_CUE_GAP_MS, SUGGESTION_CUE_MS, hudTextWidth } from "../src/glasses-hud";
+import { AMBIENT_LINES, AMBIENT_LINE_WIDTH, GlassesHud, NOTICE_MS, SUGGESTION_CUE_GAP_MS, SUGGESTION_CUE_MS, hudTextWidth } from "../src/glasses-hud";
 import type { GlassesRenderBridge } from "../src/glasses-renderer";
 import { modeIcon } from "../src/pixel-art";
 import { ConversationPresentation } from "../src/presentation";
@@ -54,6 +54,10 @@ async function listening(mode = "interviewer", options: ConstructorParameters<ty
   return mounted;
 }
 const blank = (text: string) => text.trim() === "";
+/** v0.16: the pop-up on the hidden display as its non-blank lines, without the centring spaces. */
+const pop = (hud: GlassesHud) => hud.frame.body.split("\n").map(line => line.trim()).filter(Boolean);
+/** v0.16: the last line of the hidden-display container (page marker, hint, problem); "" when there is none. */
+const footer = (hud: GlassesHud) => { const lines = hud.frame.body.split("\n"); return lines.length >= AMBIENT_LINES ? lines[AMBIENT_LINES - 1]!.trim() : ""; };
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -334,7 +338,7 @@ describe("v0.14 presentation: errors and cut-off answers", () => {
 });
 
 describe("v0.14 glasses: suggested questions pop up on the ambient display", () => {
-  it("pops the top new suggestion up in one glance: question first, the why when it fits", async () => {
+  it("pops the top new suggestion up in one glance: the bare question, no heading and no reason (v0.16)", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening("interviewer");
     expect(blank(hud.frame.body)).toBe(true);
@@ -342,11 +346,13 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
       suggestion("s1", "What was your own contribution to the migration?", "They said 'we' throughout."),
       suggestion("s2", "Which numbers moved after the launch?", "No outcome was given."),
     ]);
-    expect(hud.frame.title).toBe(MODE_PROFILES.interviewer.askLabel);
-    expect(hud.frame.body).toBe("What was your own contribution to the\nmigration?\n\nWhy: They said 'we' throughout.");
+    expect(pop(hud)).toEqual(["What was your own contribution to the migration?"]);
+    expect(blank(hud.frame.title) && blank(hud.frame.status)).toBe(true);
+    expect(hud.frame.body).not.toContain(MODE_PROFILES.interviewer.askLabel);
+    expect(hud.frame.body).not.toContain("Why:");
+    expect(hud.frame.body).not.toContain("They said");
     expect(hud.frame.body).not.toContain("Which numbers");
-    expect(hud.frame.status.trim()).toBe("tap to close");
-    for (const line of hud.frame.body.split("\n")) expect(hudTextWidth(line)).toBeLessThanOrEqual(HUD_LINE_WIDTH.body);
+    for (const line of hud.frame.body.split("\n")) expect(hudTextWidth(line)).toBeLessThanOrEqual(AMBIENT_LINE_WIDTH);
     // It stays long enough to be read and said, then the display is blank again.
     await vi.advanceTimersByTimeAsync(SUGGESTION_CUE_MS - 100);
     expect(hud.frame.body).toContain("What was your own contribution");
@@ -359,23 +365,24 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("drops the why when it does not fit, and never exceeds the body", async () => {
+  it("cuts a very long suggestion to the container and never exceeds it", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening("interviewer");
     const long = "Can you walk me through exactly how you sized the cluster, which load tests you ran, what the p99 latency was before and after, and which of those decisions were yours rather than the team's? ";
-    presentation.setSuggestions([suggestion("s1", long.repeat(2), "A very long reason that will certainly not fit under a question that already fills the whole body of the display.")]);
+    presentation.setSuggestions([suggestion("s1", long.repeat(4), "A very long reason that will certainly not fit under a question that already fills the whole body of the display.")]);
     const lines = hud.frame.body.split("\n");
-    expect(lines.length).toBeLessThanOrEqual(BODY_LINES);
+    expect(lines.length).toBeLessThanOrEqual(AMBIENT_LINES);
     expect(hud.frame.body).not.toContain("Why:");
-    expect(hud.frame.body.startsWith("Can you walk me through")).toBe(true);
-    for (const line of lines) expect(hudTextWidth(line)).toBeLessThanOrEqual(HUD_LINE_WIDTH.body);
+    expect(pop(hud)[0]!.startsWith("Can you walk me through")).toBe(true);
+    expect(pop(hud).at(-1)!.endsWith("…")).toBe(true);
+    for (const line of lines) expect(hudTextWidth(line)).toBeLessThanOrEqual(AMBIENT_LINE_WIDTH);
   });
 
   it("shows at most one suggestion every 20 s and the newest top one only", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening("interviewer");
     presentation.setSuggestions([suggestion("s1", "What was your own part?")]);
-    expect(hud.frame.body).toBe("What was your own part?");
+    expect(pop(hud)).toEqual(["What was your own part?"]);
     expect(hud.handleGesture("click")).toEqual({ type: "handled" }); // tap closes it
     expect(blank(hud.frame.body)).toBe(true);
     await vi.advanceTimersByTimeAsync(5000);
@@ -386,7 +393,7 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
     await vi.advanceTimersByTimeAsync(SUGGESTION_CUE_GAP_MS - 7000 - 100);
     expect(blank(hud.frame.body)).toBe(true);
     await vi.advanceTimersByTimeAsync(200);
-    expect(hud.frame.body).toBe("Who made the final call?"); // the top one now, not the one that was top before
+    expect(pop(hud)).toEqual(["Who made the final call?"]); // the top one now, not the one that was top before
     await vi.advanceTimersByTimeAsync(120_000);
     expect(blank(hud.frame.body)).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
@@ -396,7 +403,7 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
     vi.useFakeTimers();
     const { hud, presentation } = await listening("interviewer");
     presentation.setSuggestions([suggestion("s1", "What was your own part?", "", { askedAt: at }), suggestion("s2", "Which numbers moved?")]);
-    expect(hud.frame.body).toBe("Which numbers moved?"); // the top one that is still open
+    expect(pop(hud)).toEqual(["Which numbers moved?"]); // the top one that is still open
     presentation.setSuggestions([suggestion("s2", "Which numbers moved?", "", { askedAt: at })]);
     expect(blank(hud.frame.body)).toBe(true); // said aloud: it leaves the display
     await vi.advanceTimersByTimeAsync(SUGGESTION_CUE_GAP_MS + 1000);
@@ -411,26 +418,32 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
     presentation.apply(question("q1", "Do you offer remote work?"));
     presentation.apply(completed("a1", "q1", "Yes, two days a week."));
     presentation.setSuggestions([suggestion("s1", "What was your own part?")]);
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1");
-    expect(hud.frame.body).not.toContain("What was your own part?");
+    expect(pop(hud)).toEqual(["Yes, two days a week."]);
     await vi.advanceTimersByTimeAsync(8100);
-    expect(hud.frame.title).toBe(MODE_PROFILES.interviewer.askLabel);
-    expect(hud.frame.body).toBe("What was your own part?");
+    expect(pop(hud)).toEqual(["What was your own part?"]);
   });
 
-  it("titles the pop-up from the mode profile, and Candidate mode names what the other side may ask", async () => {
+  it("shows the pop-up without a title in every mode (v0.16), marks what the other side may ask inside the sentence; the woken list still carries the mode's label and the Q: mark", async () => {
     vi.useFakeTimers();
     const meeting = await listening("general");
     meeting.presentation.setSuggestions([suggestion("s1", "Who owns the purchase request?")]);
-    expect(meeting.hud.frame.title).toBe(MODE_PROFILES.general.askLabel);
+    expect(pop(meeting.hud)).toEqual(["Who owns the purchase request?"]);
+    expect(blank(meeting.hud.frame.title)).toBe(true);
     const candidate = await listening("interviewee");
     candidate.presentation.setSuggestions([suggestion("s1", "Why are you leaving your current role?", "They may ask: you mentioned a reorg.", { kind: "they-ask" })]);
-    expect(candidate.hud.frame.title).toBe("THEY MAY ASK");
-    expect(candidate.hud.frame.body).toBe("Why are you leaving your current role?\n\nWhy: you mentioned a reorg.");
+    expect(pop(candidate.hud)).toEqual(["They may ask: Why are you leaving your current role?"]);
+    expect(candidate.hud.frame.body).not.toMatch(/THEY MAY ASK|Why:|reorg/u);
     candidate.hud.handleGesture("click");
     await vi.advanceTimersByTimeAsync(SUGGESTION_CUE_GAP_MS);
-    candidate.presentation.setSuggestions([suggestion("s2", "How is the team's on-call set up?", "", { kind: "ask-them" })]);
-    expect(candidate.hud.frame.title).toBe(MODE_PROFILES.interviewee.askLabel);
+    candidate.presentation.setSuggestions([suggestion("s2", "How is the team's on-call set up?", "", { kind: "ask-them" }),
+      suggestion("s1", "Why are you leaving your current role?", "They may ask: you mentioned a reorg.", { kind: "they-ask" })]);
+    expect(pop(candidate.hud)).toEqual(["How is the team's on-call set up?"]);
+    // Woken HUD: the list is titled from the mode profile and marks what the other side may ask.
+    candidate.hud.handleGesture("double");
+    const ask = candidate.hud.menuItems.findIndex(item => item.action === "ask-them");
+    candidate.hud.selectListItem(ask, candidate.hud.menuItems[ask]!.label);
+    expect(candidate.hud.frame.title).toBe(`${MODE_PROFILES.interviewee.askLabel} 1/2`);
+    expect(candidate.hud.frame.body).toContain("Q: Why are you leaving");
   });
 
   it("leaves asked suggestions out of the glasses list", async () => {
@@ -454,13 +467,12 @@ describe("v0.14 glasses: answers stay readable", () => {
     presentation.apply(question("q1", "Do you offer remote work?"));
     presentation.apply(completed("a1", "q1", "Yes, two days a week."));
     presentation.apply(problem("Helix is catching up."));
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1");
-    expect(hud.frame.body).toContain("Yes, two days a week.");
-    expect(hud.frame.status).toContain("! Helix is catching up.");
-    expect(hudTextWidth(hud.frame.status.trim())).toBeLessThanOrEqual(HUD_LINE_WIDTH.status);
+    expect(pop(hud)).toEqual(["Yes, two days a week.", "! Helix is catching up."]);
+    expect(footer(hud)).toBe("! Helix is catching up."); // the problem is on the last line of the same container
+    for (const line of hud.frame.body.split("\n")) expect(hudTextWidth(line)).toBeLessThanOrEqual(AMBIENT_LINE_WIDTH);
     await vi.advanceTimersByTimeAsync(NOTICE_MS + 100);
-    expect(hud.frame.status).not.toContain("!");
-    expect(hud.frame.body).toContain("Yes, two days a week.");
+    expect(hud.frame.body).not.toContain("!");
+    expect(pop(hud)).toEqual(["Yes, two days a week."]);
     // A session-ending error does clear it.
     presentation.apply(problem("The API key was rejected.", true));
     expect(hud.frame.body).not.toContain("Yes, two days a week.");
@@ -470,14 +482,14 @@ describe("v0.14 glasses: answers stay readable", () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening("general");
     presentation.setStatus("listening", "Background copilot failed.");
-    expect(hud.frame.status).toContain("! Background copilot failed.");
-    expect(blank(hud.frame.body)).toBe(true);
+    expect(pop(hud)).toEqual(["! Background copilot failed."]);
+    expect(footer(hud)).toBe("! Background copilot failed.");
     await vi.advanceTimersByTimeAsync(NOTICE_MS + 1000);
-    expect(blank(hud.frame.status)).toBe(true);
+    expect(blank(hud.frame.body)).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("gives the current answer its first page, marks the waiting one with +1, and keeps each answer with its own question", async () => {
+  it("gives the current answer its first page, marks the waiting one with +1, and shows each answer in turn", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening("general");
     presentation.apply(question("q1", "Do you offer remote work?"));
@@ -485,14 +497,11 @@ describe("v0.14 glasses: answers stay readable", () => {
     await vi.advanceTimersByTimeAsync(500);
     presentation.apply(question("q2", "What is the notice period?"));
     presentation.apply(delta("a2", "q2", "Four weeks"));
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1 +1");
-    expect(hud.frame.body).toBe("Q: Do you offer remote work?\nYes, two days a week.");
-    expect(hud.frame.status.trim()).toBe("tap: next answer");
-    expect(hudTextWidth(hud.frame.title)).toBeLessThanOrEqual(HUD_LINE_WIDTH.header);
+    expect(pop(hud)).toEqual(["Yes, two days a week.", "1/1 +1 · tap: next answer"]);
+    expect(footer(hud)).toBe("1/1 +1 · tap: next answer");
     presentation.apply(completed("a2", "q2", "Four weeks."));
     await vi.advanceTimersByTimeAsync(2500);
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1");
-    expect(hud.frame.body).toBe("Q: What is the notice period?\nFour weeks.");
+    expect(pop(hud)).toEqual(["Four weeks."]);
     await vi.advanceTimersByTimeAsync(8100);
     expect(blank(hud.frame.body)).toBe(true);
   });
@@ -506,13 +515,12 @@ describe("v0.14 glasses: answers stay readable", () => {
     presentation.apply(completed("a2", "q2", "Four weeks."));
     expect(hud.frame.body).toContain("Yes, two days a week.");
     expect(hud.handleGesture("click")).toEqual({ type: "handled" });
-    expect(hud.frame.body).toBe("Q: What is the notice period?\nFour weeks.");
+    expect(pop(hud)).toEqual(["Four weeks."]);
     presentation.apply(question("q3", "Is there a bonus?"));
     presentation.apply(completed("a3", "q3", "Up to ten percent."));
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1 +1");
+    expect(footer(hud)).toBe("1/1 +1 · tap: next answer");
     presentation.beginRequest();
-    expect(hud.frame.title).toBe("◆ ANSWER");
-    expect(hud.frame.body).toContain("Thinking…");
+    expect(pop(hud)).toEqual(["Thinking…"]);
     expect(hud.frame.body).not.toContain("Four weeks.");
   });
 
@@ -522,26 +530,35 @@ describe("v0.14 glasses: answers stay readable", () => {
     presentation.apply(question("q1", "How long is the lead time?"));
     presentation.apply(delta("a1", "q1", "Twelve to sixteen "));
     presentation.apply(completed("a1", "q1", "Twelve to sixteen", true));
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1");
-    expect(hud.frame.body).toBe(`Q: How long is the lead time?\nTwelve to sixteen${CUT_OFF_MARK}`);
-    expect(hud.frame.status.trim()).toBe("cut off · tap to close");
+    expect(pop(hud)).toEqual([`Twelve to sixteen${CUT_OFF_MARK}`, "cut off"]);
+    expect(footer(hud)).toBe("cut off");
     await vi.advanceTimersByTimeAsync(7000);
     expect(hud.frame.body).toContain("Twelve to sixteen");
   });
 
-  it("titles a Candidate mode answer as a reply to say", async () => {
+  it("titles a Candidate mode answer as a reply to say on the awake HUD; the hidden display shows the reply alone (v0.16)", async () => {
     vi.useFakeTimers();
-    const { hud, presentation } = await listening("interviewee");
+    const hidden = await listening("interviewee");
+    hidden.presentation.apply(question("q1", "Why are you leaving your current role?"));
+    hidden.presentation.apply(completed("a1", "q1", "I want to own a product end to end."));
+    expect(pop(hidden.hud)).toEqual(["I want to own a product end to end."]);
+    expect(hidden.hud.frame.body).not.toMatch(/YOUR REPLY|Q:|tap to close/u);
+    const { hud, presentation } = await listening("interviewee", { display: "always-on" });
     presentation.apply(question("q1", "Why are you leaving your current role?"));
     presentation.apply(completed("a1", "q1", "I want to own a product end to end."));
     expect(hud.frame.title).toBe("◆ YOUR REPLY 1/1");
-    expect(hud.frame.status.trim()).toBe("reply · tap to close");
+    expect(hud.frame.status).toContain("reply · tap"); // the clock and the mode tag share the line
     expect(hud.frame.body).toBe("Q: Why are you leaving your current role?\nI want to own a product end to end.");
     // Interviewer mode keeps its answer key and THEY ASKED titles.
-    const other = await listening("interviewer");
+    const other = await listening("interviewer", { display: "always-on" });
     other.presentation.apply(question("q1", "Tell me about a hard migration.", "self"));
     other.presentation.apply(completed("a1", "q1", "A strong answer covers scope, their role and the outcome."));
     expect(other.hud.frame.title).toBe("§ ANSWER KEY 1/1");
+    // On the hidden display the answer key is the text alone.
+    const key = await listening("interviewer");
+    key.presentation.apply(question("q1", "Tell me about a hard migration.", "self"));
+    key.presentation.apply(completed("a1", "q1", "A strong answer covers scope, their role and the outcome."));
+    expect(pop(key.hud)).toEqual(["A strong answer covers scope, their role and the outcome."]);
   });
 
   it("labels a finished answer with its age when it is looked at again minutes later", async () => {
@@ -570,7 +587,9 @@ describe("v0.14 phone: Q&A panel and modes", () => {
     expect(suggestionGroups("general", [open]).map(group => group.heading)).toEqual(["Ask them"]);
     expect(suggestionGroups("technical", [open]).map(group => group.heading)).toEqual(["Probe"]);
     expect(suggestionGroups("interviewer", [open]).map(group => group.heading)).toEqual(["Probes to ask"]);
-    expect(suggestionGroups(undefined, []).map(group => group.heading)).toEqual(["Ask them"]);
+    // v0.16: Meeting (the default mode) suggests lines to say, so its empty panel is headed "Say next".
+    expect(suggestionGroups(undefined, []).map(group => group.heading)).toEqual(["Say next"]);
+    expect(suggestionGroups("negotiation", []).map(group => group.heading)).toEqual(["Ask"]);
     for (const group of suggestionGroups("interviewer", [])) expect(group.empty).toContain("candidate");
   });
 

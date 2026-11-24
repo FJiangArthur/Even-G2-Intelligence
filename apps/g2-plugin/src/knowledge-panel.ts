@@ -6,19 +6,20 @@
 import {
   markdownToSession, sessionToMarkdown, vaultBundle,
   type HistoryEntry, type HistorySession, type KnowledgeSource, type KnowledgeStats, type OmiExportResult, type PersonAggregate, type VaultFile,
+  type MarkdownImportOptions, type MarkdownSession, type OmiImportProgress,
 } from "@helix/conversation-sdk";
-import type { G2ConversationController, HistoryState } from "./controller";
+import type { G2ConversationController, HistoryState, MarkdownImportItem } from "./controller";
 import {
   SOURCE_ICON, SOURCE_LABEL, cleanLineText, confirmBar, copyToClipboard, sessionKnowledge, sessionSource, sessionTitle,
 } from "./history-panel";
 import { icon, type IconName } from "./pixel-art";
 import { PDF_LIMITS, type PdfFileStatus, type PdfInput, type PdfParser } from "@helix/conversation-sdk";
-import { browserTransferEnv, exportFile, fetchTextFromUrl, importUrl, inEmbeddedWebView, readTextFiles, urlFileName } from "./file-transfer";
+import { browserTransferEnv, exportFile, fetchTextFromUrl, importUrl, inEmbeddedWebView, readTextFile, urlFileName } from "./file-transfer";
 
 /* ================================================================ SDK adapter */
 
 export type MarkdownFile = VaultFile;
-export interface ImportedSession { readonly session: HistorySession; readonly entries: HistoryEntry[] }
+export interface ImportedSession extends MarkdownSession { readonly session: HistorySession; readonly entries: HistoryEntry[] }
 
 /** Session -> Obsidian note (SDK sessionToMarkdown: frontmatter, sections, Mermaid mindmap, clean transcript). */
 export function sessionMarkdown(session: HistorySession, entries: readonly HistoryEntry[]): string {
@@ -26,10 +27,10 @@ export function sessionMarkdown(session: HistorySession, entries: readonly Histo
 }
 
 /** Obsidian note -> session + entries (SDK markdownToSession; source "obsidian"). */
-export function markdownSession(name: string, markdown: string): ImportedSession {
+export function markdownSession(name: string, markdown: string, options: MarkdownImportOptions = {}): ImportedSession {
   try {
-    const parsed = markdownToSession(markdown, name);
-    return { session: { ...parsed.session, source: "obsidian" }, entries: parsed.entries };
+    const parsed = markdownToSession(markdown, name, options);
+    return { ...parsed, session: { ...parsed.session, source: "obsidian" } };
   } catch (error) { throw new Error(`${name}: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
@@ -74,6 +75,55 @@ export function markdownFileLines(names: readonly string[], unreadable: readonly
   const errors = new Map([...failed, ...unreadable].map(item => [item.name, item.error]));
   return names.map(name => errors.has(name) ? { name, state: "failed" as const, detail: `Failed: ${errors.get(name)!.replace(`${name}: `, "")}` } : { name, state: "done" as const, detail: "Imported" });
 }
+/* ------------------------------------------------------------ v0.16 import outcomes */
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const sentence = (text: string) => text.trim().replace(/[.\s]+$/u, "");
+/**
+ * The Omi import card: counts while it runs, and at the end what was imported, skipped and failed,
+ * each with its reason. A failure (the import budget is full, storage refused the save) is named here,
+ * on the card of the import that hit it.
+ */
+export function omiImportText(progress: OmiImportProgress, done: boolean): string {
+  const skipped = progress.skipped ?? 0, helix = progress.skippedHelix ?? 0, unreadable = Math.max(0, skipped - helix), failed = progress.failed ?? 0;
+  if (!done) return `Imported ${progress.imported} conversations · ${progress.pages} pages${skipped ? ` · ${skipped} skipped` : ""}`;
+  const parts = [`${plural(progress.imported, "conversation")} processed`];
+  if (unreadable) parts.push(`${unreadable} skipped (Omi returned them in a form Helix cannot read)`);
+  if (helix) parts.push(`${helix} skipped (sent to Omi by Helix, already in History)`);
+  if (failed) parts.push(`${failed} failed: ${sentence(progress.failReason ?? "could not be saved")}`);
+  return failed ? `Import stopped: ${parts.join(" · ")}. What was saved before stays as it was.` : `Import complete: ${parts.join(" · ")}. Repeated imports update existing records.`;
+}
+/** Why an Omi import ended early (network, key, a response Helix cannot read), with what had been saved by then. */
+export function omiImportErrorText(message: string, progress?: OmiImportProgress): string {
+  return progress?.imported ? `${sentence(message)}. ${plural(progress.imported, "conversation")} had been saved before that.` : message;
+}
+export interface MarkdownFileOutcome {
+  readonly name: string; readonly state: "imported" | "skipped" | "failed";
+  /** Why it was skipped or failed, or what the import limits cut from an imported note. */
+  readonly detail?: string;
+}
+/** One row per note, in the order given. Unlike markdownFileLines, two notes with one file name keep their own rows. */
+export function markdownOutcomeLines(files: readonly MarkdownFileOutcome[]): FileLine[] {
+  return files.map(file => file.state === "failed" ? { name: file.name, state: "failed" as const, detail: `Failed: ${file.detail ?? "could not be imported"}` }
+    : file.state === "skipped" ? { name: file.name, state: "failed" as const, detail: `Skipped: ${file.detail ?? "not imported"}` }
+    : { name: file.name, state: "done" as const, detail: file.detail ? `Imported. Shortened: ${file.detail}` : "Imported" });
+}
+/** The notes card: imported / skipped / failed with the main reason for each, and how many notes were shortened. */
+export function markdownImportText(files: readonly MarkdownFileOutcome[]): string {
+  const of = (state: MarkdownFileOutcome["state"]) => files.filter(file => file.state === state);
+  const imported = of("imported"), skipped = of("skipped"), failed = of("failed"), cut = imported.filter(file => file.detail).length;
+  const main = (items: readonly MarkdownFileOutcome[]) => {
+    const counts = new Map<string, number>();
+    for (const item of items) { const reason = sentence(item.detail ?? ""); if (reason) counts.set(reason, (counts.get(reason) ?? 0) + 1); }
+    const top = [...counts].sort((a, b) => b[1] - a[1])[0];
+    return top ? `: ${top[0]}${counts.size > 1 ? " (and other reasons, see below)" : ""}` : "";
+  };
+  const parts = [`Imported ${imported.length} of ${plural(files.length, "note")}`];
+  if (skipped.length) parts.push(`${skipped.length} skipped${main(skipped)}`);
+  if (failed.length) parts.push(`${failed.length} failed${main(failed)}`);
+  return `${parts.join(" · ")}.${cut ? ` ${plural(cut, "note")} shortened by the import limits (see below).` : ""}`;
+}
+
 /** The Omi auto-import line under its switch. */
 export function autoImportText(view: { enabled: boolean; running: boolean; lastSuccessAt?: string; lastImported?: number; lastError?: string }, format: (iso: string) => string = iso => new Date(iso).toLocaleString()): string {
   if (!view.enabled) return "Off. Omi conversations are imported only when you tap Import from Omi.";
@@ -239,6 +289,7 @@ export class KnowledgePanel {
   private readonly importList = el("ul", "file-status-list");
   private readonly omiStatus = el("p", "field-note io-status");
   private readonly autoImport = el("input");
+  private readonly summariesOnly = el("input");
   private readonly autoImportStatus = el("p", "field-note io-status");
   private readonly pdfList = el("ul", "file-status-list");
   private readonly pdfStatus = el("p", "field-note io-status");
@@ -265,7 +316,7 @@ export class KnowledgePanel {
     transfers.append(
       this.route("helix", "obsidian", "Export sessions as Markdown notes with summary, people, concepts and a Mermaid map.", this.exportControls()),
       this.route("obsidian", "helix", "Import .md or .txt notes: choose files, paste text, or load a link. Summary, key facts, people and “Speaker: text” lines are kept.", this.importControls()),
-      this.route("omi", "helix", "Import your Omi conversations (uses the Omi API key in Setup → API keys). Repeat imports update existing records.", this.omiImportControls()),
+      this.route("omi", "helix", "Import your Omi conversations (uses the Omi API key in Setup → API keys). Repeat imports update existing records. Conversations that Helix sent to Omi are not imported back.", this.omiImportControls()),
       this.pdfCard(),
       this.route("helix", "omi", "Send saved sessions to Omi as conversations. Needs an Omi developer key with conversations:write; Omi accepts about 25 per hour.", this.omiExportControls()),
       this.route("obsidian", "omi", "Import notes from Obsidian first, then send them to Omi.", this.obsidianToOmiControls()),
@@ -279,7 +330,7 @@ export class KnowledgePanel {
     localLabel.append(this.local, this.toggleText("Use saved knowledge in answers", "Answers may cite earlier sessions from all three sources and the PDFs you added. Off: nothing saved is read or synced"));
     const webLabel = el("label", "toggle"); webLabel.htmlFor = this.web.id;
     webLabel.append(this.web, this.toggleText("Live web fact check", "Short claims are checked as you talk"));
-    const disclosure = el("p", "field-note", "When enabled, short speech claims are sent to the web search of your answer provider (OpenAI by default; see Setup → Copilot). Search incurs provider charges. Checks may take time and do not verify every utterance. Imported summaries and AI answers are never used as memory evidence.");
+    const disclosure = el("p", "field-note", "When enabled, short speech claims are sent to the web search of your answer provider (OpenAI by default; see Setup → Copilot). Search incurs provider charges. Checks may take time and do not verify every utterance. Saved knowledge includes the summaries, key facts and concepts of imported conversations and notes.");
     this.local.addEventListener("change", () => { void controller.setLocalMemoryEnabled(this.local.checked); });
     this.web.addEventListener("change", () => { void controller.setLiveWebFactCheckEnabled(this.web.checked); });
     memory.append(localLabel, this.knowledgeControls(), webLabel, disclosure);
@@ -379,10 +430,9 @@ export class KnowledgePanel {
     input.addEventListener("change", () => {
       const files = [...(input.files ?? [])];
       if (!files.length) { this.say(this.importStatus, "No file was selected."); return; }
-      this.say(this.importStatus, `Reading ${files.length} file${files.length === 1 ? "" : "s"}…`);
-      void readTextFiles(files)
-        .then(read => this.importMarkdown(read.flatMap(item => item.ok ? [{ name: item.name, text: item.text }] : []), read.flatMap(item => item.ok ? [] : [{ name: item.name, error: item.error }])))
-        .catch(error => this.say(this.importStatus, `Import failed: ${error instanceof Error ? error.message : String(error)}`))
+      // v0.16: each file is read only when its turn comes, so a large selection is never all in memory at once.
+      void this.importMarkdown(files.map(file => ({ name: file.name, text: () => readTextFile(file), lastModified: file.lastModified,
+        ...(file.webkitRelativePath ? { path: file.webkitRelativePath } : {}) })))
         .finally(() => { input.value = ""; });
     });
     const paste = el("details", "paste-markdown");
@@ -394,7 +444,7 @@ export class KnowledgePanel {
       const text = area.value;
       if (!text.trim()) { this.say(this.importStatus, "Paste a Markdown note first."); return; }
       const title = /^#\s+(.+)$/mu.exec(text)?.[1]?.trim() ?? "Pasted note";
-      void this.importMarkdown([{ name: `${title.slice(0, 60)}.md`, text }]).then(ok => { if (ok) area.value = ""; });
+      void this.importMarkdown([{ name: `${title.slice(0, 60)}.md`, text, pasted: true }]).then(ok => { if (ok) area.value = ""; });
     });
     paste.append(summary, pasteLabel, area, go);
     const link = el("details", "paste-markdown");
@@ -403,7 +453,8 @@ export class KnowledgePanel {
     const load = button("Import from link", "button button-secondary button-small", "download");
     load.addEventListener("click", () => {
       load.disabled = true; this.say(this.importStatus, "Loading the link…");
-      void fetchTextFromUrl(url.value).then(file => this.importMarkdown([file])).then(ok => { if (ok) url.value = ""; })
+      const from = url.value;
+      void fetchTextFromUrl(from).then(file => this.importMarkdown([{ ...file, path: importUrl(from).toString() }])).then(ok => { if (ok) url.value = ""; })
         .catch(error => this.say(this.importStatus, error instanceof Error ? error.message : String(error)))
         .finally(() => { load.disabled = false; });
     });
@@ -413,19 +464,15 @@ export class KnowledgePanel {
     return wrap;
   }
 
-  private async importMarkdown(files: { name: string; text: string }[], unreadable: { name: string; error: string }[] = []): Promise<boolean> {
-    const names = [...files.map(file => file.name), ...unreadable.map(file => file.name)];
-    if (!files.length) {
-      this.fileRows(this.importList, markdownFileLines(names, unreadable, []));
-      this.say(this.importStatus, `Nothing imported: ${unreadable.length} file${unreadable.length === 1 ? "" : "s"} could not be read.`);
-      return false;
-    }
+  private async importMarkdown(files: MarkdownImportItem[]): Promise<boolean> {
     this.say(this.importStatus, `Importing ${files.length} note${files.length === 1 ? "" : "s"}…`);
     try {
-      const result = await this.controller.importMarkdownFiles(files);
-      const failed = result.failed.length + unreadable.length;
-      this.fileRows(this.importList, markdownFileLines(names, unreadable, result.failed));
-      this.say(this.importStatus, `Imported ${result.imported} of ${names.length} note${names.length === 1 ? "" : "s"}.${failed ? ` ${failed} failed (see below).` : ""}`);
+      const result = await this.controller.importMarkdownFiles(files, {
+        // Progress stays on the card ("3 / 40"); only the result is mirrored in the tab's status line.
+        onProgress: progress => { this.importStatus.textContent = `Importing ${progress.done + 1} / ${progress.total}: ${progress.name}`; },
+      });
+      this.fileRows(this.importList, markdownOutcomeLines(result.files));
+      this.say(this.importStatus, result.message);
       return result.imported > 0;
     } catch (error) { this.say(this.importStatus, `Import failed: ${error instanceof Error ? error.message : String(error)}`); return false; }
   }
@@ -439,7 +486,7 @@ export class KnowledgePanel {
     const to = el("span", "source-badge badge-helix"); to.append(iconSpan(SOURCE_ICON.helix, "badge-icon"), SOURCE_LABEL.helix);
     head.append(from, arrow, to); head.setAttribute("aria-label", "PDF documents to Helix");
     const megabytes = Math.round(PDF_LIMITS.maxBytes / 1024 / 1024);
-    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. The parsed text is stored with your history, which holds 5 MiB in total, so several large PDFs may not all fit; one that does not fit is reported as failed and nothing of it is kept. They are stored under Obsidian with the tag “pdf” and listed in History under Documents, where you can open or remove them. “Use saved knowledge in answers” must be on for answers to read them.`);
+    const copy = el("p", "route-copy", `Add PDF documents to the knowledge base. Their text becomes searchable in answers (and is synced to the OpenAI knowledge base when you use it). Up to ${PDF_LIMITS.maxFiles} PDFs at once, ${megabytes} MB each. The parsed text is stored with your imported notes and Omi conversations, which together hold 5 MiB (separate from your live sessions), so several large PDFs may not all fit; one that does not fit is reported as failed and nothing of it is kept. They are stored under Obsidian with the tag “pdf” and listed in History under Documents, where you can open or remove them. “Use saved knowledge in answers” must be on for answers to read them.`);
     const box = el("fieldset", "toggle-group pdf-parser"); box.append(el("legend", "", "Read the PDFs"));
     const local = el("input"), openai = el("input");
     const option = (input: HTMLInputElement, value: PdfParser, title: string, note: string) => {
@@ -497,13 +544,14 @@ export class KnowledgePanel {
     const wrap = el("div", "route-controls");
     const start = el("input"), end = el("input"); start.type = end.type = "date";
     start.id = "omi-import-start"; end.id = "omi-import-end";
-    const startLabel = el("label", "", "From (optional)"); startLabel.append(start);
-    const endLabel = el("label", "", "Through (optional)"); endLabel.append(end);
+    const startLabel = el("label", "", "From (optional, your local date)"); startLabel.append(start);
+    const endLabel = el("label", "", "Through (optional, your local date)"); endLabel.append(end);
     const grid = el("div", "field-grid"); grid.append(startLabel, endLabel);
     this.importButton.id = "import-omi"; this.cancelButton.id = "cancel-omi-import";
     this.importButton.addEventListener("click", () => {
       if (!this.options.omiKey().trim()) { this.say(this.omiStatus, "Enter your Omi developer API key in Setup → API keys first."); return; }
-      void this.controller.importOmi({ key: this.options.omiKey(), ...(start.value ? { startDate: start.value } : {}), ...(end.value ? { endDate: `${end.value}T23:59:59.999Z` } : {}) })
+      // v0.16: plain dates are days in this phone's time zone (the SDK turns them into the first and last moment of the day).
+      void this.controller.importOmi({ key: this.options.omiKey(), summariesOnly: this.summariesOnly.checked, ...(start.value ? { startDate: start.value } : {}), ...(end.value ? { endDate: end.value } : {}) })
         .catch(error => this.say(this.omiStatus, error instanceof Error ? error.message : String(error)));
     });
     this.cancelButton.addEventListener("click", () => this.controller.cancelImport());
@@ -513,7 +561,12 @@ export class KnowledgePanel {
     const autoLabel = el("label", "toggle"); autoLabel.htmlFor = this.autoImport.id;
     autoLabel.append(this.autoImport, this.toggleText("Import new Omi conversations automatically", "When Helix opens and about every 30 minutes while it is open. Needs the Omi key saved on this phone."));
     this.autoImport.addEventListener("change", () => { void this.controller.setAutoImportEnabled(this.autoImport.checked); });
-    wrap.append(grid, row, this.omiStatus, autoLabel, this.autoImportStatus,
+    // v0.16 summaries only: a small import for a large Omi history.
+    this.summariesOnly.type = "checkbox"; this.summariesOnly.id = "omi-summaries-only";
+    const summariesLabel = el("label", "toggle"); summariesLabel.htmlFor = this.summariesOnly.id;
+    summariesLabel.append(this.summariesOnly, this.toggleText("Summaries only", "Saves each conversation's title, overview and action items, and no transcript. Transcripts already saved stay. Uses much less space; answers can still search the summaries. Also applies to automatic imports."));
+    this.summariesOnly.addEventListener("change", () => { void this.controller.setOmiSummariesOnly(this.summariesOnly.checked); });
+    wrap.append(grid, summariesLabel, row, this.omiStatus, autoLabel, this.autoImportStatus,
       el("p", "field-note", "Automatic import cannot run while the Even app is closed or Helix is not open: plugins have no background execution."));
     return wrap;
   }
@@ -610,7 +663,10 @@ export class KnowledgePanel {
     this.renderKnowledgeBase(state);
     this.importButton.disabled = state.importing; this.cancelButton.disabled = !state.importing;
     // v0.13: Omi import progress beside its buttons, auto-import state, PDF progress.
-    if (state.importing || /Omi|conversations/u.test(state.status)) this.omiStatus.textContent = state.status;
+    // v0.16: the card shows its own import's progress and outcome, whatever the words (a storage error names neither Omi nor conversations).
+    if (state.omiImport.message) this.omiStatus.textContent = state.omiImport.message;
+    this.omiStatus.classList.toggle("is-warning", !!state.omiImport.failed);
+    this.summariesOnly.checked = !!state.autoImport.summariesOnly; this.summariesOnly.disabled = state.importing;
     this.autoImport.checked = state.autoImport.enabled;
     this.autoImportStatus.textContent = autoImportText(state.autoImport);
     this.autoImportStatus.classList.toggle("is-warning", state.autoImport.enabled && !!state.autoImport.lastError);

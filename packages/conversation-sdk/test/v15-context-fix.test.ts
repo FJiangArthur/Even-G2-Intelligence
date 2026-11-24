@@ -3,6 +3,7 @@ import { DirectConversationTransport } from "../src/direct-transport.js";
 import { HelixConversationClient } from "../src/client.js";
 import { TranscriptContext } from "../src/transcript-context.js";
 import type { GatewayEvent, SessionConfig } from "../src/types.js";
+import { lineRequest } from "../src/modes.js";
 
 const config: SessionConfig = {
   sessionId: "v15-context-fix", endpoint: { id: "openai-direct", url: "https://api.openai.com/v1/responses", provider: "openai", model: "gpt-4.1-mini" },
@@ -36,7 +37,8 @@ const lastContent = (fetcher: ReturnType<typeof setup>["fetcher"]): string => {
 const backgroundOf = (content: string): string => JSON.parse(content.slice(content.indexOf("GLOBAL BACKGROUND\n") + "GLOBAL BACKGROUND\n".length, content.lastIndexOf("\nREQUEST\n")));
 const requestOf = (content: string): string => content.slice(content.lastIndexOf("\nREQUEST\n") + "\nREQUEST\n".length);
 const answered = (events: GatewayEvent[], count = 1) => vi.waitFor(() => expect(events.filter(e => e.type === "answer.completed")).toHaveLength(count));
-const OMITTED = /earlier speech .* is not included/i;
+// v0.16 fix pass: the note is worded about facts, not about what was captured (OMITTED_SPEECH_NOTE).
+const OMITTED = /If the answer depends on something not shown above, say you do not have that detail\./;
 
 describe("review of finding 23: only an explicit whole-session ask sends the whole window", () => {
   it("caps GLOBAL BACKGROUND for a typed question and says that earlier speech was left out", async () => {
@@ -117,10 +119,12 @@ describe("review of finding 24: a rolled window is not presented as the whole se
     const content = lastContent(fetcher);
     expect(backgroundOf(content)).toContain("Zebramarker opened the meeting.");
     expect(backgroundOf(content).length).toBeGreaterThan(60_000);
-    expect(requestOf(content)).toBe("Answer the most recent unresolved question in the whole captured session. If no question is present, suggest one useful follow-up question or next response.");
+    // v0.16: a context ask returns a line to say (modes.ts lineRequest).
+    expect(requestOf(content)).toBe(lineRequest("global"));
+    expect(requestOf(content)).toContain("the whole captured session");
     await client.dispose();
   });
-  it("a whole-session ask after the window rolled says the earliest speech is missing", async () => {
+  it("a whole-session ask after the window rolled is not called the whole session", async () => {
     const { fetcher, transport, client, events } = setup();
     await client.start(config, { openai: "runtime" });
     await transport.injectTranscript("Zebramarker opened the meeting.", speaker);
@@ -131,7 +135,9 @@ describe("review of finding 24: a rolled window is not presented as the whole se
     expect(background).not.toContain("Zebramarker");
     expect(background.length).toBeGreaterThan(60_000);
     expect(requestOf(content)).not.toContain("whole captured session");
-    expect(requestOf(content)).toMatch(OMITTED);
+    // v0.16: the reply is a line to read aloud, which never comments on what was captured; a typed ask still gets the note (above).
+    expect(requestOf(content)).toBe(lineRequest("global", true));
+    expect(requestOf(content)).not.toMatch(OMITTED);
     await client.dispose();
   });
 });
