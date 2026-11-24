@@ -88,7 +88,8 @@ describe("ConversationCopilot", () => {
     expect(h.concepts[0]!.explanation.length).toBeLessThanOrEqual(500);
     expect(h.concepts[0]!.explanation).not.toMatch(/[\u0000-\u001f]/u);
     expect(h.conflicts).toEqual([]);
-    expect((h.suggestions[0] as unknown[]).length).toBe(5);
+    // v0.16: the default mode (Meeting) suggests lines to say, at most three (five in the question modes).
+    expect((h.suggestions[0] as unknown[]).length).toBe(3);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
   it("dedupes concepts, conflicts and asks across the session by normalized key", async () => {

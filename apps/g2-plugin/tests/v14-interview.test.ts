@@ -587,7 +587,9 @@ describe("v0.14 phone: Q&A panel and modes", () => {
     expect(suggestionGroups("general", [open]).map(group => group.heading)).toEqual(["Ask them"]);
     expect(suggestionGroups("technical", [open]).map(group => group.heading)).toEqual(["Probe"]);
     expect(suggestionGroups("interviewer", [open]).map(group => group.heading)).toEqual(["Probes to ask"]);
-    expect(suggestionGroups(undefined, []).map(group => group.heading)).toEqual(["Ask them"]);
+    // v0.16: Meeting (the default mode) suggests lines to say, so its empty panel is headed "Say next".
+    expect(suggestionGroups(undefined, []).map(group => group.heading)).toEqual(["Say next"]);
+    expect(suggestionGroups("negotiation", []).map(group => group.heading)).toEqual(["Ask"]);
     for (const group of suggestionGroups("interviewer", [])) expect(group.empty).toContain("candidate");
   });
 

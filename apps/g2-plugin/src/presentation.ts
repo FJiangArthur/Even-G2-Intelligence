@@ -148,6 +148,16 @@ export interface UsageTotals extends UsageBucket {
   readonly byKind: Partial<Record<UsageKind, UsageBucket>>;
 }
 
+/** v0.16 heading of a line to say (CopilotSuggestion.kind "say") on the phone: Q&A group and peek strip. */
+export const SAY_NEXT_TITLE = "Say next";
+
+/** Feed label of the reply to a manual context request ("last few sentences" / "whole conversation"). */
+export const LINE_ANSWER_LABEL = "Helix · say next";
+const CONTEXT_REQUEST_LABELS: readonly string[] = ["Local context", "Whole conversation"];
+function isContextRequest(question: { readonly speaker?: string; readonly trigger?: string } | undefined): boolean {
+  return question?.trigger === "manual" && CONTEXT_REQUEST_LABELS.includes(question.speaker ?? "");
+}
+
 /** Newest copilot item, for the cross-tab peek strip. `seq` increases per peek. */
 export interface PresentationPeek {
   readonly seq: number;
@@ -253,6 +263,8 @@ export class ConversationPresentation {
   private concepts: CopilotConcept[] = [];
   private conflicts: CopilotConflict[] = [];
   private suggestions: CopilotSuggestion[] = [];
+  /** v0.16: lines the wearer marked as said on the phone (suggestion id -> when). */
+  private readonly saidLines = new Map<string, string>();
   private asks: CopilotAsk[] = [];
   private verifications: VerificationResult[] = [];
   private factChecks: FactCheckResult[] = [];
@@ -406,13 +418,34 @@ export class ConversationPresentation {
   /** Replaces the suggestion list; only ids not shown before count as new. */
   public setSuggestions(items: readonly CopilotSuggestion[]): void {
     const known = new Set(this.suggestions.map(item => item.id));
+    // v0.16: a line the wearer marked as said stays said when the copilot sends its list again.
+    for (const id of this.saidLines.keys()) if (!items.some(item => item.id === id)) this.saidLines.delete(id);
+    const next = structuredClone([...items]).map(item => {
+      const saidAt = item.askedAt ? undefined : this.saidLines.get(item.id);
+      return saidAt ? { ...item, askedAt: saidAt } : item;
+    });
     // A suggestion that was already said aloud is not news.
-    const fresh = items.filter(item => !known.has(item.id) && !item.askedAt);
-    this.suggestions = structuredClone([...items]);
+    const fresh = next.filter(item => !known.has(item.id) && !item.askedAt);
+    this.suggestions = next;
     this.unseen.qa += fresh.length;
     const first = fresh[0];
-    if (first) this.setPeek({ id: first.id, tab: "qa", kind: "suggestion", title: "Suggested question", text: first.question });
+    // A line to say (kind "say") is announced as such; every other kind is a question.
+    if (first) this.setPeek({ id: first.id, tab: "qa", kind: "suggestion", title: first.kind === "say" ? SAY_NEXT_TITLE : "Suggested question", text: first.question });
     this.emit();
+  }
+
+  /**
+   * v0.16: the wearer tapped a line to say (CopilotSuggestion.kind "say") on the phone. The line is marked
+   * as said (`askedAt`), so the phone strikes it out and the glasses stop offering it. Nothing is asked of
+   * Helix. False when the id is unknown or the suggestion was already said.
+   */
+  public markSuggestionSaid(id: string, at: string = new Date().toISOString()): boolean {
+    const item = this.suggestions.find(entry => entry.id === id);
+    if (!item || item.askedAt) return false;
+    this.saidLines.set(id, at);
+    this.suggestions = this.suggestions.map(entry => entry.id === id ? { ...entry, askedAt: at } : entry);
+    this.emit();
+    return true;
   }
 
   /** Upsert by id: pending first, then done/failed. */
@@ -655,6 +688,7 @@ export class ConversationPresentation {
     this.questionOrder.length = 0;
     this.summary = undefined;
     this.concepts = []; this.conflicts = []; this.suggestions = []; this.asks = [];
+    this.saidLines.clear();
     this.verifications = []; this.factChecks = [];
     this.answerMeta.clear(); this.usageIds.clear();
     this.usage = { ...emptyBucket(), byKind: {} };
@@ -722,7 +756,7 @@ export class ConversationPresentation {
         if (this.retiredQuestions.has(event.questionId)) return;
         if (this.questions.has(event.questionId)) return;
         const manual = event.context.trigger === "manual";
-        const contextLabel = ["Local context", "Whole conversation"].includes(event.context.speaker.label);
+        const contextLabel = CONTEXT_REQUEST_LABELS.includes(event.context.speaker.label);
         const question = {
           text: event.text,
           speaker: event.context.speaker.label,
@@ -746,7 +780,8 @@ export class ConversationPresentation {
             ? `${event.context.speaker.label} · ${contextLabel ? "request" : "manual question"}`
             : questionKind === "you" ? "You asked" : "They asked",
           body: manual && contextLabel
-            ? (event.context.speaker.label === "Local context" ? "Help with the recent conversation." : "Help using the whole conversation.")
+            // v0.16: a context request returns a line the wearer can read aloud.
+            ? (event.context.speaker.label === "Local context" ? "A line to say about the last few sentences." : "A line to say from the whole conversation.")
             : event.text,
           meta: manual ? undefined : `${Math.round(event.confidence * 100)}% confidence`,
         });
@@ -794,7 +829,8 @@ export class ConversationPresentation {
         this.upsert({
           id: event.answerId,
           kind: "answer",
-          label: event.partial ? "Helix · answer cut off" : "Helix · answer",
+          // v0.16: the reply to a context request is a line to say, not an answer to a question.
+          label: event.partial ? "Helix · answer cut off" : isContextRequest(this.questionFor(event.questionId)) ? LINE_ANSWER_LABEL : "Helix · answer",
           ...(event.partial ? { partial: true } : {}),
           body: event.text,
           meta: `${Math.round(event.context.latencyMs.totalMs)} ms`,

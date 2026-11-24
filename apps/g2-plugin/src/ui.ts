@@ -24,7 +24,7 @@ import {
   type HudMirror,
   type TranscriptionModelInfo,
 } from "@helix/conversation-sdk";
-import { feedBlocks, PARTIAL_TRANSCRIPT_ID, type PresentationSnapshot, type FeedItem, type FeedBlock, type CompanionTab } from "./presentation";
+import { feedBlocks, PARTIAL_TRANSCRIPT_ID, SAY_NEXT_TITLE, type PresentationSnapshot, type FeedItem, type FeedBlock, type CompanionTab } from "./presentation";
 import { HistoryPanel, copyToClipboard, sourceLink } from "./history-panel";
 import { KnowledgePanel } from "./knowledge-panel";
 import { PeoplePanel } from "./people-panel";
@@ -34,6 +34,9 @@ import { SHORTCUT_ACTIONS, type ShortcutActionId } from "./shortcut-actions";
 import {
   DEFAULT_TRANSCRIPTION_PROVIDER,
   TRANSCRIPTION_PROVIDERS,
+  isMixedSpeechLanguage,
+  shownSpeechLanguage,
+  speechLanguageSettings,
   type PluginConfig,
   type ProviderCredentialLoadResult,
   type ProviderCredentialPersistenceResult,
@@ -107,6 +110,11 @@ export interface CompanionUiActions {
   readonly onTogglePause: () => Promise<void>;
   readonly onDisconnect: () => Promise<void>;
   readonly onAsk: (question: string) => Promise<void>;
+  /**
+   * v0.16: the wearer tapped a line to say (suggestion kind "say") to mark it as said. Wire to
+   * presentation.markSuggestionSaid so the glasses stop offering it; the phone strikes it out either way.
+   */
+  readonly onSayLine?: (id: string, text: string) => void | Promise<void>;
   readonly onAskLocal: () => Promise<void>;
   readonly onAskGlobal: () => Promise<void>;
   readonly onClearProviderKeys: () => Promise<ProviderCredentialPersistenceResult>;
@@ -185,6 +193,8 @@ export class CompanionUi {
   private readonly panelGate = new PanelGate();
   private activeTab: CompanionTab = "answers";
   private lastSnapshot?: PresentationSnapshot;
+  /** v0.16: lines to say the wearer tapped as said on this phone (suggestion id -> when). */
+  private readonly saidLines = new Map<string, string>();
   private lastPeekSeq = 0;
   private peekTimer?: ReturnType<typeof setTimeout>;
   private settingsTimer?: ReturnType<typeof setTimeout>;
@@ -245,6 +255,8 @@ export class CompanionUi {
     this.button("gesture-strip").addEventListener("click", toggleShortcuts);
     for (const action of SHORTCUT_ACTIONS) this.button(`shortcut-${action.itemID}`).addEventListener("click", () => { void this.runAction(() => actions.onShortcut(action.itemID)); });
     this.input("auto-explain-terms").addEventListener("change", () => { void this.runAction(() => actions.onAutoExplainTerms(this.input("auto-explain-terms").checked)); });
+    // v0.16: with mixed languages on, the single speech language is not used.
+    this.input("speech-mixed").addEventListener("change", () => { this.input("locale").disabled = this.input("speech-mixed").checked; });
     this.button("ask-local-button").addEventListener("click", () => { void this.runAction(actions.onAskLocal); });
     this.button("ask-global-button").addEventListener("click", () => { void this.runAction(actions.onAskGlobal); });
     this.button("connect-button").addEventListener("click", () => {
@@ -397,7 +409,7 @@ export class CompanionUi {
       setMirrorOpen(open);
       try { globalThis.localStorage?.setItem(MIRROR_OPEN_KEY, String(open)); } catch { /* storage unavailable */ }
     });
-    // Long-press (550 ms) on an "Ask them" suggestion copies it instead of asking Helix.
+    // Long-press (550 ms) on a suggestion (a question to ask or a line to say) copies it instead of acting on it.
     let pressTimer: ReturnType<typeof setTimeout> | undefined;
     let suppressClick: HTMLElement | undefined;
     this.root.addEventListener("pointerdown", (event) => {
@@ -425,6 +437,12 @@ export class CompanionUi {
       } else if (action === "ask") {
         void this.runAction(() => actions.onAsk(text));
         this.selectTab("answers");
+      } else if (action === "said" && id) {
+        // v0.16: a line to say is marked as said. Nothing is asked of Helix and the tab stays.
+        this.saidLines.set(id, new Date().toISOString());
+        if (this.saidLines.size > 200) this.saidLines.delete(this.saidLines.keys().next().value!);
+        if (actions.onSayLine) void this.runAction(async () => { await actions.onSayLine?.(id, text); });
+        if (this.lastSnapshot) this.render(this.lastSnapshot);
       } else if (action === "verify-claim" && id) {
         target.dataset.state = "sent";
         target.setAttribute("aria-label", "Verification requested");
@@ -559,7 +577,7 @@ export class CompanionUi {
   }
 
   public render(input: PresentationSnapshot): void {
-    const snapshot = withSnapshotDefaults(input);
+    const snapshot = withSaidLines(withSnapshotDefaults(input), this.saidLines);
     this.lastSnapshot = snapshot;
     const status = this.element("session-status");
     status.textContent = snapshot.status;
@@ -693,7 +711,8 @@ export class CompanionUi {
       ...this.sessionIdentity,
       model: this.selectedAnswerModel(),
       instructions: this.textarea("instructions").value.trim(),
-      locale: this.input("locale").value.trim(),
+      // Mixed on stores "auto" and keeps the language in the (disabled) field for when it is turned off again.
+      ...speechLanguageSettings(this.input("speech-mixed").checked, this.input("locale").value),
       maxResponseSentences: Number.parseInt(this.input("sentence-limit").value, 10),
       conversationMode: this.select("conversation-mode").value as SessionFormState["conversationMode"],
       responseStrategy: this.select("response-strategy").value as SessionFormState["responseStrategy"],
@@ -801,7 +820,10 @@ export class CompanionUi {
     this.select("answer-length").value = answerLengthProfile(config.answerLength).id;
     this.input("news-search").checked = config.newsSearch !== false;
     this.textarea("instructions").value = config.instructions;
-    this.input("locale").value = config.locale;
+    const speech = speechLanguageFields(config);
+    this.input("speech-mixed").checked = speech.mixed;
+    this.input("locale").value = speech.language;
+    this.input("locale").disabled = speech.mixed;
     this.input("sentence-limit").value = String(config.maxResponseSentences);
     // The saved mode is shown as itself whenever the picker offers it (Candidate is `interviewee`);
     // only an id with no option (the legacy `office-discussion` name of Meeting) falls back to Meeting.
@@ -1291,8 +1313,9 @@ export class CompanionUi {
 
   private renderQa(snapshot: PresentationSnapshot, connected: boolean): Node[] {
     const nodes: Node[] = [];
-    // Suggested questions, headed for the mode: "Ask them", "Probes to ask" (Interviewer), or the
-    // "They may ask" / "Ask them" groups of Candidate mode. Asked ones stay struck out until the SDK drops them.
+    // Suggestions, headed for what they are: "Say next" for lines to read aloud (v0.16), else for the mode:
+    // "Ask them", "Probes to ask" (Interviewer), or the "They may ask" / "Ask them" groups of Candidate mode.
+    // Asked or said ones stay struck out until the SDK drops them.
     for (const group of suggestionGroups(snapshot.glasses.mode, snapshot.suggestions)) {
       nodes.push(el("h3", "section-label", group.heading));
       if (!group.items.length) { nodes.push(el("p", "field-note", group.empty)); continue; }
@@ -1301,14 +1324,16 @@ export class CompanionUi {
       for (const suggestion of group.items) {
         const asked = Boolean(suggestion.askedAt);
         const row = el("li", `suggestion${asked ? " is-asked" : ""}`);
-        const button = actionButton("ask", "", { target: suggestion.question }, "suggestion-button");
+        // A line to say is marked as said by its tap (works offline); a question is sent to Helix.
+        const line = group.action === "said";
+        const button = actionButton(group.action === "said" ? "said" : "ask", "", { target: suggestion.question, id: suggestion.id }, "suggestion-button");
         button.dataset.longpress = "copy";
-        button.disabled = !connected;
-        button.append(iconNode(asked ? "check" : "question"), el("span", "suggestion-text", suggestion.question));
+        button.disabled = line ? asked : !connected;
+        button.append(iconNode(asked ? "check" : line ? "bubble" : "question"), el("span", "suggestion-text", suggestion.question));
         const why = suggestionWhyText(suggestion.why);
-        if (asked) button.append(el("small", "suggestion-why suggestion-asked", "Asked"));
+        if (asked) button.append(el("small", "suggestion-why suggestion-asked", group.doneLabel ?? "Asked"));
         else if (why) button.append(el("small", "suggestion-why", why));
-        button.setAttribute("aria-label", `${asked ? "Already asked. " : ""}${group.tapLabel}: ${suggestion.question}`);
+        button.setAttribute("aria-label", `${asked ? `Already ${(group.doneLabel ?? "Asked").toLowerCase()}. ` : ""}${group.tapLabel}: ${suggestion.question}`);
         const copy = actionButton("copy", "", { target: suggestion.question }, "copy-button");
         copy.innerHTML = `${icon("copy", "icon copy-icon")}<span>Copy</span>`;
         copy.setAttribute("aria-label", `Copy: ${suggestion.question}`);
@@ -1317,7 +1342,7 @@ export class CompanionUi {
       }
       nodes.push(list);
     }
-    if (snapshot.suggestions.length && !connected) nodes.push(el("p", "field-note", "Connect to ask Helix a suggested question. Copy works offline."));
+    if (snapshot.suggestions.some(item => item.kind !== "say") && !connected) nodes.push(el("p", "field-note", "Connect to ask Helix a suggested question. Copy works offline."));
     // v0.8 kind "answer": questions others asked the wearer (answered on the glasses).
     const asked = snapshot.feed.filter(item => item.kind === "question" && (item.questionKind === "they" || item.questionKind === "you"));
     if (asked.length) {
@@ -1858,9 +1883,10 @@ export function companionMarkup(rehearsalScripts: readonly RehearsalScriptOption
                 <textarea id="instructions" rows="4" maxlength="8000"></textarea>
               </label>
               <div class="field-grid prompt-grid">
-                <label for="locale">Locale<input id="locale" type="text" /></label>
+                <label for="locale">Speech language<input id="locale" type="text" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="en" /></label>
                 <label for="sentence-limit">Max answer sentences<input id="sentence-limit" type="number" min="1" max="10" inputmode="numeric" /></label>
               </div>
+              ${toggle("speech-mixed", "Mixed languages (do not assume English)", "Speech recognition follows whatever is spoken instead of the one language above. Use it when people switch languages.")}
             </section>
 
             <section class="config-group" aria-labelledby="diagnostics-title" data-no-persist>
@@ -2057,6 +2083,13 @@ export interface SuggestionGroup {
   readonly tapLabel: string;
   /** Open questions first, the ones already said aloud last. */
   readonly items: readonly CopilotSuggestion[];
+  /**
+   * What a tap does. "ask" (default): send the question to Helix. "said" (v0.16, lines to say): mark the
+   * line as said; nothing is sent.
+   */
+  readonly action?: "ask" | "said";
+  /** Label on an item that is done: "Asked" (default) or "Said". */
+  readonly doneLabel?: string;
 }
 const SDK_KIND_LABELS = (conversationSdk as unknown as { SUGGESTION_KIND_LABELS?: Readonly<Record<string, string>> }).SUGGESTION_KIND_LABELS;
 const kindLabel = (kind: "they-ask" | "ask-them") => SDK_KIND_LABELS?.[kind] ?? (kind === "they-ask" ? "They may ask" : "Ask them");
@@ -2071,9 +2104,21 @@ export function suggestionWhyText(why: string | undefined): string {
  * Q&A tab groups for a mode. Interviewer: probes to ask the candidate. Candidate (`interviewee`):
  * what the interviewer may ask next and what the candidate could ask, by the SDK's optional `kind`
  * ("they-ask" | "ask-them", absent = ask-them). Every other mode: one group named by the mode's ask label.
+ * Lines to say (kind "say", v0.16) come first under "Say next" in any mode.
  */
-export function suggestionGroups(mode: string | undefined, suggestions: readonly CopilotSuggestion[]): SuggestionGroup[] {
+export function suggestionGroups(mode: string | undefined, all: readonly CopilotSuggestion[]): SuggestionGroup[] {
   const profile = modeProfile(mode);
+  // v0.16: lines to say (kind "say") are their own group whatever the mode; a tap marks one as said.
+  const lines = all.filter(item => item.kind === "say"), suggestions = all.filter(item => item.kind !== "say");
+  const sayNext: SuggestionGroup = { heading: SAY_NEXT_TITLE, tapLabel: "Mark as said", action: "said", doneLabel: "Said", items: askedLast(lines),
+    note: "Lines you can read out as they are. Tap one when you have said it; hold or use Copy to copy.",
+    empty: "Lines you can say next appear here as the conversation develops." };
+  if (lines.length) return suggestions.length ? [sayNext, ...questionGroups(profile, suggestions)] : [sayNext];
+  // Nothing yet in a mode whose suggestions are lines (Meeting, Learning, Social, Partner).
+  if (!suggestions.length && profile.sayLines === true) return [sayNext];
+  return questionGroups(profile, suggestions);
+}
+function questionGroups(profile: ReturnType<typeof modeProfile>, suggestions: readonly CopilotSuggestion[]): SuggestionGroup[] {
   const say = "Tap to ask Helix instead; hold or use Copy to copy.";
   if (profile.id === "interviewee") {
     const theirs = suggestions.filter(item => (item as { kind?: string }).kind === "they-ask");
@@ -2095,6 +2140,21 @@ export function suggestionGroups(mode: string | undefined, suggestions: readonly
   return [{ heading: labelCase(profile.askLabel) || "Ask them", tapLabel: "Ask Helix", items: askedLast(suggestions),
     note: `Say these to the other person. ${say}`,
     empty: "Questions worth asking the other person appear here as the conversation develops." }];
+}
+
+/** v0.16: the snapshot with the lines the wearer tapped as said marked so (`askedAt`). Same object when nothing changes. */
+export function withSaidLines(snapshot: PresentationSnapshot, said: ReadonlyMap<string, string>): PresentationSnapshot {
+  if (!said.size || !snapshot.suggestions.some(item => !item.askedAt && said.has(item.id))) return snapshot;
+  return { ...snapshot, suggestions: snapshot.suggestions.map(item => !item.askedAt && said.has(item.id) ? { ...item, askedAt: said.get(item.id)! } : item) };
+}
+
+/**
+ * v0.16 Setup "Speech language": the saved `locale` as the two controls. `mixed` = the "Mixed languages"
+ * switch (locale "auto": speech recognition is not pinned to one language); `language` = the language field,
+ * which keeps the language set before the switch was turned on.
+ */
+export function speechLanguageFields(config: Pick<PluginConfig, "locale" | "speechLanguage">): { readonly mixed: boolean; readonly language: string } {
+  return { mixed: isMixedSpeechLanguage(config), language: shownSpeechLanguage(config) };
 }
 
 export function retrievalNote(meta: AnswerMeta | undefined): string | undefined {

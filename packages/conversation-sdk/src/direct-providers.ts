@@ -258,11 +258,25 @@ export interface TranscribeOptions {
   /** Recent transcript context (last ~200 chars are sent) for models that accept `prompt`. */
   readonly prompt?: string;
 }
+/**
+ * v0.16 speech language "auto" (mixed languages): recognition is not pinned to one language. It is a value
+ * of the session `locale`; any other value pins recognition as before.
+ */
+export const AUTO_SPEECH_LANGUAGE = "auto";
+export function isAutoSpeechLanguage(locale: string | undefined): boolean { return locale?.trim().toLowerCase() === AUTO_SPEECH_LANGUAGE; }
+/** Two-letter language of a locale ("en-US" -> "en"); undefined for "auto", a missing locale, or anything else. */
+export function speechLanguageHint(locale: string | undefined): string | undefined {
+  if (isAutoSpeechLanguage(locale)) return undefined;
+  const hint = locale?.trim().split(/[-_]/)[0]?.toLowerCase();
+  return hint && /^[a-z]{2}$/.test(hint) ? hint : undefined;
+}
 export async function transcribeDirect(fetcher: DirectFetch, profile: string, key: string, samples: Int16Array, language: string | undefined, signal: AbortSignal, onPartial?: (text: string) => void, options: TranscribeOptions = {}): Promise<string> {
   if (profile === "soniox") return sonioxTranscribe(key, samples, language, signal, onPartial);
   const wav = pcmWav(samples);
   if (profile === "deepgram") {
-    const response = await directFetch(fetcher, "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true", {
+    // No language was ever sent here, so Deepgram uses its default (English) whatever the locale. "auto" asks
+    // for nova-3 multilingual code-switching instead; other locales keep the request as it was.
+    const response = await directFetch(fetcher, `https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true${isAutoSpeechLanguage(language) ? "&language=multi" : ""}`, {
       method: "POST", headers: { Authorization: `Token ${key}`, "Content-Type": "audio/wav" }, body: new Blob([wav], { type: "audio/wav" }), signal,
     }, "Deepgram");
     const result = await response.json();
@@ -278,8 +292,9 @@ export async function transcribeDirect(fetcher: DirectFetch, profile: string, ke
     const prompt = options.prompt?.replace(/\s+/g, " ").trim().slice(-200);
     if (prompt) body.append("prompt", prompt);
   } else {
-    const hint = language?.split(/[-_]/)[0]?.toLowerCase();
-    if (hint && /^[a-z]{2}$/.test(hint)) body.append("language", hint);
+    // "auto" sends no language: the model detects it per request.
+    const hint = speechLanguageHint(language);
+    if (hint) body.append("language", hint);
   }
   const response = await directFetch(fetcher, `${OPENAI_BASE}/audio/transcriptions`, { method: "POST", headers: { Authorization: `Bearer ${key}` }, body, signal }, "OpenAI transcription");
   const result: unknown = await response.json();
@@ -398,7 +413,9 @@ function sonioxTranscribe(key: string, samples: Int16Array, language: string | u
     if (signal.aborted) { abort(); return; }
     signal.addEventListener("abort", abort, { once: true });
     socket.onopen = () => {
-      socket.send(JSON.stringify({ api_key: key, model: "stt-rt-v5", audio_format: "pcm_s16le", sample_rate: 16000, num_channels: 1, enable_endpoint_detection: true, ...(language ? { language_hints: [language.split(/[-_]/)[0]] } : {}) }));
+      socket.send(JSON.stringify({ api_key: key, model: "stt-rt-v5", audio_format: "pcm_s16le", sample_rate: 16000, num_channels: 1, enable_endpoint_detection: true,
+        // "auto" sends no hints: Soniox then identifies the language itself, including within one sentence.
+        ...(language && !isAutoSpeechLanguage(language) ? { language_hints: [language.split(/[-_]/)[0]] } : {}) }));
       const pcm = pcmWav(samples).subarray(44);
       let offset = 0;
       const send = () => {

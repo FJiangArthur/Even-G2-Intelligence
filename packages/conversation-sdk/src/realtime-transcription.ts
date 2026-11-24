@@ -1,4 +1,4 @@
-import { DirectProviderError, directFetch, httpFailure, OPENAI_BASE, type DirectFetch } from "./direct-providers.js";
+import { AUTO_SPEECH_LANGUAGE, DirectProviderError, directFetch, httpFailure, isAutoSpeechLanguage, OPENAI_BASE, speechLanguageHint, type DirectFetch } from "./direct-providers.js";
 
 /** Minimal browser WebSocket surface so tests can inject a fake socket. */
 export interface RealtimeSocketLike {
@@ -56,14 +56,16 @@ export function pcm16Base64(samples: Int16Array): string {
   for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(binary);
 }
+export { AUTO_SPEECH_LANGUAGE, isAutoSpeechLanguage, speechLanguageHint };
+/** `locale` "auto" (mixed languages, v0.16) sends no `languages` list, so recognition is not pinned to one language. */
 export function realtimeSessionConfig(prompt?: string, locale?: string): Record<string, unknown> {
-  const language = locale?.split(/[-_]/)[0]?.toLowerCase();
+  const language = speechLanguageHint(locale);
   const cleanPrompt = prompt?.replace(/\s+/g, " ").trim().slice(-200);
   return {
     type: "transcription",
     audio: { input: {
       format: { type: "audio/pcm", rate: 24000 },
-      transcription: { model: REALTIME_TRANSCRIPTION_MODEL, delay: "low", ...(cleanPrompt ? { prompt: cleanPrompt } : {}), ...(language && /^[a-z]{2}$/.test(language) ? { languages: [language] } : {}) },
+      transcription: { model: REALTIME_TRANSCRIPTION_MODEL, delay: "low", ...(cleanPrompt ? { prompt: cleanPrompt } : {}), ...(language ? { languages: [language] } : {}) },
       // gpt-live-transcribe does not support server VAD; turns are committed by the client.
       turn_detection: null,
     } },
