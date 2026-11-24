@@ -16,6 +16,11 @@ export interface MarkdownSession {
   legacySessionId?: string;
   /** v0.16: stable hash of the note's text: the same text twice in one import is one note. */
   contentHash: string;
+  /**
+   * v0.16: nothing names this note but its file name, or its file name and a frontmatter date: another
+   * note can arrive at the same id. MarkdownImportPlanner then looks at the saved copy before replacing it.
+   */
+  weakId?: true;
   /** v0.16: what the import limits left out or shortened, as one sentence. Absent: the whole note was kept. */
   truncated?: string;
 }
@@ -265,6 +270,8 @@ function idPart(value: string): string {
   for (let i = 0; i < encoded.length; i++) { hash ^= encoded.charCodeAt(i); hash = Math.imul(hash, 0x01000193) >>> 0; }
   return `${encoded.slice(0, 150)}-${hash.toString(16)}`;
 }
+/** The id exportToOmi gives Omi for a session (Omi import reads it back to find that session). */
+export function helixClientSessionId(sessionId: string): string { return `helix-${idPart(sessionId)}`.slice(0, 200); }
 function parsePerson(text: string): SessionPerson | undefined {
   const bold = /^\*\*([^*]+)\*\*\s*(?:[—–:-]\s*(.*))?$/u.exec(text.trim());
   const [name, role] = bold ? [bold[1]!, bold[2] ?? ""] : (() => {
@@ -420,6 +427,8 @@ function parseMarkdown(markdown: string, fileName: string, options: MarkdownImpo
     : frontId ? `id:${frontId}` : created ? `created:${created}` : dated ? `date:${dated}`
     : options.pasted ? `text:${contentHash}` : undefined;
   const sessionId = mark ? `${legacyId}:h${hash8(mark)}` : legacyId;
+  // A path, a frontmatter id, a Helix session id or the pasted text itself names one note. A file name, alone or with a day, does not.
+  const weakId = !helixSessionId && (mark === undefined || mark.startsWith("created:") || mark.startsWith("date:"));
   for (const tag of frontList(front, "tags", /[,\s]+/u)) tags.add(tag);
   const byName = new Map<string, SessionPerson>();
   for (const name of frontList(front, "people", /,/u).map(value => plain(value))) if (name && !byName.has(normal(name))) byName.set(normal(name), { name: bounded(name, MAX_ITEM_CHARS) });
@@ -451,7 +460,7 @@ function parseMarkdown(markdown: string, fileName: string, options: MarkdownImpo
     ...(counted.lines ? [`${count(counted.lines, "long line", "long lines")} cut to ${MAX_ENTRY_CHARS.toLocaleString("en-US")} characters`] : []),
     ...(droppedItems ? [`${count(droppedItems, "summary or list item", "summary or list items")} left out or shortened (${MAX_ITEMS} of ${MAX_ITEM_CHARS} characters each are kept)`] : []),
   ];
-  return { session, entries, contentHash, ...(helixSessionId ? { helixSessionId } : {}), ...(sessionId !== legacyId ? { legacySessionId: legacyId } : {}), ...(left.length ? { truncated: `${left.join("; ")}.` } : {}) };
+  return { session, entries, contentHash, ...(weakId ? { weakId: true as const } : {}), ...(helixSessionId ? { helixSessionId } : {}), ...(sessionId !== legacyId ? { legacySessionId: legacyId } : {}), ...(left.length ? { truncated: `${left.join("; ")}.` } : {}) };
 }
 
 /** The same note under another session id (its lines are numbered under that id). */
@@ -467,23 +476,74 @@ export interface MarkdownPlacement {
 }
 /** What the planner reads from the saved archive (LocalHistoryStore has both). */
 export interface MarkdownImportLookup { getSession(id: string): HistorySession | undefined; getEntries(id: string): HistoryEntry[] }
+/** Words of a note, lower-cased; Chinese, Japanese and Korean text as pairs of characters. */
+function noteWords(entries: readonly HistoryEntry[]): Set<string> {
+  const words = new Set<string>();
+  for (const entry of entries) for (const run of entry.text.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+    if (!/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(run)) { if (run.length > 2) words.add(run); continue; }
+    const chars = Array.from(run);
+    if (chars.length === 1) words.add(run);
+    for (let i = 0; i + 1 < chars.length; i++) words.add(chars[i]! + chars[i + 1]!);
+  }
+  return words;
+}
+/** At least this share of the shorter note's words must be in the other for the two to be one note, edited. */
+const SAME_NOTE_SHARE = 0.5;
+/**
+ * How much of the shorter of two notes is in the other (0..1). A saved note without lines counts as the
+ * same note (nothing of it can be lost); a new note without lines is not taken for a saved one that has some.
+ */
+function noteLikeness(saved: readonly HistoryEntry[], next: readonly HistoryEntry[]): number {
+  const a = noteWords(saved), b = noteWords(next);
+  if (!a.size) return 1;
+  if (!b.size) return 0;
+  let shared = 0;
+  for (const word of b) if (a.has(word)) shared++;
+  return shared / Math.min(a.size, b.size);
+}
 /**
  * v0.16: gives the notes of one import their final ids, one note at a time.
  * - A second, different note that arrives at an id already taken in this import gets ":n2", ":n3", ...
  *   (two "Untitled.md" without a path or frontmatter): both are kept.
  * - The same text twice is reported as a duplicate.
+ * - A note that only its file name identifies (`weakId`) is compared with the copies saved under that
+ *   name (the plain id and its ":nN" siblings): it replaces the one it shares most words with, when that
+ *   is at least half of the shorter note (the same note, edited). When none is alike it is another note
+ *   with the same name and gets the next free ":nN", so a later import does not overwrite the saved one.
  * - A note that an earlier version saved under its old id ("obsidian:<file name>") takes that copy's
  *   place: the first note of the import that maps to the old id replaces it instead of being added
- *   beside it. Pasted text does so only when its lines are the same, because one title can be two notes.
+ *   beside it. Pasted text does so only when its lines are the same, and a note with a weak id only
+ *   when the two are alike, because one title can be two notes.
  */
 export class MarkdownImportPlanner {
   private readonly used = new Map<string, string>();
   private readonly claimed = new Set<string>();
   constructor(private readonly archive: MarkdownImportLookup) {}
+  /** The id for a note that its file name alone identifies: the saved copy it is an edit of, else the next free one. */
+  private weakPlace(note: MarkdownSession): string {
+    const base = note.session.id, sibling = (n: number) => n === 1 ? base : `${base}:n${n}`;
+    let best: string | undefined, share = SAME_NOTE_SHARE, free: string | undefined;
+    // Siblings are numbered without gaps unless one was removed: look a little past the first free number.
+    for (let n = 1, misses = 0; misses < 8 && n < 1000; n++) {
+      const id = sibling(n), saved = this.archive.getSession(id);
+      if (!saved) { misses++; if (!this.used.has(id)) free ??= id; continue; }
+      misses = 0;
+      if (this.used.has(id) || saved.source !== "obsidian") continue;
+      const likeness = noteLikeness(this.archive.getEntries(id), note.entries);
+      if (likeness > share || (likeness === share && !best)) { best = id; share = likeness; }
+    }
+    return best ?? free ?? base;
+  }
   place(note: MarkdownSession, options: { pasted?: boolean } = {}): MarkdownPlacement {
-    let id = note.session.id;
-    for (let n = 2; this.used.has(id) && this.used.get(id) !== note.contentHash; n++) id = `${note.session.id}:n${n}`;
-    if (this.used.get(id) === note.contentHash) return { note, duplicate: true };
+    const base = note.session.id;
+    let id = base;
+    if (note.weakId) {
+      for (const [taken, hash] of this.used) if (hash === note.contentHash && (taken === base || taken.startsWith(`${base}:n`))) return { note, duplicate: true };
+      id = this.weakPlace(note);
+    } else {
+      for (let n = 2; this.used.has(id) && this.used.get(id) !== note.contentHash; n++) id = `${base}:n${n}`;
+      if (this.used.get(id) === note.contentHash) return { note, duplicate: true };
+    }
     this.used.set(id, note.contentHash);
     const placed = id === note.session.id ? note : renameMarkdownSession(note, id);
     const legacy = note.legacySessionId;
@@ -491,6 +551,7 @@ export class MarkdownImportPlanner {
     const old = this.archive.getSession(legacy);
     if (!old || old.source !== "obsidian") return { note: placed };
     if (options.pasted && this.archive.getEntries(legacy).map(entry => entry.text).join("\n") !== note.entries.map(entry => entry.text).join("\n")) return { note: placed };
+    if (note.weakId && noteLikeness(this.archive.getEntries(legacy), note.entries) < SAME_NOTE_SHARE) return { note: placed };
     this.claimed.add(legacy);
     return { note: placed, supersedes: legacy };
   }
@@ -581,7 +642,7 @@ export async function exportToOmi(options: OmiExportOptions): Promise<OmiExportR
   let endpoint: "from-segments" | "from-text", body: Record<string, unknown>;
   if (segments.length) {
     endpoint = "from-segments";
-    body = { transcript_segments: segments, client_session_id: `helix-${idPart(session.id)}`.slice(0, 200), source: "external_integration", started_at: new Date(Date.parse(session.startedAt)).toISOString(), ...(language ? { language } : {}) };
+    body = { transcript_segments: segments, client_session_id: helixClientSessionId(session.id), source: "external_integration", started_at: new Date(Date.parse(session.startedAt)).toISOString(), ...(language ? { language } : {}) };
   } else {
     const summary = [...(session.summary ?? []), ...facts].map(cleanLine).filter(Boolean);
     if (!summary.length) return { status: "skipped", reason: "This session has no transcript or summary to export." };

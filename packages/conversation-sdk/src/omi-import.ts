@@ -1,5 +1,6 @@
 import type { DirectFetch } from "./direct-providers.js";
-import { LocalHistoryStore, isImportStorageFull, type HistoryEntry, type HistorySession } from "./local-history.js";
+import { helixClientSessionId } from "./knowledge-transfer.js";
+import { LocalHistoryStore, isImportStorageFull, withSavedAdditions, type HistoryEntry, type HistorySession } from "./local-history.js";
 
 export interface OmiImportProgress {
   /** Conversations saved or already saved unchanged. */ imported: number; pages: number;
@@ -35,7 +36,7 @@ export interface OmiImportOptions {
   /**
    * v0.16: keep only what Omi wrote about each conversation (title, overview, action items, category)
    * and no transcript lines. The transcript is not downloaded. A conversation imported earlier with its
-   * transcript is replaced by the short form.
+   * transcript keeps those saved lines (and the people found in them); only its summary is refreshed.
    */
   summariesOnly?: boolean;
 }
@@ -178,25 +179,32 @@ function parseConversation(value: unknown, summariesOnly = false): Parsed {
 /* ------------------------------------------------------------------ conversations Helix sent to Omi */
 
 const plainText = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-/** What exportToOmi (knowledge-transfer.ts) puts on a conversation, wherever Omi returns it. */
-function helixMarker(value: Record<string, unknown>): boolean {
+/**
+ * What exportToOmi (knowledge-transfer.ts) puts on a conversation, wherever Omi returns it: the
+ * client_session_id ("helix-<session id>"), or "" for the text marker, which names no session.
+ */
+function helixMarker(value: Record<string, unknown>): string | undefined {
   const holders = [value, value.external_data, value.source_spec, value.structured].filter(record);
-  return holders.some(holder => (typeof holder.client_session_id === "string" && /^helix-/iu.test(holder.client_session_id.trim()))
-    || (typeof holder.text_source_spec === "string" && holder.text_source_spec.trim().toLowerCase() === "helix"));
+  for (const holder of holders) if (typeof holder.client_session_id === "string" && /^helix-/iu.test(holder.client_session_id.trim())) return holder.client_session_id.trim();
+  return holders.some(holder => typeof holder.text_source_spec === "string" && holder.text_source_spec.trim().toLowerCase() === "helix") ? "" : undefined;
 }
 interface LocalSession { id: string; time: number; title: string }
 /**
- * True for a conversation that is a Helix (or imported note) session sent to Omi earlier: importing it
- * back would list the same talk twice. By marker when Omi returns one; otherwise a session on this phone
- * that started at the same moment and has the same title or first line, or any such session when Omi
- * marks the conversation as coming from an integration.
+ * True for a conversation that is a Helix (or imported note) session sent to Omi earlier and still on
+ * this phone: importing it back would list the same talk twice. By marker when Omi returns one (the
+ * session it names, or one that started at the same moment); otherwise a session that started at the
+ * same moment and has the same title or first line, or any such session when Omi marks the conversation
+ * as coming from an integration. When the session is no longer on this phone (History -> Remove all),
+ * the Omi copy is the only one and is imported.
  */
 function sentByHelix(value: unknown, parsed: Parsed, local: readonly LocalSession[], store: LocalHistoryStore): boolean {
   if (!record(value)) return false;
-  if (helixMarker(value)) return true;
+  const marker = helixMarker(value);
+  if (marker && local.some(session => helixClientSessionId(session.id).toLowerCase() === marker.toLowerCase())) return true;
   const time = Date.parse(parsed.session.startedAt);
   const near = local.filter(session => Math.abs(session.time - time) <= SAME_START_MS);
   if (!near.length) return false;
+  if (marker !== undefined) return true;
   if (typeof value.source === "string" && value.source.trim().toLowerCase() === "external_integration") return true;
   const title = plainText(parsed.session.title), line = parsed.firstLine === undefined ? "" : plainText(parsed.firstLine);
   return near.some(session => (title && title === session.title)
@@ -205,14 +213,25 @@ function sentByHelix(value: unknown, parsed: Parsed, local: readonly LocalSessio
 
 /* ------------------------------------------------------------------ saving */
 
-const KEPT_KEYS = ["concepts", "todos", "notes", "overview", "endedAt", "recap", "continues"] as const;
-/** The record to save: what Omi returned, plus what was added to the saved copy on this phone (a generated title, concepts, to-dos). */
+/**
+ * The record to save: what Omi returned, plus what was added to the saved copy on this phone (a generated
+ * title, overview, concepts, to-dos) and what the saved copy holds and Omi does not supply this time
+ * (summary, key facts, people, tags: with "Summaries only" no transcript is read, so no people).
+ */
 function merged(session: HistorySession, old: HistorySession | undefined): HistorySession {
   if (!old) return session;
-  const result: HistorySession = { ...session };
-  for (const key of KEPT_KEYS) if (old[key] !== undefined) (result as unknown as Record<string, unknown>)[key] = old[key];
+  const result = withSavedAdditions(session, old);
   if (old.recap) result.title = old.title;
   return result;
+}
+/**
+ * "Summaries only" saves no transcript; it does not delete one either. A conversation imported earlier
+ * with its transcript keeps those lines, and only what Omi wrote about it is refreshed.
+ */
+function withSavedTranscript(store: LocalHistoryStore, sessionId: string, entries: HistoryEntry[]): HistoryEntry[] {
+  if (!store.entryCount(sessionId)) return entries;
+  const ids = new Set(entries.map(entry => entry.id));
+  return [...entries, ...store.getEntries(sessionId).filter(entry => entry.kind === "transcript" && !ids.has(entry.id))];
 }
 const canonical = (value: object) => JSON.stringify(Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
 /** The saved copy already is exactly this: nothing is written (an automatic import repeats the last day every time). */
@@ -281,7 +300,8 @@ export async function importOmiConversations(options: OmiImportOptions): Promise
       const batch: Parsed[] = [];
       for (const item of conversations.slice(at, at + SAVE_BATCH)) {
         const session = merged(item.session, store.getSession(item.session.id));
-        if (unchanged(store, session, item.entries)) { imported++; seen.add(session.id); } else batch.push({ ...item, session });
+        const entries = summariesOnly ? withSavedTranscript(store, session.id, item.entries) : item.entries;
+        if (unchanged(store, session, entries)) { imported++; seen.add(session.id); } else batch.push({ ...item, session, entries });
       }
       const outcomes = batch.length ? await saveBatch(store, batch) : [];
       outcomes.forEach((error, index) => {

@@ -564,7 +564,7 @@ export class KnowledgePanel {
     // v0.16 summaries only: a small import for a large Omi history.
     this.summariesOnly.type = "checkbox"; this.summariesOnly.id = "omi-summaries-only";
     const summariesLabel = el("label", "toggle"); summariesLabel.htmlFor = this.summariesOnly.id;
-    summariesLabel.append(this.summariesOnly, this.toggleText("Summaries only", "Saves each conversation's title, overview and action items, and no transcript. Uses much less space; answers can still search the summaries. Also applies to automatic imports."));
+    summariesLabel.append(this.summariesOnly, this.toggleText("Summaries only", "Saves each conversation's title, overview and action items, and no transcript. Transcripts already saved stay. Uses much less space; answers can still search the summaries. Also applies to automatic imports."));
     this.summariesOnly.addEventListener("change", () => { void this.controller.setOmiSummariesOnly(this.summariesOnly.checked); });
     wrap.append(grid, summariesLabel, row, this.omiStatus, autoLabel, this.autoImportStatus,
       el("p", "field-note", "Automatic import cannot run while the Even app is closed or Helix is not open: plugins have no background execution."));

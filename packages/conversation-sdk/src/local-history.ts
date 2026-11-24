@@ -203,6 +203,18 @@ function cleanKnowledge(value: Record<string, unknown>): SessionKnowledge {
   return result;
 }
 const NOTEBOOK_KEYS = ["todos", "notes"] as const;
+/**
+ * v0.16: `session` (a fresh import of a note or conversation) plus what its saved copy holds and the
+ * import does not define: a generated summary, key facts, people, concepts, tags, to-dos, notes, the
+ * overview and the recap. The rule upsertSession applies, for a save through replaceSession, which
+ * writes the record exactly as given.
+ */
+export function withSavedAdditions(session: HistorySession, saved: HistorySession | undefined): HistorySession {
+  if (!saved) return session;
+  const result: HistorySession = { ...session };
+  for (const key of [...KNOWLEDGE_KEYS, ...NOTEBOOK_KEYS, ...RECAP_KEYS]) if (result[key] === undefined && saved[key] !== undefined) (result as unknown as Record<string, unknown>)[key] = saved[key];
+  return result;
+}
 /** Validated to-dos and notes present in `value` (invalid items are dropped, not fatal). */
 function cleanNotebook(value: Record<string, unknown>): SessionNotebookData {
   const result: SessionNotebookData = {};

@@ -38,7 +38,7 @@ import {
   exportToOmi,
 } from "@helix/conversation-sdk";
 import { markdownImportText, markdownSession, omiExportSummary, omiImportErrorText, omiImportText, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile, type MarkdownFileOutcome } from "./knowledge-panel"; // phone agent
-import { MarkdownImportPlanner, type OmiImportProgress } from "@helix/conversation-sdk"; // v0.16 imports
+import { MarkdownImportPlanner, withSavedAdditions, type OmiImportProgress } from "@helix/conversation-sdk"; // v0.16 imports
 import { joinConcept } from "./history-panel";
 import { historyScopeIds, proposeHistoryCleanup, type HistoryCleanupProposal, type HistoryRemoveScope } from "@helix/conversation-sdk"; // v0.16 history clean-up
 import { firstAccessibleModel } from "@helix/conversation-sdk";
@@ -176,7 +176,11 @@ export const RESUME_SAME_SESSION_MS = 30 * 60 * 1000;
 export interface HistoryRemoval { readonly removed: number; readonly failed: number; readonly pendingInOpenAI: number; readonly message: string }
 /** v0.16: what the wearer ticked in History -> Clean up. A merge moves `fromId` (the later session) into `intoId`. */
 export interface HistoryCleanupPlan { readonly remove: readonly string[]; readonly merge: readonly { readonly fromId: string; readonly intoId: string }[] }
-export interface HistoryCleanupResult extends HistoryRemoval { readonly merged: number }
+export interface HistoryCleanupResult extends HistoryRemoval {
+  readonly merged: number;
+  /** Ticked removals and merges left alone because the session no longer qualifies (it gained a summary, a to-do, more speech). */
+  readonly skipped: number;
+}
 /** One model call over a saved transcript (the transport's own fetch, or the Setup key path). */
 type DigestRunner = (session: { title: string; lines: readonly { speaker: string; text: string }[] }) => Promise<SessionDigest>;
 export const RESUME_PROMPT = "Session paused while Helix was in the background · tap to resume";
@@ -363,33 +367,59 @@ export class G2ConversationController {
   }
   /**
    * Carries out the ticked part of a clean-up: merges first (oldest first, so a chain A + B + C ends
-   * up in A), then removals through removeHistorySessions. Only what is in `plan` is touched.
+   * up in A), then removals through removeHistorySessions. Only what is in `plan` is touched, and only
+   * what clean-up would still propose now: the preview may be minutes old, and a session that gained a
+   * summary, a to-do or more speech since is left alone and counted in `skipped`.
+   * A merge drops the two generated summaries (they no longer cover the session): the two overviews stay,
+   * joined, and with a key and summaries on, one new summary of the whole session is written.
    * Caller shows the preview and confirms before calling this API.
    */
   public async applyHistoryCleanup(plan: HistoryCleanupPlan, key = ""): Promise<HistoryCleanupResult> {
-    const skip = this.historyBulkSkip(), moved = new Map<string, string>(), gone: string[] = [];
-    let mergeFailed = 0;
+    const skip = this.historyBulkSkip(), moved = new Map<string, string>(), gone: string[] = [], survivors = new Set<string>();
+    let mergeFailed = 0, stale = 0;
+    const offered = new Set(this.historyCleanupProposal().merges.map(merge => `${merge.fromId}\n${merge.intoId}`));
     const startOf = (id: string) => Date.parse(this.history.getSession(id)?.startedAt ?? "");
     const pairs = [...plan.merge].sort((a, b) => startOf(a.fromId) - startOf(b.fromId));
     for (const pair of pairs) {
       const into = moved.get(pair.intoId) ?? pair.intoId, from = this.history.getSession(pair.fromId), target = this.history.getSession(into);
       if (!from || !target || from.id === target.id || from.source !== "helix" || target.source !== "helix" || skip.has(from.id) || skip.has(target.id)) { mergeFailed++; continue; }
+      if (!offered.has(`${pair.fromId}\n${pair.intoId}`)) { stale++; continue; }
       try {
+        const titled = !!target.recap || !isAutoSessionTitle(target, this.history.getEntries(into));
         await this.history.mergeSession(from.id, into);
-        moved.set(from.id, into); gone.push(from.id); this.mergedInto.set(from.id, into); this.titles.delete(from.id); this.titles.delete(into);
+        moved.set(from.id, into); gone.push(from.id); survivors.add(into); this.mergedInto.set(from.id, into); this.titles.delete(from.id); this.titles.delete(into);
+        // mergeSession drops both overviews and recaps: keep what they said (and a generated title) until a new summary is written.
+        const overview = [target.overview, from.overview].map(text => text?.trim()).filter(Boolean).join(" ");
+        const record = overview || target.recap || from.recap ? this.openHistorySession(into) : undefined;
+        if (record) await this.history.updateSessionRecap(into, { ...(overview ? { overview } : {}), recap: { origin: "fallback" as const, generatedAt: new Date().toISOString() },
+          ...(titled ? {} : { title: from.recap ? from.title : fallbackSessionRecap(record.session, record.entries).title }) }).catch(() => undefined);
       } catch { mergeFailed++; }
     }
     if (gone.length) { try { await this.history.flush(); } catch { /* reported by the next save */ } }
     // A merged-away session's file in the OpenAI knowledge base goes too; the surviving session is re-sent by the next Sync.
     const mergedPending = gone.length ? await this.forgetOpenAIKnowledge(gone, key) : 0;
-    const remove = [...new Set(plan.remove)].filter(id => !moved.has(id) && !skip.has(id));
+    // One summary call per surviving session, as at a session end (same switch, same minimum of speech).
+    if (key.trim() && this.summarizeOnEnd && !this.disposed) for (const id of survivors) {
+      const record = this.openHistorySession(id);
+      if (!record || this.recapJobs.has(id) || spokenChars(record.entries) < MIN_RECAP_TRANSCRIPT_CHARS) continue;
+      const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init)), model = this.digestModel();
+      const job = this.writeRecap(id, model, session => summarizeSession(fetcher, key, model, session, { onUsage: usage => this.presentation.applyUsage(usage) })).catch(() => undefined) // the joined overviews stay
+        .finally(() => { if (this.recapJobs.get(id) === job) this.recapJobs.delete(id); if (!this.disposed) this.emitHistory(); });
+      this.recapJobs.set(id, job);
+    }
+    // Removals are checked against what is true now, after the merges: a session a merge just filled stays.
+    const still = new Set(this.historyCleanupProposal().removals.map(item => item.id));
+    const wanted = [...new Set(plan.remove)].filter(id => !moved.has(id) && !skip.has(id));
+    const remove = wanted.filter(id => still.has(id) || !this.history.getSession(id));
+    stale += wanted.length - remove.length;
     const removal: HistoryRemoval = remove.length ? await this.removeHistorySessions(remove, key) : { removed: 0, failed: 0, pendingInOpenAI: 0, message: "" };
     const merged = gone.length, pendingInOpenAI = removal.pendingInOpenAI + mergedPending;
     const message = [merged ? `${merged === 1 ? "1 session" : `${merged} sessions`} merged into the one before.` : "", mergeFailed ? `${mergeFailed} could not be merged.` : "",
-      removal.message || (merged || mergeFailed ? "" : "Nothing was changed."),
+      removal.message || (merged || mergeFailed || stale ? "" : "Nothing was changed."),
+      stale ? `${stale} left as ${stale === 1 ? "it is: it" : "they are: they"} changed after the list was made.` : "",
       mergedPending && !removal.pendingInOpenAI ? "The OpenAI knowledge base catches up at the next Sync (Knowledge tab)." : ""].filter(Boolean).join(" ");
     this.setHistoryStatus(message);
-    return { removed: removal.removed, failed: removal.failed + mergeFailed, pendingInOpenAI, merged, message };
+    return { removed: removal.removed, failed: removal.failed + mergeFailed, pendingInOpenAI, merged, skipped: stale, message };
   }
   /** Sessions History -> Remove all would remove for a scope ("all" includes PDF documents). The live session always stays. */
   public historyScopeIds(scope: HistoryRemoveScope): string[] { return historyScopeIds(this.savedSessions(), scope, this.session ? [this.session.id] : []); }
@@ -1606,7 +1636,9 @@ export class G2ConversationController {
           }
           const { session, entries } = placed.note;
           // One all-or-nothing save: when it fails, nothing of the new version exists and the earlier copy is untouched.
-          await this.history.replaceSession({ ...session, source: "obsidian" }, entries, placed.supersedes ? { supersedes: placed.supersedes } : {});
+          // What was added to the saved copy on this phone (a generated summary, to-dos, notes) stays unless the note defines it.
+          const saved = this.history.getSession(session.id) ?? (placed.supersedes ? this.history.getSession(placed.supersedes) : undefined);
+          await this.history.replaceSession(withSavedAdditions({ ...session, source: "obsidian" }, saved?.source === "obsidian" ? saved : undefined), entries, placed.supersedes ? { supersedes: placed.supersedes } : {});
           sessionIds.push(session.id);
           if (placed.supersedes) superseded.push(placed.supersedes);
           if (placed.note.truncated) truncated.push({ name: file.name, detail: placed.note.truncated });

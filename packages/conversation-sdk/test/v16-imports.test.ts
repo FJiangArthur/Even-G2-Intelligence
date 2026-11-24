@@ -143,10 +143,12 @@ describe("v0.16 Omi import", () => {
     const { store } = await open();
     await store.upsertSession(session("session_talk", "helix", { title: "Calibration sync", startedAt: "2026-09-05T09:00:00.000Z" }));
     await store.upsertEntries([line("t1", "session_talk", "The rig ships on Friday.", { occurredAt: "2026-09-05T09:00:03.000Z" })]);
+    // Fix pass: a marker skips only while the session it names (or one started at that moment) is still on this phone.
+    await store.upsertSession(session("session_other", "helix")); await store.upsertSession(session("session_x", "helix"));
     const body = [
       conversation("marked", { external_data: { client_session_id: "helix-session_other" } }),
       conversation("marked-top", { client_session_id: "helix-session_x" }),
-      conversation("text", { external_data: { text_source_spec: "helix" } }),
+      conversation("text", { started_at: "2026-09-05T09:00:00Z", external_data: { text_source_spec: "helix" } }),
       conversation("same-title", { started_at: "2026-09-05T09:00:00Z", structured: { title: "Calibration Sync!" } }),
       conversation("same-line", { started_at: "2026-09-05T09:00:01Z", structured: { title: "Omi's own title" }, transcript_segments: [{ text: "The rig ships on Friday.", start: 0, speaker: "SPEAKER_00" }] }),
       conversation("integration", { started_at: "2026-09-05T09:00:00.500Z", source: "external_integration", structured: { title: "Another title" }, transcript_segments: [] }),
@@ -162,12 +164,11 @@ describe("v0.16 Omi import", () => {
   });
 
   it("\"Summaries only\" stores overview, key facts and action items, no transcript lines, and does not download transcripts", async () => {
-    const { store } = await open(), urls: string[] = [];
+    const { store: withTranscripts } = await open(), { store } = await open(), urls: string[] = [];
     const fetcher = async (url: string) => { urls.push(url); return Response.json([conversation("a"), conversation("b")]); };
-    // First with transcripts, then summaries only: the transcript lines of the earlier import are gone.
-    await importOmiConversations({ key, store, fetch: fetcher });
-    expect(store.getEntries("omi:a").filter(entry => entry.kind === "transcript")).toHaveLength(1);
-    const full = store.storageUsage().imports.bytes;
+    await importOmiConversations({ key, store: withTranscripts, fetch: fetcher });
+    expect(withTranscripts.getEntries("omi:a").filter(entry => entry.kind === "transcript")).toHaveLength(1);
+    const full = withTranscripts.storageUsage().imports.bytes;
     await expect(importOmiConversations({ key, store, fetch: fetcher, summariesOnly: true })).resolves.toEqual({ imported: 2, pages: 1 });
     expect(new URL(urls[0]!).searchParams.get("include_transcript")).toBe("true");
     expect(new URL(urls[1]!).searchParams.get("include_transcript")).toBe("false");
@@ -175,6 +176,9 @@ describe("v0.16 Omi import", () => {
     expect(store.getEntries("omi:a").map(entry => entry.metadata?.origin)).toEqual(["omi-summary"]);
     expect(store.getSession("omi:a")).toMatchObject({ title: "Launch a", summary: ["The launch moved to October.", "Ada owns the checklist."], keyFacts: ["Order the Jetson boards"], tags: ["work"] });
     expect(store.storageUsage().imports.bytes).toBeLessThan(full);
+    // Fix pass: a transcript saved by an earlier import is not deleted by a summaries-only import (v16-import-fixes.test.ts).
+    await importOmiConversations({ key, store: withTranscripts, fetch: fetcher, summariesOnly: true });
+    expect(withTranscripts.getEntries("omi:a").filter(entry => entry.kind === "transcript")).toHaveLength(1);
   });
 
   it("makes summaries, key facts and concepts of imported sessions searchable at answer time; live sessions are searched as before", async () => {

@@ -170,10 +170,12 @@ describe("v0.16 Omi import through the controller", () => {
   });
 
   it("skips a conversation that Helix sent to Omi and says so on the card", async () => {
-    const storage = new Map([[LEGACY_HISTORY_KEY, archive([{ id: "session_talk", source: "helix", title: "Standup a", startedAt: "2026-11-18T09:00:00.000Z", lines: ["The calibration rig ships on Friday."] }])]]);
+    // Fix pass: a marker skips only while the session it names is still on this phone, so "session_x" is saved here too.
+    const storage = new Map([[LEGACY_HISTORY_KEY, archive([{ id: "session_talk", source: "helix", title: "Standup a", startedAt: "2026-11-18T09:00:00.000Z", lines: ["The calibration rig ships on Friday."] },
+      { id: "session_x", source: "helix", title: "Earlier talk", startedAt: "2026-11-12T09:00:00.000Z", lines: ["We agreed to move the review to next week."] }])]]);
     const { controller } = await controllerWith(storage);
     await controller.importOmi({ key: "omi-test", fetch: async () => Response.json([omiConversation("a"), omiConversation("marked", { started_at: "2026-11-17T09:00:00Z", external_data: { client_session_id: "helix-session_x" } }), omiConversation("kept", { started_at: "2026-11-16T09:00:00Z" }), { id: "odd" }]) });
-    expect(controller.listHistorySessions().map(session => session.id).sort()).toEqual(["omi:kept", "session_talk"]);
+    expect(controller.listHistorySessions().map(session => session.id).sort()).toEqual(["omi:kept", "session_talk", "session_x"]);
     expect(controller.historySnapshot().omiImport).toMatchObject({ imported: 1, skipped: 3, failed: 0,
       message: "Import complete: 1 conversation processed · 1 skipped (Omi returned them in a form Helix cannot read) · 2 skipped (sent to Omi by Helix, already in History). Repeated imports update existing records." });
     await controller.dispose();

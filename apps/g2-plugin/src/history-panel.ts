@@ -397,7 +397,7 @@ const CLEANUP_GROUPS: readonly (readonly [CleanupGroupId, string, string])[] = [
   ["little-speech", "Almost nothing said", "Helix sessions with a stray word or a mic test, and no summary."],
   ["answers-only", "Only tapped answers", "Helix sessions with answers you tapped for and no transcript."],
   ["duplicate-import", "Duplicate imports", "The same Omi conversation or note saved twice. One copy stays."],
-  ["merge", "Merge sessions minutes apart", "Off by default. A merge cannot be undone."],
+  ["merge", "Merge sessions minutes apart", "Off by default. A merge cannot be undone. The two summaries are joined, and replaced by a new one when summaries are on."],
 ];
 /** The clean-up preview: what is proposed, grouped by reason, removals ticked and merges unticked (pure). */
 export function cleanupPreview(proposal: HistoryCleanupProposal): CleanupGroup[] {

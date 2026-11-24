@@ -197,6 +197,26 @@ function hasTypedQuestion(entries: readonly HistoryEntry[]): boolean {
     return !!asked && !said.some(text => text.includes(asked));
   });
 }
+/** One Han, kana or Hangul character says about as much as three Latin letters. */
+const DENSE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
+/** spokenChars with dense scripts weighted, so a few Chinese, Japanese or Korean sentences are not "almost nothing". */
+function spokenWeight(entries: readonly HistoryEntry[]): number {
+  return spoken(entries).reduce((sum, entry) => sum + (entry.text.match(DENSE_SCRIPT)?.length ?? 0) * 2, spokenChars(entries));
+}
+/** A fact check, or an answer to a question that was spoken (not a tap): short, but something Helix was used for. */
+function hasSpokenExchange(entries: readonly HistoryEntry[]): boolean {
+  if (entries.some(entry => entry.kind === "fact-check" && entry.text.trim())) return true;
+  return entries.some(entry => entry.kind === "answer" && entry.text.trim()) && entries.some(entry => entry.kind === "question" && !contextAskScope(entry) && entry.text.trim());
+}
+/** True when every saved line of `copy` is also in `keep` (and, for a copy without lines, its summary and key facts are the same). */
+function containedIn(copy: CleanupRecord, keep: CleanupRecord): boolean {
+  const line = (entry: HistoryEntry) => `${entry.kind}|${entry.text.replace(/\s+/gu, " ").trim()}`;
+  const kept = new Set(keep.entries.map(line));
+  if (!copy.entries.every(entry => kept.has(line(entry)))) return false;
+  if (copy.entries.length) return true;
+  const knowledge = (session: HistorySession) => JSON.stringify([session.summary ?? [], session.keyFacts ?? []]);
+  return !keep.entries.length && knowledge(copy.session) === knowledge(keep.session);
+}
 function sessionEnd(session: HistorySession, entries: readonly HistoryEntry[]): number {
   let end = Date.parse(session.endedAt ?? "");
   for (const entry of entries) { const at = Date.parse(entry.occurredAt); if (Number.isFinite(at) && !(at <= end)) end = at; }
@@ -205,9 +225,10 @@ function sessionEnd(session: HistorySession, entries: readonly HistoryEntry[]): 
 
 /**
  * What History -> Clean up offers (pure; nothing is removed here). Removals, ticked by default:
- * (a) Helix sessions with almost no speech and no recap, title, knowledge, to-dos or notes of their own;
+ * (a) Helix sessions with almost no speech, no fact check or answered spoken question, and no recap,
+ *     title, knowledge, to-dos or notes of their own;
  * (b) Helix sessions that hold only answers to manual taps and no transcript;
- * (c) duplicate imports: the same source, title and start time, or an Omi conversation whose title and
+ * (c) duplicate imports: the same source, title and start time with no line the kept copy lacks, or an Omi conversation whose title and
  *     start time match a Helix session (Helix sent it there).
  * Merges, offered unticked: two Helix sessions where the second starts within `mergeGapMs` of the first ending.
  * An imported session is never proposed under (a) or (b); PDF documents are never proposed at all.
@@ -227,9 +248,10 @@ export function proposeHistoryCleanup(records: readonly CleanupRecord[], options
     if (!entries.length || hasOwnRecap(session, entries) || hasTypedQuestion(entries)) continue;
     const said = spokenChars(entries);
     if (!said && entries.some(entry => entry.kind === "answer")) remove(record, "answers-only");
-    else if (said < MIN_RECAP_TRANSCRIPT_CHARS) remove(record, "little-speech");
+    else if (spokenWeight(entries) < MIN_RECAP_TRANSCRIPT_CHARS && !hasSpokenExchange(entries)) remove(record, "little-speech");
   }
-  // (c) the same import twice: the copy with the most saved lines (then the newest) is kept.
+  // (c) the same import twice: the copy with the most saved lines (then the newest) is kept. A copy is
+  // proposed only when it holds nothing the kept one lacks: two notes can share a title and a day.
   const imported = usable.filter(record => record.session.source !== "helix"), groups = new Map<string, CleanupRecord[]>();
   for (const record of imported) {
     const title = flatText(record.session.title), at = Date.parse(record.session.startedAt);
@@ -240,7 +262,7 @@ export function proposeHistoryCleanup(records: readonly CleanupRecord[], options
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     const [keep, ...rest] = [...group].sort((a, b) => b.entries.length - a.entries.length || Date.parse(b.session.updatedAt) - Date.parse(a.session.updatedAt) || a.session.id.localeCompare(b.session.id));
-    for (const record of rest) remove(record, "duplicate-import", keep!.session.id);
+    for (const record of rest) if (containedIn(record, keep!)) remove(record, "duplicate-import", keep!.session.id);
   }
   // (c) an Omi conversation that is a Helix session sent to Omi and imported back.
   const kept = helix.filter(record => !going.has(record.session.id)).map(record => ({ id: record.session.id, at: Date.parse(record.session.startedAt), titles: [flatText(record.session.title), flatText(titleOf(record))].filter(Boolean) }));
