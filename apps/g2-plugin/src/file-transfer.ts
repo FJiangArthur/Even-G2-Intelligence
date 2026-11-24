@@ -100,7 +100,13 @@ export async function exportFile<Link = unknown>(file: { name: string; content: 
 
 /* ------------------------------------------------------------------ reading picked files */
 
-export interface ReadFile { readonly name: string; readonly size: number; text?: () => Promise<string> }
+export interface ReadFile {
+  readonly name: string; readonly size: number; text?: () => Promise<string>;
+  /** File.lastModified (ms). Dates a note that has no date of its own. */
+  readonly lastModified?: number;
+  /** Set by a folder picker: the path inside the chosen folder. Empty for single files. */
+  readonly webkitRelativePath?: string;
+}
 export type TextFileResult = { readonly name: string; readonly ok: true; readonly text: string } | { readonly name: string; readonly ok: false; readonly error: string };
 const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
@@ -113,17 +119,27 @@ function legacyText(file: ReadFile): Promise<string> {
     reader.readAsText(file as unknown as Blob);
   });
 }
-/** Reads every picked text file. One unreadable or oversized file is reported; the others still load. */
-export async function readTextFiles(files: readonly ReadFile[], maxBytes = 2_000_000): Promise<TextFileResult[]> {
-  return Promise.all(files.map(async (file): Promise<TextFileResult> => {
-    try {
-      if (file.size > maxBytes) throw new Error(`Too large (${mb(file.size)}; the limit is ${mb(maxBytes)}).`);
-      const text = typeof file.text === "function" ? await file.text() : await legacyText(file);
-      if (!text.trim()) throw new Error("The file is empty.");
-      if (text.slice(0, 2048).includes("\u0000")) throw new Error("Not a text file.");
-      return { name: file.name, ok: true, text };
-    } catch (error) { return { name: file.name, ok: false, error: error instanceof Error ? error.message : String(error) }; }
-  }));
+/** Reads one picked text file. Throws a sentence for the user when it is too large, empty, binary or unreadable. */
+export async function readTextFile(file: ReadFile, maxBytes = 2_000_000): Promise<string> {
+  if (file.size > maxBytes) throw new Error(`Too large (${mb(file.size)}; the limit is ${mb(maxBytes)}).`);
+  const text = typeof file.text === "function" ? await file.text() : await legacyText(file);
+  if (!text.trim()) throw new Error("The file is empty.");
+  if (text.slice(0, 2048).includes("\u0000")) throw new Error("Not a text file.");
+  return text;
+}
+/**
+ * Reads every picked text file, one at a time (v0.16: 200 files of 2 MB read at once could exhaust the
+ * WebView's memory). One unreadable or oversized file is reported; the others still load.
+ * `onProgress(done, total, name)` is called before each file.
+ */
+export async function readTextFiles(files: readonly ReadFile[], maxBytes = 2_000_000, onProgress?: (done: number, total: number, name: string) => void): Promise<TextFileResult[]> {
+  const results: TextFileResult[] = [];
+  for (const [index, file] of files.entries()) {
+    try { onProgress?.(index, files.length, file.name); } catch { /* progress display only */ }
+    try { results.push({ name: file.name, ok: true, text: await readTextFile(file, maxBytes) }); }
+    catch (error) { results.push({ name: file.name, ok: false, error: error instanceof Error ? error.message : String(error) }); }
+  }
+  return results;
 }
 
 /* ------------------------------------------------------------------ import from a link */

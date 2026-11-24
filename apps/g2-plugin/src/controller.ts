@@ -37,7 +37,8 @@ import {
   type OmiExportResult,
   exportToOmi,
 } from "@helix/conversation-sdk";
-import { markdownSession, omiExportSummary, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile } from "./knowledge-panel"; // phone agent
+import { markdownImportText, markdownSession, omiExportSummary, omiImportErrorText, omiImportText, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile, type MarkdownFileOutcome } from "./knowledge-panel"; // phone agent
+import { MarkdownImportPlanner, type OmiImportProgress } from "@helix/conversation-sdk"; // v0.16 imports
 import { joinConcept } from "./history-panel";
 import { historyScopeIds, proposeHistoryCleanup, type HistoryCleanupProposal, type HistoryRemoveScope } from "@helix/conversation-sdk"; // v0.16 history clean-up
 import { firstAccessibleModel } from "@helix/conversation-sdk";
@@ -101,7 +102,37 @@ export interface AutoImportView {
   readonly lastAttemptAt?: string; readonly lastSuccessAt?: string; readonly lastImported?: number;
   /** Why the last attempt did not import (missing key, Omi error, storage full). */
   readonly lastError?: string;
+  /** v0.16: Omi imports (automatic and by hand) keep summaries and no transcripts. Absent: off. */
+  readonly summariesOnly?: boolean;
 }
+// ---- v0.16 imports ----
+/** The Omi import card: its own progress and outcome, whatever else the status line says. */
+export interface OmiImportView {
+  readonly running: boolean;
+  /** Progress while running, then the outcome with counts and reasons. "" before the first import. */
+  readonly message: string;
+  readonly imported: number; readonly skipped: number; readonly failed: number;
+}
+/** One note to import. `text` may be a function, so a file is read only when its turn comes. */
+export interface MarkdownImportItem {
+  readonly name: string; readonly text: string | (() => Promise<string>);
+  /** Path inside the vault, or the link the note came from. */ readonly path?: string;
+  /** File.lastModified (ms): the date of a note that has none of its own. */ readonly lastModified?: number;
+  /** Pasted text: never replaces another note with the same title. */ readonly pasted?: boolean;
+}
+export interface MarkdownImportProgress { /** Notes finished so far. */ readonly done: number; readonly total: number; /** The note being read now. */ readonly name: string }
+export interface MarkdownImportResult {
+  readonly imported: number; readonly sessionIds: string[]; readonly failed: { name: string; error: string }[];
+  /** Notes left out without an error (the same note twice in one import). */
+  readonly skipped: { name: string; reason: string }[];
+  /** Imported notes that the import limits shortened, with what was cut. */
+  readonly truncated: { name: string; detail: string }[];
+  /** One outcome per note, in the order given. */
+  readonly files: MarkdownFileOutcome[];
+  /** The outcome as one line for the card. */
+  readonly message: string;
+}
+// ---- end v0.16 imports ----
 export interface PdfImportView { readonly running: boolean; readonly parser?: PdfParser; readonly files: readonly PdfFileStatus[] }
 export interface PdfImportRequest {
   readonly parser: PdfParser;
@@ -115,6 +146,7 @@ export interface HistoryState {
   readonly knowledge: KnowledgeBaseView;
   readonly autoImport: AutoImportView;
   readonly pdfImport: PdfImportView;
+  readonly omiImport: OmiImportView;
   readonly sessions: HistorySession[];
   readonly status: string;
   readonly importing: boolean;
@@ -246,7 +278,7 @@ export class G2ConversationController {
   ) { this.history = new LocalHistoryStore(bridge); }
 
   public historySnapshot(): HistoryState {
-    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), sessions: this.savedSessions().slice(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
+    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), omiImport: this.omiImportView(), sessions: this.savedSessions().slice(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
       useLocalMemory: this.localMemoryEnabled, liveWebFactCheck: this.webCheckEnabled, autoExplainTerms: this.autoExplainEnabled };
   }
   /**
@@ -397,28 +429,51 @@ export class G2ConversationController {
     if (this.importAbort) throw new Error("An Omi import is already running.");
     const abort = new AbortController(); this.importAbort = abort;
     this.bulkHistoryWrites++; this.syncHistoryWriteDelay(); // Sequential awaited writes: no coalescing window.
-    this.setHistoryStatus("Importing Omi conversations…");
+    // v0.16: the card has its own line (omiImport), so an error that names neither Omi nor conversations still shows there.
+    let latest: OmiImportProgress | undefined;
+    const report = (message: string, running: boolean) => {
+      this.omiImport = { running, message, imported: latest?.imported ?? 0, skipped: latest?.skipped ?? 0, failed: latest?.failed ?? 0 };
+      this.setHistoryStatus(message);
+    };
+    report("Importing Omi conversations…", true);
     const archives = this.archiveQueue;
     const completion = (async () => {
       try {
         await archives;
         // v0.13 skipInvalid: one conversation Helix cannot read is counted and skipped instead of failing every import.
-        const result = await importOmiConversations({ skipInvalid: true, ...request, store: this.history, signal: abort.signal,
-          onProgress: progress => this.setHistoryStatus(`Imported ${progress.imported} conversations · ${progress.pages} pages`) });
-        this.lastOmiImport = { ok: true, imported: result.imported, skipped: result.skipped ?? 0 };
-        this.setHistoryStatus(`Import complete: ${result.imported} conversations processed${result.skipped ? ` · ${result.skipped} skipped (Omi returned them in a form Helix cannot read)` : ""}. Repeated imports update existing records.`);
-      } catch (error) { this.lastOmiImport = { ok: false, message: errorMessage(error) }; this.setHistoryStatus(errorMessage(error)); }
+        const result = await importOmiConversations({ skipInvalid: true, ...(this.autoImport.summariesOnly ? { summariesOnly: true } : {}), ...request, store: this.history, signal: abort.signal,
+          onProgress: progress => { latest = progress; report(omiImportText(progress, false), true); } });
+        latest = result;
+        const message = omiImportText(result, true);
+        // A conversation that could not be saved (the import budget is full) makes the run a failure with that reason.
+        this.lastOmiImport = result.failed ? { ok: false, message } : { ok: true, imported: result.imported, skipped: result.skipped ?? 0 };
+        report(message, false);
+      } catch (error) {
+        const message = omiImportErrorText(errorMessage(error), latest);
+        this.lastOmiImport = { ok: false, message }; report(message, false);
+      }
       finally { this.importAbort = undefined; this.importCompletion = undefined; this.bulkHistoryWrites--; this.syncHistoryWriteDelay(); this.emitHistory(); }
     })();
     this.importCompletion = completion;
     await completion;
   }
   public cancelImport(): void { this.importAbort?.abort(); }
+  // ---- v0.16 imports ----
+  private omiImport: OmiImportView = { running: false, message: "", imported: 0, skipped: 0, failed: 0 };
+  public omiImportView(): OmiImportView { return this.omiImport; }
+  /** Omi imports keep summaries and no transcripts (saved with the auto-import switch; used by automatic imports too). */
+  public async setOmiSummariesOnly(enabled: boolean): Promise<void> {
+    const { summariesOnly: _old, ...kept } = this.autoImport;
+    this.autoImport = enabled ? { ...kept, summariesOnly: true } : kept;
+    this.emitHistory();
+    await this.saveAutoImport();
+  }
+  // ---- end v0.16 imports ----
 
   // ---- v0.13 Omi auto-import ----
   /** Outcome of the most recent importOmi() run (it reports through the status line and never throws). */
   private lastOmiImport?: { ok: true; imported: number; skipped: number } | { ok: false; message: string };
-  private autoImport: { enabled: boolean; lastAttemptAt?: string; lastSuccessAt?: string; lastImported?: number; lastError?: string } = { enabled: false };
+  private autoImport: { enabled: boolean; lastAttemptAt?: string; lastSuccessAt?: string; lastImported?: number; lastError?: string; summariesOnly?: boolean } = { enabled: false };
   private autoImportRunning = false;
   private autoImportKey?: () => string;
   private autoImportTimer?: ReturnType<typeof setInterval>;
@@ -735,7 +790,8 @@ export class G2ConversationController {
       const text = (value: unknown) => typeof value === "string" && value.length <= 600 ? value : undefined;
       const lastAttemptAt = text(saved.lastAttemptAt), lastSuccessAt = text(saved.lastSuccessAt), lastError = text(saved.lastError);
       this.autoImport = { enabled: saved.enabled === true, ...(lastAttemptAt ? { lastAttemptAt } : {}), ...(lastSuccessAt ? { lastSuccessAt } : {}), ...(lastError ? { lastError } : {}),
-        ...(typeof saved.lastImported === "number" && Number.isSafeInteger(saved.lastImported) ? { lastImported: saved.lastImported } : {}) };
+        ...(typeof saved.lastImported === "number" && Number.isSafeInteger(saved.lastImported) ? { lastImported: saved.lastImported } : {}),
+        ...(saved.summariesOnly === true ? { summariesOnly: true } : {}) };
     } catch { /* auto-import stays off */ }
     try { await this.history.load(); await this.tidyHistory(); this.setHistoryStatus("History is saved only on this phone."); }
     catch (error) { this.setHistoryStatus(errorMessage(error)); }
@@ -1521,30 +1577,57 @@ export class G2ConversationController {
     const sessions = this.history.listSessions().filter(session => !wanted || wanted.has(session.id));
     return sessions.length ? toVaultFiles(sessions.map(session => ({ session: this.titled(session), entries: this.history.getEntries(session.id) }))) : [];
   }
-  /** Obsidian -> Helix: parse .md notes and store them as source "obsidian" sessions. */
-  public async importMarkdownFiles(files: readonly { name: string; text: string }[]): Promise<{ imported: number; sessionIds: string[]; failed: { name: string; error: string }[] }> {
+  /**
+   * Obsidian -> Helix: parse .md notes and store them as source "obsidian" sessions.
+   * v0.16: notes are read, parsed and saved one at a time (`text` may be a function that reads the file),
+   * with progress per note. Each note replaces its earlier copy as a whole, so lines removed from the note
+   * do not stay; when it does not fit (the import budget is full) the earlier copy stays and the note is
+   * reported as failed with that reason. Two notes with one file name are both kept, and a note saved by
+   * an earlier version under its old id is replaced, not doubled (MarkdownImportPlanner).
+   */
+  public async importMarkdownFiles(files: readonly MarkdownImportItem[], options: { onProgress?: (progress: MarkdownImportProgress) => void } = {}): Promise<MarkdownImportResult> {
     if (this.disposed || this.exiting) throw new Error("Helix has exited.");
-    const parsed: { session: HistorySession; entries: HistoryEntry[] }[] = [];
-    const failed: { name: string; error: string }[] = [];
-    for (const file of files.slice(0, 200)) {
-      try { parsed.push(markdownSession(file.name, file.text)); } catch (error) { failed.push({ name: file.name, error: errorMessage(error) }); }
-    }
-    // v0.13: files past the batch limit are reported, not silently dropped.
-    for (const file of files.slice(200)) failed.push({ name: file.name, error: "Only 200 notes can be imported at once. Import this one in the next batch." });
-    const sessionIds: string[] = [];
+    const batch = files.slice(0, 200), outcomes: MarkdownFileOutcome[] = [];
+    const sessionIds: string[] = [], failed: { name: string; error: string }[] = [], skipped: { name: string; reason: string }[] = [], truncated: { name: string; detail: string }[] = [], superseded: string[] = [];
     await this.archiveQueue;
     this.bulkHistoryWrites++; this.syncHistoryWriteDelay();
+    const planner = new MarkdownImportPlanner(this.history);
     try {
-      for (const { session, entries } of parsed) {
+      for (const [index, file] of batch.entries()) {
+        try { options.onProgress?.({ done: index, total: batch.length, name: file.name }); } catch { /* progress display only */ }
         try {
-          await this.history.upsertSession({ ...session, source: "obsidian" });
-          if (entries.length) await this.history.upsertEntries(entries.map(entry => ({ ...entry, sessionId: session.id })));
+          const text = typeof file.text === "function" ? await file.text() : file.text;
+          const parsed = markdownSession(file.name, text, { ...(file.path ? { path: file.path } : {}), ...(file.lastModified ? { lastModified: file.lastModified } : {}), ...(file.pasted ? { pasted: true } : {}) });
+          const placed = planner.place(parsed, { pasted: !!file.pasted });
+          if (placed.duplicate) {
+            const reason = "The same note is in this import twice";
+            skipped.push({ name: file.name, reason }); outcomes.push({ name: file.name, state: "skipped", detail: reason });
+            continue;
+          }
+          const { session, entries } = placed.note;
+          // One all-or-nothing save: when it fails, nothing of the new version exists and the earlier copy is untouched.
+          await this.history.replaceSession({ ...session, source: "obsidian" }, entries, placed.supersedes ? { supersedes: placed.supersedes } : {});
           sessionIds.push(session.id);
-        } catch (error) { failed.push({ name: session.title, error: errorMessage(error) }); }
+          if (placed.supersedes) superseded.push(placed.supersedes);
+          if (placed.note.truncated) truncated.push({ name: file.name, detail: placed.note.truncated });
+          outcomes.push({ name: file.name, state: "imported", ...(placed.note.truncated ? { detail: placed.note.truncated } : {}) });
+        } catch (error) {
+          const message = errorMessage(error);
+          failed.push({ name: file.name, error: message });
+          outcomes.push({ name: file.name, state: "failed", detail: message.replace(`${file.name}: `, "") });
+        }
       }
     } finally { this.bulkHistoryWrites--; this.syncHistoryWriteDelay(); }
-    this.setHistoryStatus(`Imported ${sessionIds.length} Obsidian note${sessionIds.length === 1 ? "" : "s"}${failed.length ? ` · ${failed.length} failed` : ""}.`);
-    return { imported: sessionIds.length, sessionIds, failed };
+    // v0.13: files past the batch limit are reported, not silently dropped.
+    for (const file of files.slice(200)) {
+      const error = "Only 200 notes can be imported at once. Import this one in the next batch.";
+      failed.push({ name: file.name, error }); outcomes.push({ name: file.name, state: "failed", detail: error });
+    }
+    // A note that moved to its new id leaves no copy behind in the OpenAI knowledge base: the next Sync removes the old file.
+    if (superseded.length) await this.forgetOpenAIKnowledge(superseded, "").catch(() => 0);
+    const message = markdownImportText(outcomes);
+    this.setHistoryStatus(message);
+    return { imported: sessionIds.length, sessionIds, failed, skipped, truncated, files: outcomes, message };
   }
   public omiExportSupport(): { supported: boolean; reason: string } {
     return { supported: true, reason: "" };
