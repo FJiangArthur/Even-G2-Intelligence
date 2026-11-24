@@ -25,11 +25,15 @@
  * evenhub-simulator 0.9.5 font. Physical-glasses font acceptance is separate.
  *
  * AMBIENT display (default; "always-on" keeps everything above on screen all the time): during a
- * session the glasses are blank. An answer (THEY ASKED / ANSWER / ANSWER KEY, "Thinking…") or a
- * cue of the current mode (concept, lookup, conflict, fact verdict, the top suggested question) pops up
- * in the same title + BODY style, pages by itself and disappears. Double-tap (the menu gesture) wakes the full HUD with
- * the MENU open; double-tap on the menu, or AMBIENT_IDLE_MS without a gesture, blanks it again.
- * The blank page is its own page (no frame border, no images) whose BODY still captures events.
+ * session the glasses are blank. An answer ("Thinking…" while it is requested) or a cue of the current
+ * mode (concept, lookup, conflict, fact verdict, the top suggestion) pops up, pages by itself and
+ * disappears. Double-tap (the menu gesture) wakes the full HUD with the MENU open; double-tap on the
+ * menu, or AMBIENT_IDLE_MS without a gesture, blanks it again.
+ * v0.16: the blank page is its own page with ONE text container over the whole canvas (HUD_AMBIENT_PANEL,
+ * 10 lines; no frame, no images, it captures the gestures). A pop-up is content only, with no title or
+ * prefix, centred in that container with leading spaces and blank lines (centreBlock). The page marker
+ * ("1/2"), a gesture hint and a problem ("! …") share its last line, and only when there is one to show.
+ * A streaming answer page stays top-left until the page is complete, so it is not re-centred per token.
  */
 import { recordDiagnostic } from "./diagnostics";
 import {
@@ -152,6 +156,11 @@ export interface GlassesHudOptions {
   readonly display?: GlassesDisplay;
   /** Ambient display: idle time after which the woken HUD blanks again. Default AMBIENT_IDLE_MS; at least 1000 ms. */
   readonly ambientIdleMs?: number;
+  /**
+   * v0.16: the wearer tapped a line to say (CopilotSuggestion kind "say") on the glasses. The HUD stops
+   * offering it by itself; the host can mark it said elsewhere (the phone list). Never a request to Helix.
+   */
+  readonly onSaid?: (line: { readonly id?: string; readonly text: string }) => void;
 }
 
 /**
@@ -275,7 +284,14 @@ export const AMBIENT_LINES = HUD_AMBIENT_PANEL.lines;
 export const AMBIENT_LINE_WIDTH = HUD_AMBIENT_PANEL.width - HEADROOM;
 type ImageKey = keyof typeof HUD_IMAGES;
 type PanelKey = keyof typeof HUD_PANELS;
+/** A text container of one of the three pages: the six HUD panels, or the one container of the ambient page. */
+type ContainerKey = PanelKey | "ambient";
 const PANEL_ORDER: readonly PanelKey[] = ["body", "header", "status", "caption", "mode", "views"];
+/** MENU page: the native list takes the place of the view list. */
+const MENU_ORDER: readonly PanelKey[] = ["body", "header", "status", "caption", "mode"];
+const AMBIENT_ORDER: readonly ContainerKey[] = ["ambient"];
+const ALL_CONTAINERS: readonly ContainerKey[] = [...PANEL_ORDER, "ambient"];
+const containerOf = (key: ContainerKey) => key === "ambient" ? HUD_AMBIENT_PANEL : HUD_PANELS[key];
 /** Container text of a panel in a frame (the HEADER container shows the title). */
 const panelText = (frame: HudFrame, key: PanelKey): string => key === "header" ? frame.title : frame[key];
 const innerWidth = (key: PanelKey) => {
@@ -379,6 +395,61 @@ export function fitLines(text: string, maxLines: number, width: number = HUD_LIN
   return kept;
 }
 
+/**
+ * Leading spaces that centre one line in `width` px. The font is proportional, so the middle of the
+ * line lands within half a space (2.6 px) of the middle of the container, and the padded line never
+ * passes `width`. A blank line stays empty.
+ */
+function centreLine(line: string, width: number): string {
+  const text = line.trim();
+  if (!text) return "";
+  const pad = Math.round((width - hudTextWidth(text)) / 2 / hudGlyphWidth(" "));
+  return pad > 0 ? `${" ".repeat(pad)}${text}` : text;
+}
+
+/**
+ * v0.16: centres a block of text in a container of `lineCount` lines of `width` px. The Even SDK has no
+ * alignment, so every line gets leading spaces (a space is 5.2 px) and the block gets leading blank
+ * lines. A text is wrapped and cut to `lineCount` lines (fitLines); an array is taken as lines that are
+ * already wrapped. Returns the lines from the top of the container; nothing is added after the block.
+ */
+export function centreBlock(content: string | readonly string[], width: number = AMBIENT_LINE_WIDTH, lineCount: number = AMBIENT_LINES): string[] {
+  if (lineCount <= 0) return [];
+  let lines = typeof content === "string" ? fitLines(content, lineCount, width) : content.map(line => ellipsize(line.trim(), width));
+  while (lines.length && !lines[0]!.trim()) lines = lines.slice(1);
+  while (lines.length && !lines[lines.length - 1]!.trim()) lines = lines.slice(0, -1);
+  lines = lines.slice(0, lineCount);
+  if (!lines.length) return [];
+  const top = Math.floor((lineCount - lines.length) / 2);
+  return [...Array.from({ length: top }, () => ""), ...lines.map(line => centreLine(line, width))];
+}
+
+const utf8 = new TextEncoder();
+/** Ceiling for the text of the ambient container. The SDK takes at most 1000 characters at page creation. */
+export const AMBIENT_MAX_BYTES = 960;
+/**
+ * The ambient container text from its lines, never over AMBIENT_MAX_BYTES (UTF-8, so never over that many
+ * characters either): the centring spaces go first, then the end of the text.
+ */
+function ambientContent(lines: readonly string[], footer = "", rows = lines.length): string {
+  const size = (text: string) => utf8.encode(text).length;
+  // The footer (page marker, hint, problem) is the last row of the container: blank rows fill up to it.
+  const join = (content: readonly string[], foot: string) => foot
+    ? [...content, ...Array.from({ length: Math.max(0, rows - content.length) }, () => ""), foot].join("\n") : content.join("\n");
+  let text = join(lines, footer);
+  if (!text.trim()) return " ";
+  if (size(text) <= AMBIENT_MAX_BYTES) return text;
+  const content = lines.map(line => line.trimStart()), foot = footer.trimStart();
+  text = join(content, foot);
+  if (size(text) <= AMBIENT_MAX_BYTES) return text;
+  // Still too long: the end of the content is cut. The footer stays, so the page marker is never lost.
+  const glyphs = graphemes(content.join("\n"));
+  const budget = AMBIENT_MAX_BYTES - size("…") - (foot ? size(foot) + Math.max(1, rows) : 0);
+  let used = 0, cut = 0;
+  while (cut < glyphs.length && used + size(glyphs[cut]!) <= budget) used += size(glyphs[cut++]!);
+  return join(`${glyphs.slice(0, cut).join("").trimEnd()}…`.split("\n"), foot);
+}
+
 /** The last `maxLines` wrapped lines; a cut head is marked with "…". */
 export function tailLines(text: string, maxLines: number, width: number, prefix = ""): string[] {
   const source = text.length > 600 ? text.slice(-600).replace(/^\S*\s/u, "") : text;
@@ -467,6 +538,32 @@ export function rollingCaption(segments: readonly CaptionSegment[], maxLines: nu
 const ANSWER_LAYOUT: PageLayout = Object.freeze({ lineWidth: HUD_LINE_WIDTH.body, lines: BODY_LINES, bytes: 1500, measure: hudGlyphWidth });
 /** "THEY ASKED" answers keep the question on the first body line. */
 const THEY_ASKED_LAYOUT: PageLayout = Object.freeze({ ...ANSWER_LAYOUT, lines: BODY_LINES - 1 });
+/**
+ * v0.16 answer pages on the hidden display: the whole ambient container less its last line (page marker,
+ * hint, problem). 700 bytes of text leave room for the centring spaces under AMBIENT_MAX_BYTES.
+ * "small" is the same pop-up in the BODY box, for a host that cannot swap pages.
+ */
+type LayoutMode = "awake" | "full" | "small";
+/** A full hidden-display page holds about 550 characters (nine lines of 548 px): at 45 ms a character that is about 25 s, not the 10 s of the smaller pages. */
+export const AMBIENT_READ_MS = 25_000;
+/** Text bytes of one cue page on the hidden display; like answer pages, it leaves room for the centring spaces and the last line. */
+const CUE_PAGE_BYTES = 700;
+const AMBIENT_PAGE: PageLayout = Object.freeze({ lineWidth: AMBIENT_LINE_WIDTH, lines: AMBIENT_LINES - 1, bytes: 700, measure: hudGlyphWidth, maxReadingMs: AMBIENT_READ_MS });
+const AMBIENT_SMALL_PAGE: PageLayout = Object.freeze({ lineWidth: HUD_LINE_WIDTH.body, lines: BODY_LINES - 1, bytes: 700, measure: hudGlyphWidth });
+/** One layout object per mode and answer kind, so a page swap can map each answer's layout to the other mode. */
+const ANSWER_LAYOUTS: Readonly<Record<LayoutMode, readonly [plain: PageLayout, asked: PageLayout]>> = Object.freeze({
+  awake: [ANSWER_LAYOUT, THEY_ASKED_LAYOUT],
+  full: [AMBIENT_PAGE, Object.freeze({ ...AMBIENT_PAGE })],
+  small: [AMBIENT_SMALL_PAGE, Object.freeze({ ...AMBIENT_SMALL_PAGE })],
+});
+/** The layout of the same answer kind in `mode`. */
+function layoutIn(layout: PageLayout, mode: LayoutMode): PageLayout {
+  for (const pair of Object.values(ANSWER_LAYOUTS)) {
+    const index = pair.indexOf(layout);
+    if (index >= 0) return ANSWER_LAYOUTS[mode][index]!;
+  }
+  return layout;
+}
 
 /* ------------------------------------------------------------------ */
 /* Snapshot helpers                                                    */
@@ -513,6 +610,8 @@ interface HudItem {
   readonly check?: string;
   /** Verdicts: the dated source line shown at the end of the ambient pop-up ("Src: reuters.com · 2026-11-18 · +2"). */
   readonly source?: string;
+  /** v0.16 pop-up on the hidden display: content only, no title or label. Absent = this item does not pop up. */
+  readonly ambient?: string;
 }
 
 /** "web check", or "news check" when the search was biased to recent reporting (Setup → news search). */
@@ -530,17 +629,32 @@ export function verdictSourceLine(sources: readonly { url: string; title?: strin
 
 const ASK_LABEL: Readonly<Record<string, string>> = { lookup: "LOOKUP", propose: "PROPOSAL", question: "QUESTION" };
 
+/**
+ * v0.16 verdict on the hidden display, with no kind heading ("web check", "verify") and the verdict said
+ * once: a contradiction is "Correction: …" (what is right), any other verdict is one word and the claim.
+ */
+function verdictPopUp(status: string, claim: string, summary: string): string {
+  if (status === "contradicted") return summary ? `Correction: ${summary}` : `Not true: ${claim}`;
+  const word = status === "supported" ? "True" : status === "uncertain" ? "Unsure" : status === "unavailable" ? "Not checked" : "";
+  return `${word ? `${word}: ` : ""}${claim}${summary ? `\n${summary}` : ""}`;
+}
+
 function collectItems(snapshot: PresentationSnapshot): HudItem[] {
   const items: HudItem[] = [];
   for (const concept of snapshot.concepts) {
+    const term = oneLine(concept.term), explanation = oneLine(concept.explanation);
     items.push({ key: `c:${concept.id}`, sig: `${concept.term}|${concept.explanation}`, kind: "concept",
-      live: titled(oneLine(concept.term), oneLine(concept.explanation)) });
+      live: titled(term, explanation), ambient: term && explanation ? `${term} — ${explanation}` : term || explanation });
   }
   for (const conflict of snapshot.conflicts) {
     const what = oneLine(conflict.explanation || conflict.later);
     items.push({ key: `x:${conflict.id}`, sig: `${conflict.explanation}|${conflict.later}`, kind: "conflict",
       live: `▲ Conflict: ${what}`,
-      check: `▲ CONFLICT\n${what}${conflict.earlier ? `\nWas: ${oneLine(conflict.earlier)}` : ""}${conflict.later && conflict.explanation ? `\nNow: ${oneLine(conflict.later)}` : ""}` });
+      check: `▲ CONFLICT\n${what}${conflict.earlier ? `\nWas: ${oneLine(conflict.earlier)}` : ""}${conflict.later && conflict.explanation ? `\nNow: ${oneLine(conflict.later)}` : ""}`,
+      // Hidden display: sentences, no "Conflict:" / "Was:" / "Now:" labels.
+      ambient: `${what}${conflict.earlier
+        ? `\nWas “${oneLine(conflict.earlier)}”${conflict.later && conflict.explanation ? `, now “${oneLine(conflict.later)}”` : ""}.`
+        : conflict.later && conflict.explanation ? `\nNow “${oneLine(conflict.later)}”.` : ""}` });
   }
   for (const ask of snapshot.asks) {
     // Implicit asks (lookup / propose): "→ LOOKUP · topic: result".
@@ -549,30 +663,33 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
     const live = ask.status === "pending" ? `→ ${label} · ${topic}…`
       : ask.status === "failed" ? `→ ${label} failed · ${topic}`
         : `→ ${label} · ${titled(topic, oneLine(ask.answer ?? ""))}`;
-    items.push({ key: `k:${ask.id}`, sig: `${ask.status}|${ask.answer ?? ""}`, kind: "ask", live });
+    // Lookups pop up when their answer arrived, not while pending or after a failure.
+    const settled = ask.status !== "pending" && ask.status !== "failed";
+    items.push({ key: `k:${ask.id}`, sig: `${ask.status}|${ask.answer ?? ""}`, kind: "ask", live,
+      ...(settled ? { ambient: titled(topic, oneLine(ask.answer ?? "")) } : {}) });
   }
   for (const result of snapshot.verifications) {
     const summary = oneLine(result.summary);
     const source = verdictSourceLine(result.sources);
+    const check = `${verdictLine(result)} · ${checkKind(result, "verify")}\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}`;
     items.push({ key: `v:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "verification",
       live: titled(verdictLabel(result.status), `${oneLine(result.target)}${summary ? ` — ${summary}` : ""}`),
-      check: `${verdictLine(result)} · ${checkKind(result, "verify")}\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}`,
-      ...(source ? { source } : {}) });
+      check, ambient: verdictPopUp(result.status, oneLine(result.target), summary), ...(source ? { source } : {}) });
   }
   for (const result of snapshot.factChecks) {
     const summary = oneLine(result.summary);
     const source = verdictSourceLine(result.sources);
+    const check = `${verdictLine(result)} · ${checkKind(result, "web check")}\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}`;
     items.push({ key: `f:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "fact-check",
       live: titled(verdictLabel(result.status), `${oneLine(result.claim)}${summary ? ` — ${summary}` : ""}`),
-      check: `${verdictLine(result)} · ${checkKind(result, "web check")}\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}`,
-      ...(source ? { source } : {}) });
+      check, ambient: verdictPopUp(result.status, oneLine(result.claim), summary), ...(source ? { source } : {}) });
   }
   for (const fact of snapshot.summary?.keyFacts ?? []) {
     items.push({ key: `kf:${oneLine(fact).toLowerCase()}`, sig: "", kind: "fact", live: `Fact: ${oneLine(fact)}` });
   }
   // Notes mode: one short confirmation per captured or changed to-do ("TODO + Send quote - Mei, Fri").
   for (const cue of snapshot.notebook?.cues ?? []) {
-    items.push({ key: `t:${cue.id}`, sig: cue.text, kind: "todo", live: oneLine(cue.text) });
+    items.push({ key: `t:${cue.id}`, sig: cue.text, kind: "todo", live: oneLine(cue.text), ambient: oneLine(cue.text) });
   }
   for (const suggestion of snapshot.suggestions) {
     items.push({ key: `s:${suggestion.id}`, sig: "", kind: "suggestion", live: `? ${oneLine(suggestion.question)}` });
@@ -609,7 +726,8 @@ const VERIFY_PENDING_MS = 45_000;
 const CUE_QUEUE = 3, CUE_STALE_MS = 45_000, CUE_PAGES = 3, CUE_PAGES_DETAILED = 6, CUE_LAST_PAGE_MS = 5000;
 /** Ambient: "● listening" / "○ paused" shows this long after the mic state changes. */
 const STATUS_CUE_MS = 4000;
-const CUE_TITLE: Readonly<Partial<Record<ItemKind, string>>> = { concept: "CONCEPT", ask: "LOOKUP", conflict: "CHECK", verification: "CHECK", "fact-check": "FACT CHECK", todo: "TO-DO" };
+/** v0.16: the active mode shows this long at session start on the hidden display ("Mode: Interviewer"). */
+export const MODE_NOTICE_MS = 4000;
 /**
  * Ambient suggested question (v0.14): the top one that was not yet said aloud pops up by itself, at most
  * one every SUGGESTION_CUE_GAP_MS, and stays at least SUGGESTION_CUE_MS so it can be read and said.
@@ -618,18 +736,19 @@ export const SUGGESTION_CUE_GAP_MS = 20_000;
 export const SUGGESTION_CUE_MS = 10_000;
 /** A transient problem (glasses.notice) shows this long in the status line; the answer stays up. */
 export const NOTICE_MS = 6000;
-/** A cue that pops up on the blank ambient display: body pages, the page shown and when it turns / expires. */
-interface AmbientCue { readonly key: string; readonly title: string; readonly pages: readonly string[]; readonly at: number; page: number; until: number;
-  /** Minimum time on the last page (default CUE_LAST_PAGE_MS). */ readonly minMs?: number }
+/** A cue that pops up on the blank ambient display: its pages (content only), the page shown and when it turns / expires. */
+interface AmbientCue { readonly key: string; readonly pages: readonly string[]; readonly at: number; page: number; until: number;
+  /** Minimum time on the last page (default CUE_LAST_PAGE_MS). */ readonly minMs?: number;
+  /** A line to say (suggestion kind "say"): a tap marks it said. */ readonly say?: boolean }
+/** What is popping up on the hidden display: wrapped lines, whether they are centred, and what the last line adds. */
+interface AmbientPop { readonly lines: readonly string[]; readonly centred: boolean; readonly position?: string; readonly hint?: string }
 /** Candidate mode: the wearer is the candidate, so an answer to the interviewer's question is a reply to say. */
 const candidateMode = (mode: string | undefined) => modeProfile(mode).id === "interviewee";
 /** Candidate mode suggestion kinds (SDK: optional `kind`, absent = a question for the wearer to ask). */
 type KindedSuggestion = CopilotSuggestion & { readonly kind?: string };
-const suggestionKindLabels = (conversationSdk as unknown as { SUGGESTION_KIND_LABELS?: Readonly<Record<string, string>> }).SUGGESTION_KIND_LABELS;
 const theyMayAsk = (suggestion: KindedSuggestion) => suggestion.kind === "they-ask";
-const THEY_MAY_ASK_LABEL = (suggestionKindLabels?.["they-ask"] ?? "They may ask").toUpperCase();
-/** The SDK prefixes `why` with the kind in Candidate mode; the title already says it. */
-const suggestionWhy = (suggestion: KindedSuggestion) => oneLine(suggestion.why ?? "").replace(/^(they may ask|ask them)\s*[:\-–—]\s*/iu, "");
+/** v0.16: a line to read aloud. A tap marks it said; it is never sent to Helix as a question. */
+const sayLine = (suggestion: KindedSuggestion) => suggestion.kind === "say";
 const questionKey = (text: string) => oneLine(text).toLowerCase();
 /** "4m ago" / "1h05m ago" for a finished answer recalled later; "" under a minute. */
 function ageText(ms: number): string {
@@ -650,7 +769,7 @@ interface AnswerInfo { readonly kind: AnswerKind; readonly question?: string; re
 
 export class GlassesHud implements GlassesSurface {
   private readonly debounce: number;
-  private readonly intervals: Record<PanelKey, number>;
+  private readonly intervals: Record<ContainerKey, number>;
   private readonly now: () => number;
   private glasses: GlassesConversationState = { status: "starting" };
   private snapshot?: PresentationSnapshot;
@@ -701,9 +820,10 @@ export class GlassesHud implements GlassesSurface {
    * not-connected page and a connect/disconnect swaps pages with rebuildPageContainer.
    */
   private pageSplash = false;
-  private readonly sent = new Map<PanelKey, string>();
-  private readonly sentAt = new Map<PanelKey, number>();
-  private readonly dirtySince = new Map<PanelKey, number>();
+  /** Text last accepted by each container of the page on the glasses (only containers of that page are in it). */
+  private readonly sent = new Map<ContainerKey, string>();
+  private readonly sentAt = new Map<ContainerKey, number>();
+  private readonly dirtySince = new Map<ContainerKey, number>();
   /** After a rejected write the link is likely congested: pause all writes. */
   private blockedUntil = 0;
   // v0.15: a write the glasses never answer is given up after a deadline (see withDeadline), so the
@@ -716,8 +836,8 @@ export class GlassesHud implements GlassesSurface {
   // A text write that passed its deadline may still be answered (a link that is steadily slower than the
   // deadline). Until TEXT_LATE_ANSWER_MS after its start the same text is not sent again, and a late
   // "accepted" counts as sent. `writeSeq` orders the writes; `sentSeq` is the newest one each container shows.
-  private readonly awaited = new Map<PanelKey, { content: string; seq: number; until: number }>();
-  private readonly sentSeq = new Map<PanelKey, number>();
+  private readonly awaited = new Map<ContainerKey, { content: string; seq: number; until: number }>();
+  private readonly sentSeq = new Map<ContainerKey, number>();
   private writeSeq = 0;
   /** Unanswered writes whose outcome is still unknown; at 0 no re-push is owed. */
   private unknownWrites = 0;
@@ -756,8 +876,26 @@ export class GlassesHud implements GlassesSurface {
   private readonly idleMs: number;
   /** The woken HUD stays until this time (0 = not woken). State follows the clock: timers only call refresh(). */
   private awakeUntil = 0;
-  /** Whether the HUD page on the glasses is the blank ambient page (no frame, no images). */
+  /** Whether the HUD page on the glasses is the blank ambient page (one text container, no frame, no images). */
   private pageAmbient = false;
+  /** Whether `frameValue` was composed for the hidden display. */
+  private frameAmbient = false;
+  /** Geometry the pager's answers are paged for; follows the display (see syncLayout). */
+  private layoutMode: LayoutMode = "awake";
+  /** Session start: the active mode shows for MODE_NOTICE_MS. */
+  private modeNoticeAt?: number;
+  /** The session went to "connecting" straight from running (a transport reconnect): no mode notice when it is back. */
+  private reconnecting = false;
+  /**
+   * The hidden-display page is wanted but the glasses rejected it, or writes are backing off. Until it is
+   * accepted, pop-ups are drawn in the BODY box of the page that is still up (the "small" layout), so the
+   * wearer is never left with a blank display. Set and cleared in holdAmbient().
+   */
+  private ambientHeld = false;
+  /** True only while rebuild() composes the ambient page itself, which is always the full canvas. */
+  private buildingAmbient = false;
+  /** Lines to say (normalized text) the wearer tapped: said, no longer offered on the glasses. */
+  private readonly saidLines = new Set<string>();
   private cue?: AmbientCue;
   private cueQueue: AmbientCue[] = [];
   private statusCueAt?: number;
@@ -772,7 +910,7 @@ export class GlassesHud implements GlassesSurface {
     const debounce = this.debounce = Math.max(120, options.debounceMs ?? 120);
     this.imagesDisabled = options.images === false;
     this.writeGap = Math.max(0, options.writeGapMs ?? WRITE_GAP_MS);
-    this.intervals = { header: debounce, status: debounce, body: debounce, mode: debounce, views: debounce, caption: Math.max(debounce, options.captionIntervalMs ?? 1000) };
+    this.intervals = { header: debounce, status: debounce, body: debounce, mode: debounce, views: debounce, ambient: debounce, caption: Math.max(debounce, options.captionIntervalMs ?? 1000) };
     this.now = options.now ?? (() => Date.now());
     this.displayMode = options.display ?? DEFAULT_GLASSES_DISPLAY;
     this.idleMs = Math.max(1000, options.ambientIdleMs ?? AMBIENT_IDLE_MS);
@@ -852,8 +990,7 @@ export class GlassesHud implements GlassesSurface {
     this.page = "hud";
     this.pageSplash = splash;
     this.pageAmbient = ambient;
-    const at = this.now();
-    for (const key of PANEL_ORDER) { this.sent.set(key, panelText(frame, key)); this.sentAt.set(key, at); }
+    this.markPageSent(frame);
     this.imagesSent.clear(); // a new page has empty image containers
     this.startTicker();
     this.refresh();
@@ -1013,10 +1150,20 @@ export class GlassesHud implements GlassesSurface {
     const glasses = this.glasses;
     const status = glasses.status;
     const now = this.now();
+    this.syncLayout();
     if (status !== this.previousStatus) {
-      if ((status === "connecting" || status === "authorizing") && !["connecting", "authorizing"].includes(this.previousStatus)) this.resetSession();
+      const linking = status === "connecting" || status === "authorizing";
+      if (linking && !["connecting", "authorizing"].includes(this.previousStatus)) {
+        // Connecting straight from a running session is the link coming back, not a new session.
+        this.reconnecting = ACTIVE.includes(this.previousStatus);
+        this.resetSession();
+      } else if (!linking && !ACTIVE.includes(status)) this.reconnecting = false;
+      const started = ACTIVE.includes(status) && !ACTIVE.includes(this.previousStatus);
       this.previousStatus = status;
       if (ACTIVE.includes(status)) this.statusCueAt = now;
+      // A mode left on from an earlier session is easy to miss: name it when the session starts (once; not on a reconnect).
+      if (started && !this.reconnecting) this.modeNoticeAt = now;
+      if (started) this.reconnecting = false;
     }
     if (ACTIVE.includes(status) && this.sessionStart === undefined) this.sessionStart = now;
     if (glasses.interaction !== this.interaction?.text) this.interaction = glasses.interaction ? { text: glasses.interaction, at: now } : undefined;
@@ -1064,7 +1211,7 @@ export class GlassesHud implements GlassesSurface {
         this.answerInfo.set(key, info);
         while (this.answerInfo.size > 12) this.answerInfo.delete(this.answerInfo.keys().next().value!);
       }
-      this.updatePager({ ...answer, layout: info.kind === "answer" ? ANSWER_LAYOUT : THEY_ASKED_LAYOUT }, glasses.answerResetRevision);
+      this.updatePager({ ...answer, layout: ANSWER_LAYOUTS[this.layoutMode][info.kind === "answer" ? 0 : 1] }, glasses.answerResetRevision);
     } else this.updatePager(undefined, glasses.answerResetRevision);
     this.followAnswer();
   }
@@ -1144,6 +1291,7 @@ export class GlassesHud implements GlassesSurface {
     this.counted.clear(); this.summarySig = "";
     this.answerInfo.clear(); this.answerSeenAt.clear(); this.notice = undefined;
     this.suggestionsCued.clear(); this.suggestionCueAt = -SUGGESTION_CUE_GAP_MS; this.suggestionDue = 0;
+    this.saidLines.clear(); this.modeNoticeAt = undefined;
     for (const key of RAIL_ROWS) this.unseen[key] = 0;
     this.awakeUntil = 0; this.cue = undefined; this.cueQueue = [];
     if (this.menu) this.closeMenu();
@@ -1158,6 +1306,45 @@ export class GlassesHud implements GlassesSurface {
   /** True while the ambient display replaces the HUD: a session is running, the HUD is not woken, no menu. */
   private ambientActive(): boolean {
     return this.ambientSession() && !this.menu && this.now() >= this.awakeUntil;
+  }
+
+  /** The hidden display has its own full-canvas page; a host that cannot swap pages shows the pop-up in the BODY box. */
+  private get fullCanvas(): boolean {
+    return typeof this.bridge.rebuildPageContainer === "function" && (!this.ambientHeld || this.buildingAmbient);
+  }
+  /**
+   * Follows whether the swap to the hidden-display page is held back. It is, once the page is wanted, is
+   * not on the glasses and cannot go out now (the glasses rejected it, or writes are backing off). It stays
+   * so until the page is accepted or no longer wanted: the pop-up layout then changes once each way, not at
+   * every retry (a layout change starts the reading time of the page on screen again).
+   */
+  private holdAmbient(): void {
+    const wanted = this.initialized && typeof this.bridge.rebuildPageContainer === "function" && this.ambientActive()
+      && !(this.page === "hud" && this.pageAmbient);
+    if (!wanted) this.ambientHeld = false;
+    else if (!this.ambientHeld) {
+      const now = this.now();
+      if (now < this.blockedUntil || now < this.timeoutUntil) this.ambientHeld = true;
+    }
+  }
+  /** Line width and line count of the container a pop-up on the hidden display is drawn in. */
+  private ambientBox(): { readonly width: number; readonly lines: number } {
+    return this.fullCanvas ? { width: AMBIENT_LINE_WIDTH, lines: AMBIENT_LINES } : { width: HUD_LINE_WIDTH.body, lines: BODY_LINES };
+  }
+  /**
+   * Answers are paged for the display they are read on. When it changes (hide, wake, session start) the
+   * answer on screen and the waiting ones are paged again for the new geometry; the page with the text
+   * being read stays on screen. Runs before every compose; a no-op unless the display changed.
+   */
+  private syncLayout(): void {
+    this.holdAmbient();
+    const mode: LayoutMode = !this.ambientActive() ? "awake" : this.fullCanvas ? "full" : "small";
+    if (mode === this.layoutMode) return;
+    this.layoutMode = mode;
+    if (this.pagerInput?.layout) this.pagerInput = { ...this.pagerInput, layout: layoutIn(this.pagerInput.layout, mode) };
+    const ingesting = this.ingesting;
+    this.ingesting = true; // the pager reports the new pages; the caller composes right after
+    try { this.pager.relayout(layout => layoutIn(layout, mode)); } finally { this.ingesting = ingesting; }
   }
 
   /** Setup → Answer length. Applies to cues that arrive from now on (answers always page in full). */
@@ -1191,47 +1378,52 @@ export class GlassesHud implements GlassesSurface {
     return HANDLED;
   }
 
-  /** A new or changed LIVE item becomes a cue that pops up on the blank display. */
+  /** A new or changed LIVE item becomes a cue that pops up on the blank display: its content, with no title. */
   private offerCue(item: HudItem, now: number): void {
     if (!this.ambientSession() || this.awakeUntil > now) return;
-    const title = CUE_TITLE[item.kind];
-    // Lookups pop up when their answer arrived, not while pending or after a failure.
-    if (!title || (item.kind === "ask" && /^(pending|failed)\|/u.test(item.sig))) return;
+    if (!item.ambient) return;
+    const box = this.ambientBox(), room = box.lines - 1; // the last line is kept for the page marker
     // Verdict pop-ups end with the dated source line (news search), so the wearer sees how fresh the evidence is.
-    const lines = wrapText(clean(`${item.check ?? item.live}${item.source ? `\n${item.source}` : ""}`), HUD_LINE_WIDTH.body);
+    const lines = wrapText(clean(`${item.ambient}${item.source ? `\n${item.source}` : ""}`), box.width);
     const pages: string[] = [];
     // Setup → Answer length "Detailed" writes longer lookups and verdicts: allow them more pages before the "…".
     const CUE_PAGES = this.cuePages;
-    for (let index = 0; index < lines.length && pages.length < CUE_PAGES; index += BODY_LINES) {
-      const page = lines.slice(index, index + BODY_LINES);
+    let index = 0;
+    while (index < lines.length && pages.length < CUE_PAGES) {
+      // A page closes at `room` lines or at its byte budget, whichever comes first (scripts with multi-byte
+      // clusters fill the bytes before the lines); the rest carries over to the next page.
+      const page: string[] = [];
+      let bytes = 0;
+      while (index < lines.length && page.length < room) {
+        const size = utf8.encode(lines[index]!).length + 1;
+        if (page.length && bytes + size > CUE_PAGE_BYTES) break;
+        page.push(lines[index++]!);
+        bytes += size;
+      }
       // The last allowed page ends with "…" when text is left over (all of it is in the woken HUD and on the phone).
-      const rest = lines[index + BODY_LINES];
-      if (pages.length + 1 === CUE_PAGES && rest !== undefined) page[page.length - 1] = ellipsize(`${page[page.length - 1]!} ${rest}`, HUD_LINE_WIDTH.body);
-      pages.push(page.join("\n"));
+      const rest = lines[index];
+      if (pages.length + 1 === CUE_PAGES && rest !== undefined) page[page.length - 1] = ellipsize(`${page[page.length - 1]!} ${rest}`, box.width);
+      if (page.some(line => line.trim())) pages.push(page.join("\n"));
     }
     if (!pages.length) return;
     if (this.cue?.key === item.key) this.cue = undefined; // the item changed while on screen: show the new text
-    this.cueQueue = [...this.cueQueue.filter(cue => cue.key !== item.key), { key: item.key, title, pages, at: now, page: 0, until: 0 }].slice(-CUE_QUEUE);
+    this.cueQueue = [...this.cueQueue.filter(cue => cue.key !== item.key), { key: item.key, pages, at: now, page: 0, until: 0 }].slice(-CUE_QUEUE);
   }
 
   /** Reading time of the cue's current page; the last page stays at least CUE_LAST_PAGE_MS. */
   private cueReadMs(cue: AmbientCue): number {
-    const ms = pageReadingMs(graphemes(cue.pages[cue.page] ?? "").length);
+    // A cue page can fill the whole hidden display, so it gets that page's ceiling (a BODY-box page never reaches it).
+    const ms = pageReadingMs(graphemes(cue.pages[cue.page] ?? "").length, AMBIENT_READ_MS);
     return cue.page + 1 < cue.pages.length ? ms : Math.max(cue.minMs ?? CUE_LAST_PAGE_MS, ms);
   }
 
-  /** Cue title of a suggested question: the mode's label, or "THEY MAY ASK" for the other side's likely next question. */
-  private suggestionTitle(suggestion: KindedSuggestion): string {
-    return theyMayAsk(suggestion) ? THEY_MAY_ASK_LABEL : this.askLabel();
-  }
-
   /**
-   * The top suggested question that was not said aloud yet pops up once, as one page that reads in a
-   * glance: the question first, the reason only when all of it fits under it. It waits in the cue
-   * queue like any cue (never over an answer, dropped when stale) and leaves when the question is asked.
+   * The top suggestion that was not said aloud yet pops up once, as one page that reads in a glance:
+   * the bare sentence, with no heading and no reason (v0.16). It waits in the cue queue like any cue
+   * (never over an answer, dropped when stale) and leaves when the line is said.
    */
   private offerSuggestion(now: number): void {
-    const open = (this.snapshot?.suggestions ?? []).filter(item => !item.askedAt && oneLine(item.question)) as KindedSuggestion[];
+    const open = (this.snapshot?.suggestions ?? []).filter(item => !item.askedAt && oneLine(item.question) && !this.saidLines.has(questionKey(item.question))) as KindedSuggestion[];
     const live = new Set(open.map(item => `s:${questionKey(item.question)}`));
     const gone = (cue: AmbientCue) => cue.key.startsWith("s:") && !live.has(cue.key);
     if (this.cue && gone(this.cue)) this.cue = undefined;
@@ -1243,16 +1435,14 @@ export class GlassesHud implements GlassesSurface {
     if (this.suggestionsCued.has(text) || this.cue?.key === key || this.cueQueue.some(cue => cue.key === key)) return;
     const due = this.suggestionCueAt + SUGGESTION_CUE_GAP_MS;
     if (now < due) { this.suggestionDue = due; return; }
-    const width = HUD_LINE_WIDTH.body;
-    const question = fitLines(clean(oneLine(top.question)), BODY_LINES, width);
-    const why = suggestionWhy(top);
-    const reason = why ? wrapText(clean(`Why: ${why}`), width) : [];
-    const lines = !reason.length || question.length + reason.length > BODY_LINES ? question
-      : question.length + 1 + reason.length <= BODY_LINES ? [...question, "", ...reason] : [...question, ...reason];
+    const box = this.ambientBox();
+    // Candidate mode: a question the other side may ask is not a line to say. With no title on the hidden
+    // display, the sentence itself says so ("They may ask: …"), like "Correction: …".
+    const lines = fitLines(clean(`${theyMayAsk(top) ? "They may ask: " : ""}${oneLine(top.question)}`), box.lines - 1, box.width);
     this.suggestionCueAt = now;
     // One suggestion at a time: a newer top one replaces an older one still waiting.
     this.cueQueue = [...this.cueQueue.filter(cue => !cue.key.startsWith("s:")),
-      { key, title: this.suggestionTitle(top), pages: [lines.join("\n")], at: now, page: 0, until: 0, minMs: SUGGESTION_CUE_MS }].slice(-CUE_QUEUE);
+      { key, pages: [lines.join("\n")], at: now, page: 0, until: 0, minMs: SUGGESTION_CUE_MS, ...(sayLine(top) ? { say: true } : {}) }].slice(-CUE_QUEUE);
   }
 
   /**
@@ -1296,12 +1486,15 @@ export class GlassesHud implements GlassesSurface {
   private scheduleAmbient(): void {
     if (this.ambientTimer) clearTimeout(this.ambientTimer);
     this.ambientTimer = undefined;
-    if (this.displayMode !== "ambient" || this.disposed) return;
+    if (this.disposed) return;
     const now = this.now();
-    const deadlines = [this.awakeUntil, this.cue?.until ?? 0, (this.statusCueAt ?? -STATUS_CUE_MS) + STATUS_CUE_MS,
+    // A page swap that waits for the write back-off is retried when it ends, with either display setting.
+    const swapAt = this.pageSwapDue() || this.splashSwapDue() ? Math.max(this.blockedUntil, this.timeoutUntil) : 0;
+    const deadlines = (this.displayMode !== "ambient" ? [swapAt] : [this.awakeUntil, this.cue?.until ?? 0, (this.statusCueAt ?? -STATUS_CUE_MS) + STATUS_CUE_MS,
       this.interaction ? this.interaction.at + 4001 : 0, ...this.cueQueue.map(cue => cue.at + CUE_STALE_MS),
       this.suggestionDue, this.notice ? this.notice.at + NOTICE_MS : 0,
-      this.pageSwapDue() ? this.blockedUntil : 0].filter(time => time > now);
+      this.modeNoticeAt === undefined ? 0 : this.modeNoticeAt + MODE_NOTICE_MS,
+      swapAt]).filter(time => time > now);
     if (!deadlines.length) return;
     this.ambientTimer = setTimeout(() => {
       this.ambientTimer = undefined;
@@ -1313,6 +1506,12 @@ export class GlassesHud implements GlassesSurface {
   /** The glasses show the wrong one of the HUD page / blank ambient page (and the bridge can swap pages). */
   private pageSwapDue(): boolean {
     return this.initialized && this.page === "hud" && typeof this.bridge.rebuildPageContainer === "function" && this.ambientActive() !== this.pageAmbient;
+  }
+
+  /** The glasses show the page with the SPLASH container when they should not, or the other way round (connect / disconnect). */
+  private splashSwapDue(): boolean {
+    return this.initialized && this.page === "hud" && typeof this.bridge.rebuildPageContainer === "function" && this.imagesOn
+      && this.splashActive() !== this.pageSplash;
   }
 
   /** Gestures on the blank display: double-tap wakes the HUD; tap / swipe act on the pop-up only. */
@@ -1332,21 +1531,69 @@ export class GlassesHud implements GlassesSurface {
     if (this.glasses.manualPending) return HANDLED;
     const cue = this.cue;
     if (cue) {
+      // A tap on a line to say marks it said. It is never sent to Helix as a question.
+      if (cue.say && gesture === "click") { this.markSaid(cue.key.slice(2)); this.cue = undefined; return HANDLED; }
       const page = cue.page + (gesture === "up" ? -1 : 1);
       if (page >= cue.pages.length) this.cue = undefined;
       else if (page >= 0) { cue.page = page; cue.until = this.now() + this.cueReadMs(cue); }
       return HANDLED;
     }
-    // Nothing on screen: a tap asks about the last few sentences (the answer pops up); swipes have nothing to turn.
-    return gesture === "click" ? { type: "askLocal" } : HANDLED;
+    // Nothing but the mode notice, or nothing at all: a tap asks about the last few sentences (the answer
+    // pops up) and closes the notice; it is never dropped without a sign. Swipes have nothing to turn.
+    if (gesture !== "click") return HANDLED;
+    this.modeNoticeAt = undefined;
+    return { type: "askLocal" };
   }
 
-  /** The blank display, or the answer / cue that is popping up on it. */
+  /** The wearer tapped a line to say: it is said, and not offered again on the glasses. */
+  private markSaid(text: string): void {
+    this.saidLines.add(text);
+    this.suggestionsCued.add(text);
+    if (this.saidLines.size > 200) this.saidLines.delete(this.saidLines.values().next().value!);
+    this.lastGesture = "said";
+    const said = this.snapshot?.suggestions.find(item => questionKey(item.question) === text);
+    try { this.options.onSaid?.({ ...(said ? { id: said.id } : {}), text: said ? oneLine(said.question) : text }); } catch (error) { this.reportRenderError(error); }
+  }
+  private modeNoticeShown(): boolean {
+    return this.modeNoticeAt !== undefined && this.now() - this.modeNoticeAt < MODE_NOTICE_MS;
+  }
+
+  /** What pops up on the hidden display now, as lines wrapped for `width` and at most `room` of them. */
+  private ambientPop(width: number, room: number): AmbientPop | undefined {
+    if (this.pager.text) {
+      const total = this.pager.pageCount, index = this.pager.pageIndex, streaming = this.pager.isStreaming, waiting = this.pager.waiting;
+      const last = index + 1 >= total;
+      // A page that is still filling stays top-left: centring it would move every line at each token.
+      const complete = !streaming || !last;
+      const marker = total > 1 || waiting > 0 ? `${index + 1}/${streaming ? "…" : total}${waiting ? ` +${waiting}` : ""}` : undefined;
+      const hint = !last ? "swipe ↓ more" : streaming ? undefined : waiting ? "tap: next answer" : this.pager.isCutOff ? "cut off" : undefined;
+      return { lines: fitLines(clean(this.pager.text).trim(), room, width), centred: complete, ...(marker ? { position: marker } : {}), ...(hint ? { hint } : {}) };
+    }
+    if (this.glasses.manualPending) {
+      const speaker = this.glasses.question?.speaker;
+      const about = speaker === "Local context" ? "About the last few sentences." : speaker === "Whole conversation" ? "Using the whole conversation." : "";
+      return { lines: fitLines(`Thinking…${about ? `\n\n${about}` : ""}`, room, width), centred: true };
+    }
+    const cue = this.cue;
+    if (cue) {
+      const more = cue.page + 1 < cue.pages.length;
+      return { lines: (cue.pages[cue.page] ?? "").split("\n").slice(0, room), centred: true,
+        ...(cue.pages.length > 1 ? { position: `${cue.page + 1}/${cue.pages.length}` } : {}), ...(more ? { hint: "swipe ↓ more" } : {}) };
+    }
+    if (this.modeNoticeShown()) return { lines: fitLines(`Mode: ${modeProfile(this.glasses.mode).label}`, room, width), centred: true };
+    return undefined;
+  }
+
+  /**
+   * The blank display, or the answer / cue that is popping up on it: one block of text for the one
+   * container of the ambient page (in `body`; the other panels do not exist there and stay blank).
+   * Content only. The last line carries a problem, gesture feedback, the page marker and a hint, when
+   * there is one; the content is centred in the lines above it.
+   */
   private composeAmbient(): HudFrame {
-    const cue = this.cue, answering = this.answerBusy();
-    const pop: BodyView | undefined = answering ? this.answerView()
-      : cue ? { label: cue.title, text: cue.pages[cue.page] ?? "", ...(cue.pages.length > 1 ? { position: `${cue.page + 1}/${cue.pages.length}` } : {}),
-        status: cue.page + 1 < cue.pages.length ? "swipe ↓ more" : "tap to close" } : undefined;
+    const box = this.ambientBox();
+    const answering = this.answerBusy();
+    const pop = this.ambientPop(box.width, box.lines - 1);
     if (answering) this.unseen.answer = 0; // an answer that popped up was seen
     const parts: string[] = [];
     const interaction = this.interactionText(), status = this.glasses.status;
@@ -1355,16 +1602,13 @@ export class GlassesHud implements GlassesSurface {
     if (problem) parts.push(problem);
     if (interaction) parts.push(interaction);
     else if (this.statusCueAt !== undefined && this.now() - this.statusCueAt < STATUS_CUE_MS) parts.push(status === "listening" ? "● listening" : status === "paused" ? "○ paused" : "○ mic off");
-    if (pop?.status) parts.push(pop.status);
-    const statusLine = parts.length ? ellipsize(parts.join(" · "), HUD_LINE_WIDTH.status) : "";
-    const title = pop ? ellipsize(`${pop.label}${pop.position ? ` ${pop.position}` : ""}`, HUD_LINE_WIDTH.header) || " " : " ";
-    return {
-      header: [title, statusLine].filter(part => part.trim()).join(" · ") || " ",
-      title,
-      status: rightAlign(statusLine, HUD_LINE_WIDTH.status) || " ",
-      body: pop ? fitLines(clean(pop.text), BODY_LINES, HUD_LINE_WIDTH.body).join("\n") || " " : " ",
-      caption: " ", mode: " ", views: " ",
-    };
+    if (pop?.position) parts.push(pop.position);
+    if (pop?.hint) parts.push(pop.hint);
+    const footer = parts.length ? ellipsize(parts.join(" · "), box.width) : "";
+    const room = footer ? box.lines - 1 : box.lines;
+    const lines: string[] = !pop ? [] : pop.centred ? centreBlock(pop.lines, box.width, room) : pop.lines.slice(0, room).map(line => line.trimEnd());
+    const body = ambientContent(lines, footer ? centreLine(footer, box.width) : "", box.lines - 1);
+    return { header: " ", title: " ", status: " ", body, caption: " ", mode: " ", views: " " };
   }
 
   /** "! message" for a session-ending error, or for NOTICE_MS after a transient problem. */
@@ -1389,6 +1633,8 @@ export class GlassesHud implements GlassesSurface {
     if (view === "qa") {
       const list = this.suggestions();
       const suggestion = list[Math.min(this.cursor.qa, list.length - 1)];
+      // A line to say is for the wearer to read aloud: the tap marks it said and asks Helix nothing.
+      if (suggestion && sayLine(suggestion)) { this.markSaid(questionKey(suggestion.question)); return HANDLED; }
       return suggestion ? { type: "ask", text: suggestion.question } : { type: "askLocal" };
     }
     if (view === "claims") {
@@ -1593,7 +1839,9 @@ export class GlassesHud implements GlassesSurface {
   /* ---------------- data views ---------------- */
 
   /** Suggested questions not yet said aloud (asked ones stay on the phone, struck out, until the SDK drops them). */
-  private suggestions(): KindedSuggestion[] { return (this.snapshot?.suggestions ?? []).filter(item => !item.askedAt).slice(0, CAPS.suggestions); }
+  private suggestions(): KindedSuggestion[] {
+    return (this.snapshot?.suggestions ?? []).filter(item => !item.askedAt && !this.saidLines.has(questionKey(item.question))).slice(0, CAPS.suggestions);
+  }
   private conceptList() { return [...(this.snapshot?.concepts ?? [])].reverse().slice(0, CAPS.concepts); }
   private claimList(): CopilotClaim[] { return [...(this.snapshot?.claims ?? [])].reverse().slice(0, CAPS.claims); }
   private selectedConcept(): CopilotConcept | undefined {
@@ -1657,16 +1905,20 @@ export class GlassesHud implements GlassesSurface {
 
   private refresh(): void {
     this.stepAmbient();
+    this.syncLayout();
     this.frameValue = this.compose();
     const now = this.now();
-    for (const key of PANEL_ORDER) {
-      if (this.sent.get(key) === panelText(this.frameValue, key)) this.dirtySince.delete(key);
+    for (const key of this.pageKeys()) {
+      if (this.sent.get(key) === this.wanted(key)) this.dirtySince.delete(key);
       else if (!this.dirtySince.has(key)) this.dirtySince.set(key, now);
     }
     this.schedule();
     // Connect / disconnect: swap to the page with (or without) the opaque SPLASH container.
     // Ambient display: swap between the blank page and the HUD page (wake, idle, session start / end).
-    const swap = now >= this.timeoutUntil && ((this.imagesOn && this.splashActive() !== this.pageSplash) || (this.pageSwapDue() && now >= this.blockedUntil));
+    // A rejected swap is retried after the write back-off, never at once. While the ambient page is held
+    // back, the text of the page that is up goes out first (send() comes back here when it is done).
+    const swap = now >= this.timeoutUntil && now >= this.blockedUntil && (this.splashSwapDue() || this.pageSwapDue())
+      && !(this.ambientHeld && this.dirty().length);
     if (this.initialized && this.page === "hud" && !this.rebuilding && swap) void this.rebuild("hud", false);
     this.updateImages();
     this.publishMirror();
@@ -1674,7 +1926,8 @@ export class GlassesHud implements GlassesSurface {
   }
 
   private compose(): HudFrame {
-    if (this.ambientActive()) return this.composeAmbient();
+    this.frameAmbient = this.ambientActive();
+    if (this.frameAmbient) return this.composeAmbient();
     const status = this.glasses.status;
     const active = ACTIVE.includes(status) || status === "failed";
     // v0.11: the native MENU sits in the rail, so the view stays visible; only the text fallback uses the BODY.
@@ -1859,7 +2112,8 @@ export class GlassesHud implements GlassesSurface {
         lines.push(ellipsize(`${indent(lead)}${marker}${question}`, HUD_LINE_WIDTH.body));
       }
     });
-    return { label: this.askLabel(), position: `${selected + 1}/${suggestions.length}`, status: "say it · tap: answer", text: lines.join("\n") };
+    // A line to say has no answer to fetch: the tap only marks it said.
+    return { label: this.askLabel(), position: `${selected + 1}/${suggestions.length}`, status: sayLine(suggestions[selected]!) ? "say it" : "say it · tap: answer", text: lines.join("\n") };
   }
 
   /** Verdict lines for a verify target: pending, result (word + summary) or nothing. */
@@ -2115,13 +2369,41 @@ export class GlassesHud implements GlassesSurface {
 
   /* ---------------- transport ---------------- */
 
+  /** Text containers of the page on the glasses, in write order. Nothing else may be written: a write to a container the page does not have is never answered. */
+  private pageKeys(): readonly ContainerKey[] {
+    return this.page === "menu" ? MENU_ORDER : this.pageAmbient ? AMBIENT_ORDER : PANEL_ORDER;
+  }
+
+  /**
+   * Text `key` should show for `frame` (the frame last composed). The ambient container shows the pop-up
+   * block; while a wake swap is still due it carries the view text, so the text menu stays usable when the
+   * glasses reject the HUD page. On the HUD page a full-canvas pop-up is not drawn in the smaller BODY box:
+   * the box stays blank for the moment the swap takes. When the swap is held back (ambientHeld) the frame is
+   * composed for the BODY box instead and is drawn there.
+   */
+  private wanted(key: ContainerKey, frame: HudFrame = this.frameValue): string {
+    if (key === "ambient") return frame.body;
+    if (key === "body" && this.frameAmbient && this.fullCanvas) return " ";
+    return panelText(frame, key);
+  }
+
+  /** A page was accepted with `frame`: its containers show that text, and no other container exists. */
+  private markPageSent(frame: HudFrame): void {
+    const at = this.now();
+    this.sent.clear();
+    this.dirtySince.clear();
+    this.awaited.clear(); // a late answer to an older text write no longer counts
+    for (const key of ALL_CONTAINERS) this.sentSeq.set(key, this.writeSeq);
+    for (const key of this.pageKeys()) { this.sent.set(key, this.wanted(key, frame)); this.sentAt.set(key, at); }
+  }
+
   private hudPage(frame: HudFrame, splash = this.splashActive(), ambient = false): Partial<CreateStartUpPageContainer> {
     if (ambient) {
-      // Blank ambient page: the same text containers (BODY still the one event-capture container), no frame border, no images.
-      const panels = PANEL_ORDER.map(key => new TextContainerProperty(panelProperty(key, panelText(frame, key))));
-      return { containerTotalNum: panels.length, textObject: panels, menuObject: osMenu() };
+      // Hidden display: ONE text container over the canvas (it captures the gestures), no frame border, no images.
+      const panel = new TextContainerProperty(containerProperty(HUD_AMBIENT_PANEL, this.wanted("ambient", frame)));
+      return { containerTotalNum: 1, textObject: [panel], menuObject: osMenu() };
     }
-    const textObject = [new TextContainerProperty(frameProperty()), ...PANEL_ORDER.map(key => new TextContainerProperty(panelProperty(key, panelText(frame, key))))];
+    const textObject = [new TextContainerProperty(frameProperty()), ...PANEL_ORDER.map(key => new TextContainerProperty(panelProperty(key, this.wanted(key, frame))))];
     // Declaration order is drawing order: images after the BODY so the splash draws on top of it.
     const keys = splash ? (["mascot", "badge", "splash"] as const) : (["mascot", "badge"] as const);
     const imageObject = this.imagesOn ? keys.map(key => new ImageContainerProperty({ ...HUD_IMAGES[key] })) : [];
@@ -2134,7 +2416,7 @@ export class GlassesHud implements GlassesSurface {
     const list = HUD_MENU_LIST;
     const imageObject = this.imagesOn ? (["mascot", "badge"] as const).map(key => new ImageContainerProperty({ ...HUD_IMAGES[key] })) : [];
     const textObject = [new TextContainerProperty(frameProperty()),
-      ...(["body", "header", "status", "caption", "mode"] as const).map(key => new TextContainerProperty({ ...panelProperty(key, panelText(frame, key)), isEventCapture: 0 }))];
+      ...MENU_ORDER.map(key => new TextContainerProperty({ ...panelProperty(key, this.wanted(key, frame)), isEventCapture: 0 }))];
     return {
       containerTotalNum: textObject.length + 1 + imageObject.length,
       ...(imageObject.length ? { imageObject } : {}),
@@ -2167,7 +2449,9 @@ export class GlassesHud implements GlassesSurface {
       const splash = target === "hud" && this.splashActive();
       const ambient = target === "hud" && this.ambientActive();
       if (!force && target === this.page && (target === "menu" || (splash === this.pageSplash && ambient === this.pageAmbient))) return true;
-      this.frameValue = this.compose();
+      // The ambient page is composed for its own container, also while pop-ups are held in the BODY box.
+      this.buildingAmbient = ambient;
+      try { this.frameValue = this.compose(); } finally { this.buildingAmbient = false; }
       const frame = this.frameValue;
       let ok = false;
       const startedAt = this.now();
@@ -2193,13 +2477,7 @@ export class GlassesHud implements GlassesSurface {
       this.pageSplash = splash;
       this.pageAmbient = ambient;
       this.rebuildAt = this.now();
-      const at = this.now();
-      for (const key of PANEL_ORDER) {
-        if (key === "views" && target === "menu") continue;
-        this.sent.set(key, panelText(frame, key)); this.sentAt.set(key, at);
-        this.sentSeq.set(key, this.writeSeq); this.awaited.delete(key); // a late answer to an older text write no longer counts
-      }
-      if (target === "menu") this.sent.set("views", frame.views); // the list is in its place
+      this.markPageSent(frame);
       this.imagesSent.clear(); // rebuilt image containers start empty
       return true;
     }).finally(() => {
@@ -2220,19 +2498,19 @@ export class GlassesHud implements GlassesSurface {
   }
 
   /** Containers that exist on the current page and differ from what was sent. */
-  private dirty(): PanelKey[] {
-    return PANEL_ORDER.filter(key => !(key === "views" && this.page === "menu") && this.sent.get(key) !== panelText(this.frameValue, key));
+  private dirty(): ContainerKey[] {
+    return this.pageKeys().filter(key => this.sent.get(key) !== this.wanted(key));
   }
 
-  private dueAt(key: PanelKey): number {
+  private dueAt(key: ContainerKey): number {
     const since = this.dirtySince.get(key) ?? this.now();
     let interval = this.slowUntil > this.now() ? Math.max(this.intervals[key], key === "caption" ? SLOW_CAPTION_MS : SLOW_PANEL_MS) : this.intervals[key];
     // A streaming answer changes at every token: a few body writes per page are enough.
-    if (key === "body" && this.pager.text && this.pager.isStreaming) interval = Math.max(interval, STREAMING_BODY_MS);
+    if ((key === "body" || key === "ambient") && this.pager.text && this.pager.isStreaming) interval = Math.max(interval, STREAMING_BODY_MS);
     const due = Math.max(since + this.debounce, (this.sentAt.get(key) ?? 0) + interval, this.blockedUntil);
     // This very text is on its way in a write that passed its deadline: wait for the late answer first.
     const awaited = this.awaited.get(key);
-    return awaited && awaited.content === panelText(this.frameValue, key) ? Math.max(due, awaited.until) : due;
+    return awaited && awaited.content === this.wanted(key) ? Math.max(due, awaited.until) : due;
   }
 
   private schedule(): void {
@@ -2251,6 +2529,8 @@ export class GlassesHud implements GlassesSurface {
     const operation = this.writePanels(this.generation, force).finally(() => {
       if (this.inFlight === operation) this.inFlight = undefined;
       this.schedule();
+      // The held-back ambient page waited for this text: try the swap again now.
+      if (this.ambientHeld && !this.disposed && !this.dirty().length) { try { this.refresh(); } catch (error) { this.reportRenderError(error); } }
       if (!this.inFlight && !this.disposed) this.pumpImages();
     });
     this.inFlight = operation;
@@ -2258,19 +2538,19 @@ export class GlassesHud implements GlassesSurface {
   }
 
   private async writePanels(generation: number, force: boolean): Promise<void> {
-    for (const key of PANEL_ORDER) {
+    // Only containers of the page on the glasses. The page changes in rebuild() alone, which waits for this loop.
+    for (const key of this.pageKeys()) {
       if (!this.initialized || generation !== this.generation || this.rebuilding) return;
-      if (key === "views" && this.page === "menu") continue; // the view list is replaced by the MENU list
-      const content = panelText(this.frameValue, key);
+      const content = this.wanted(key);
       if (this.sent.get(key) === content) continue;
       if (!force && this.dueAt(key) > this.now()) continue;
-      const panel = HUD_PANELS[key];
+      const panel = containerOf(key);
       try {
         const gap = this.nextWriteAt - this.now();
         if (gap > 0) {
           await new Promise(done => setTimeout(done, gap));
           if (!this.initialized || generation !== this.generation || this.rebuilding) return;
-          if (panelText(this.frameValue, key) !== content) continue; // changed while waiting: next pass sends the newer text
+          if (this.wanted(key) !== content) continue; // changed while waiting: next pass sends the newer text
         }
         const startedAt = this.now();
         const seq = ++this.writeSeq;
@@ -2292,7 +2572,7 @@ export class GlassesHud implements GlassesSurface {
         this.sent.set(key, content);
         this.sentAt.set(key, this.now());
         this.sentSeq.set(key, seq);
-        if (panelText(this.frameValue, key) === content) this.dirtySince.delete(key);
+        if (this.wanted(key) === content) this.dirtySince.delete(key);
         else this.dirtySince.set(key, this.now());
         if (this.writeAnswered()) return; // the re-push carries every container
       } catch (error) {
@@ -2313,19 +2593,19 @@ export class GlassesHud implements GlassesSurface {
    * that comes late marks the container as sent. Without this the first changed container would be sent
    * again after every back-off and the ones behind it never.
    */
-  private awaitLateAnswer(key: PanelKey, content: string, seq: number, startedAt: number, call: Promise<boolean>, generation: number): void {
+  private awaitLateAnswer(key: ContainerKey, content: string, seq: number, startedAt: number, call: Promise<boolean>, generation: number): void {
     this.awaited.set(key, { content, seq, until: startedAt + TEXT_LATE_ANSWER_MS });
     const settled = (accepted: boolean): void => {
       if (this.awaited.get(key)?.seq === seq) this.awaited.delete(key);
       if (this.disposed || generation !== this.generation) return;
-      if (!accepted || !this.initialized || seq <= (this.sentSeq.get(key) ?? 0)) { this.schedule(); return; }
+      if (!accepted || !this.initialized || seq <= (this.sentSeq.get(key) ?? 0) || !this.pageKeys().includes(key)) { this.schedule(); return; }
       const now = this.now();
       this.sent.set(key, content);
       this.sentAt.set(key, now);
       this.sentSeq.set(key, seq);
-      if (panelText(this.frameValue, key) === content) this.dirtySince.delete(key);
+      if (this.wanted(key) === content) this.dirtySince.delete(key);
       else if (!this.dirtySince.has(key)) this.dirtySince.set(key, now);
-      recordDiagnostic("bridge-timeout", `${HUD_PANELS[key].containerName} text update answered late · ${((now - startedAt) / 1000).toFixed(1)} s`);
+      recordDiagnostic("bridge-timeout", `${containerOf(key).containerName} text update answered late · ${((now - startedAt) / 1000).toFixed(1)} s`);
       // The link answers: the back-off ends, and with no write left unknown no re-push is owed.
       this.timeouts = 0;
       if (this.blockedUntil <= this.timeoutUntil) this.blockedUntil = Math.min(this.blockedUntil, now);
@@ -2458,7 +2738,10 @@ function frameProperty(): Partial<TextContainerProperty> {
 }
 
 function panelProperty(key: PanelKey, content: string): Partial<TextContainerProperty> {
-  const panel = HUD_PANELS[key];
+  return containerProperty(HUD_PANELS[key], content);
+}
+
+function containerProperty(panel: typeof HUD_AMBIENT_PANEL | (typeof HUD_PANELS)[PanelKey], content: string): Partial<TextContainerProperty> {
   return {
     containerID: panel.containerID, containerName: panel.containerName,
     xPosition: panel.xPosition, yPosition: panel.yPosition, width: panel.width, height: panel.height,

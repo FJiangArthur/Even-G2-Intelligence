@@ -34,7 +34,8 @@ class PageBridge implements GlassesRenderBridge {
       ?? page.textObject?.find(text => text.containerName === name)?.content ?? "";
   }
 }
-const PANELS = ["hud-body", "hud-header", "hud-status", "hud-caption", "hud-mode", "hud-views"];
+/** Text containers of the HUD page and (v0.16) the one container of the hidden-display page. */
+const PANELS = ["hud-ambient", "hud-body", "hud-header", "hud-status", "hud-caption", "hud-mode", "hud-views"];
 const allBlank = (bridge: PageBridge) => PANELS.every(name => bridge.shown(name).trim() === "");
 const at = "2026-11-19T13:00:00.000Z";
 function todoList(): TodoItem[] {
@@ -62,12 +63,13 @@ describe("Notes mode on the ambient glasses display", () => {
     expect(allBlank(bridge)).toBe(true);
     const rebuilds = bridge.rebuilds.length, list = todoList();
     presentation.applyNotebook(list.slice(0, 1), [], "TODO + Send the quote - Mei, Fri");
-    expect(hud.frame.title).toBe("TO-DO");
-    expect(hud.frame.body).toBe("TODO + Send the quote - Mei, Fri");
-    expect(hud.frame.status.trim()).toBe("tap to close");
+    // v0.16: the confirmation alone, centred in the one container; no title and no hint.
+    expect(hud.frame.body.split("\n").map(line => line.trim()).filter(Boolean)).toEqual(["TODO + Send the quote - Mei, Fri"]);
+    expect(hud.frame.title.trim()).toBe(""); expect(hud.frame.status.trim()).toBe("");
     expect(hud.frame.views.trim()).toBe(""); expect(hud.frame.mode.trim()).toBe(""); // only the pop-up, not the HUD
     await vi.advanceTimersByTimeAsync(400);
-    expect(bridge.shown("hud-body")).toBe("TODO + Send the quote - Mei, Fri");
+    expect(bridge.shown("hud-ambient")).toBe(hud.frame.body);
+    expect(bridge.updates.at(-1)).toMatchObject({ containerID: 2, containerName: "hud-ambient" });
     // It disappears by itself, without a gesture, and nothing re-lights the display afterwards.
     await vi.advanceTimersByTimeAsync(20_000);
     expect(allBlank(bridge)).toBe(true);
@@ -83,7 +85,7 @@ describe("Notes mode on the ambient glasses display", () => {
     expect(vi.getTimerCount()).toBe(0);
     // A second change pops up again; a tap closes it at once.
     presentation.applyNotebook(list, [], "TODO + Book the room");
-    expect(hud.frame.body).toBe("TODO + Book the room");
+    expect(hud.frame.body.trim()).toBe("TODO + Book the room");
     expect(hud.handleGesture("click")).toEqual({ type: "handled" });
     expect(hud.frame.body.trim()).toBe("");
     await vi.advanceTimersByTimeAsync(60_000);
