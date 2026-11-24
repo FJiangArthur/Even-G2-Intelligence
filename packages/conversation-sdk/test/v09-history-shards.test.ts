@@ -381,7 +381,10 @@ describe("LocalHistoryStore v2 matches the v1 store", () => {
           ...(random() < 0.2 ? { metadata: { origin: "omi-summary" } } : {}) }));
         ops.push(db => db.upsertEntries(list));
       } else if (roll < 0.95) {
-        const patch = { summary: [pick(SENTENCES)], ...(random() < 0.5 ? { people: [{ name: pick(["Elaine", "Kan"]), mentions: 2 }] } : { tags: [] }) };
+        // v0.16: the summary of an imported session is searched as a record of its own, which the v1 store never did;
+        // the stores are compared on live sessions' summaries and on imported sessions' tags.
+        const text = pick(SENTENCES), live = sessionId.startsWith("session_");
+        const patch = { ...(live ? { summary: [text] } : {}), ...(random() < 0.5 ? { people: [{ name: pick(["Elaine", "Kan"]), mentions: 2 }] } : { tags: live ? [] : [text.slice(0, 20)] }) };
         ops.push(db => db.updateSessionKnowledge(sessionId, patch));
       } else ops.push(db => db.deleteSession(sessionId));
     }

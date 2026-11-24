@@ -37,8 +37,10 @@ import {
   type OmiExportResult,
   exportToOmi,
 } from "@helix/conversation-sdk";
-import { markdownSession, omiExportSummary, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile } from "./knowledge-panel"; // phone agent
+import { markdownImportText, markdownSession, omiExportSummary, omiImportErrorText, omiImportText, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile, type MarkdownFileOutcome } from "./knowledge-panel"; // phone agent
+import { MarkdownImportPlanner, withSavedAdditions, type OmiImportProgress } from "@helix/conversation-sdk"; // v0.16 imports
 import { joinConcept } from "./history-panel";
+import { historyScopeIds, proposeHistoryCleanup, type HistoryCleanupProposal, type HistoryRemoveScope } from "@helix/conversation-sdk"; // v0.16 history clean-up
 import { firstAccessibleModel } from "@helix/conversation-sdk";
 import { DEFAULT_COPILOT_MODEL, answerProviderInfo, directEndpoint, providerModel, testProviderKey, type ProviderKeyTestResult } from "@helix/conversation-sdk";
 import { RehearsalPlayer, rehearsalScript, type RehearsalResult } from "./rehearsal";
@@ -100,7 +102,37 @@ export interface AutoImportView {
   readonly lastAttemptAt?: string; readonly lastSuccessAt?: string; readonly lastImported?: number;
   /** Why the last attempt did not import (missing key, Omi error, storage full). */
   readonly lastError?: string;
+  /** v0.16: Omi imports (automatic and by hand) keep summaries and no transcripts. Absent: off. */
+  readonly summariesOnly?: boolean;
 }
+// ---- v0.16 imports ----
+/** The Omi import card: its own progress and outcome, whatever else the status line says. */
+export interface OmiImportView {
+  readonly running: boolean;
+  /** Progress while running, then the outcome with counts and reasons. "" before the first import. */
+  readonly message: string;
+  readonly imported: number; readonly skipped: number; readonly failed: number;
+}
+/** One note to import. `text` may be a function, so a file is read only when its turn comes. */
+export interface MarkdownImportItem {
+  readonly name: string; readonly text: string | (() => Promise<string>);
+  /** Path inside the vault, or the link the note came from. */ readonly path?: string;
+  /** File.lastModified (ms): the date of a note that has none of its own. */ readonly lastModified?: number;
+  /** Pasted text: never replaces another note with the same title. */ readonly pasted?: boolean;
+}
+export interface MarkdownImportProgress { /** Notes finished so far. */ readonly done: number; readonly total: number; /** The note being read now. */ readonly name: string }
+export interface MarkdownImportResult {
+  readonly imported: number; readonly sessionIds: string[]; readonly failed: { name: string; error: string }[];
+  /** Notes left out without an error (the same note twice in one import). */
+  readonly skipped: { name: string; reason: string }[];
+  /** Imported notes that the import limits shortened, with what was cut. */
+  readonly truncated: { name: string; detail: string }[];
+  /** One outcome per note, in the order given. */
+  readonly files: MarkdownFileOutcome[];
+  /** The outcome as one line for the card. */
+  readonly message: string;
+}
+// ---- end v0.16 imports ----
 export interface PdfImportView { readonly running: boolean; readonly parser?: PdfParser; readonly files: readonly PdfFileStatus[] }
 export interface PdfImportRequest {
   readonly parser: PdfParser;
@@ -114,6 +146,7 @@ export interface HistoryState {
   readonly knowledge: KnowledgeBaseView;
   readonly autoImport: AutoImportView;
   readonly pdfImport: PdfImportView;
+  readonly omiImport: OmiImportView;
   readonly sessions: HistorySession[];
   readonly status: string;
   readonly importing: boolean;
@@ -141,6 +174,13 @@ export interface LifecycleFlag {
 export const RESUME_SAME_SESSION_MS = 30 * 60 * 1000;
 /** What History removal reports back to the panel. */
 export interface HistoryRemoval { readonly removed: number; readonly failed: number; readonly pendingInOpenAI: number; readonly message: string }
+/** v0.16: what the wearer ticked in History -> Clean up. A merge moves `fromId` (the later session) into `intoId`. */
+export interface HistoryCleanupPlan { readonly remove: readonly string[]; readonly merge: readonly { readonly fromId: string; readonly intoId: string }[] }
+export interface HistoryCleanupResult extends HistoryRemoval {
+  readonly merged: number;
+  /** Ticked removals and merges left alone because the session no longer qualifies (it gained a summary, a to-do, more speech). */
+  readonly skipped: number;
+}
 /** One model call over a saved transcript (the transport's own fetch, or the Setup key path). */
 type DigestRunner = (session: { title: string; lines: readonly { speaker: string; text: string }[] }) => Promise<SessionDigest>;
 export const RESUME_PROMPT = "Session paused while Helix was in the background · tap to resume";
@@ -242,7 +282,7 @@ export class G2ConversationController {
   ) { this.history = new LocalHistoryStore(bridge); }
 
   public historySnapshot(): HistoryState {
-    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), sessions: this.savedSessions().slice(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
+    return { knowledge: this.knowledgeBase(), autoImport: this.autoImportView(), pdfImport: this.pdfImportView(), omiImport: this.omiImportView(), sessions: this.savedSessions().slice(), status: this.settingsError ?? this.historyStatus, settingsError: this.settingsError, importing: !!this.importAbort,
       useLocalMemory: this.localMemoryEnabled, liveWebFactCheck: this.webCheckEnabled, autoExplainTerms: this.autoExplainEnabled };
   }
   /**
@@ -316,6 +356,80 @@ export class G2ConversationController {
     return left;
   }
   // ---- end v0.13 history ----
+  // ---- v0.16 history: clean-up and remove all ----
+  /** Sessions a bulk action leaves alone: the live one, ones being removed or summarised, and ones whose saved lines cannot be read. */
+  private historyBulkSkip(): Set<string> {
+    return new Set([...(this.session ? [this.session.id] : []), ...this.historyDeletions.keys(), ...this.recapJobs.keys(), ...this.history.corruptSessionIds()]);
+  }
+  /** What History -> Clean up would do (see proposeHistoryCleanup). Nothing changes until applyHistoryCleanup. */
+  public historyCleanupProposal(): HistoryCleanupProposal {
+    return proposeHistoryCleanup(this.savedSessions().map(session => ({ session, entries: this.history.getEntries(session.id) })), { skip: this.historyBulkSkip() });
+  }
+  /**
+   * Carries out the ticked part of a clean-up: merges first (oldest first, so a chain A + B + C ends
+   * up in A), then removals through removeHistorySessions. Only what is in `plan` is touched, and only
+   * what clean-up would still propose now: the preview may be minutes old, and a session that gained a
+   * summary, a to-do or more speech since is left alone and counted in `skipped`.
+   * A merge drops the two generated summaries (they no longer cover the session): the two overviews stay,
+   * joined, and with a key and summaries on, one new summary of the whole session is written.
+   * Caller shows the preview and confirms before calling this API.
+   */
+  public async applyHistoryCleanup(plan: HistoryCleanupPlan, key = ""): Promise<HistoryCleanupResult> {
+    const skip = this.historyBulkSkip(), moved = new Map<string, string>(), gone: string[] = [], survivors = new Set<string>();
+    let mergeFailed = 0, stale = 0;
+    const offered = new Set(this.historyCleanupProposal().merges.map(merge => `${merge.fromId}\n${merge.intoId}`));
+    const startOf = (id: string) => Date.parse(this.history.getSession(id)?.startedAt ?? "");
+    const pairs = [...plan.merge].sort((a, b) => startOf(a.fromId) - startOf(b.fromId));
+    for (const pair of pairs) {
+      const into = moved.get(pair.intoId) ?? pair.intoId, from = this.history.getSession(pair.fromId), target = this.history.getSession(into);
+      if (!from || !target || from.id === target.id || from.source !== "helix" || target.source !== "helix" || skip.has(from.id) || skip.has(target.id)) { mergeFailed++; continue; }
+      if (!offered.has(`${pair.fromId}\n${pair.intoId}`)) { stale++; continue; }
+      try {
+        const titled = !!target.recap || !isAutoSessionTitle(target, this.history.getEntries(into));
+        await this.history.mergeSession(from.id, into);
+        moved.set(from.id, into); gone.push(from.id); survivors.add(into); this.mergedInto.set(from.id, into); this.titles.delete(from.id); this.titles.delete(into);
+        // mergeSession drops both overviews and recaps: keep what they said (and a generated title) until a new summary is written.
+        const overview = [target.overview, from.overview].map(text => text?.trim()).filter(Boolean).join(" ");
+        const record = overview || target.recap || from.recap ? this.openHistorySession(into) : undefined;
+        if (record) await this.history.updateSessionRecap(into, { ...(overview ? { overview } : {}), recap: { origin: "fallback" as const, generatedAt: new Date().toISOString() },
+          ...(titled ? {} : { title: from.recap ? from.title : fallbackSessionRecap(record.session, record.entries).title }) }).catch(() => undefined);
+      } catch { mergeFailed++; }
+    }
+    if (gone.length) { try { await this.history.flush(); } catch { /* reported by the next save */ } }
+    // A merged-away session's file in the OpenAI knowledge base goes too; the surviving session is re-sent by the next Sync.
+    const mergedPending = gone.length ? await this.forgetOpenAIKnowledge(gone, key) : 0;
+    // One summary call per surviving session, as at a session end (same switch, same minimum of speech).
+    if (key.trim() && this.summarizeOnEnd && !this.disposed) for (const id of survivors) {
+      const record = this.openHistorySession(id);
+      if (!record || this.recapJobs.has(id) || spokenChars(record.entries) < MIN_RECAP_TRANSCRIPT_CHARS) continue;
+      const fetcher = this.keyTestFetch ?? ((url: string, init?: RequestInit) => globalThis.fetch(url, init)), model = this.digestModel();
+      const job = this.writeRecap(id, model, session => summarizeSession(fetcher, key, model, session, { onUsage: usage => this.presentation.applyUsage(usage) })).catch(() => undefined) // the joined overviews stay
+        .finally(() => { if (this.recapJobs.get(id) === job) this.recapJobs.delete(id); if (!this.disposed) this.emitHistory(); });
+      this.recapJobs.set(id, job);
+    }
+    // Removals are checked against what is true now, after the merges: a session a merge just filled stays.
+    const still = new Set(this.historyCleanupProposal().removals.map(item => item.id));
+    const wanted = [...new Set(plan.remove)].filter(id => !moved.has(id) && !skip.has(id));
+    const remove = wanted.filter(id => still.has(id) || !this.history.getSession(id));
+    stale += wanted.length - remove.length;
+    const removal: HistoryRemoval = remove.length ? await this.removeHistorySessions(remove, key) : { removed: 0, failed: 0, pendingInOpenAI: 0, message: "" };
+    const merged = gone.length, pendingInOpenAI = removal.pendingInOpenAI + mergedPending;
+    const message = [merged ? `${merged === 1 ? "1 session" : `${merged} sessions`} merged into the one before.` : "", mergeFailed ? `${mergeFailed} could not be merged.` : "",
+      removal.message || (merged || mergeFailed || stale ? "" : "Nothing was changed."),
+      stale ? `${stale} left as ${stale === 1 ? "it is: it" : "they are: they"} changed after the list was made.` : "",
+      mergedPending && !removal.pendingInOpenAI ? "The OpenAI knowledge base catches up at the next Sync (Knowledge tab)." : ""].filter(Boolean).join(" ");
+    this.setHistoryStatus(message);
+    return { removed: removal.removed, failed: removal.failed + mergeFailed, pendingInOpenAI, merged, skipped: stale, message };
+  }
+  /** Sessions History -> Remove all would remove for a scope ("all" includes PDF documents). The live session always stays. */
+  public historyScopeIds(scope: HistoryRemoveScope): string[] { return historyScopeIds(this.savedSessions(), scope, this.session ? [this.session.id] : []); }
+  /** Removes every saved session of a scope, through removeHistorySessions. Caller confirms with the count first. */
+  public removeAllHistory(scope: HistoryRemoveScope, key = ""): Promise<HistoryRemoval> {
+    const ids = this.historyScopeIds(scope);
+    if (!ids.length) return Promise.resolve({ removed: 0, failed: 0, pendingInOpenAI: 0, message: "Nothing to remove." });
+    return this.removeHistorySessions(ids, key);
+  }
+  // ---- end v0.16 history ----
   /** Caller confirms user-triggered deletion before calling this API. */
   public async deleteHistorySession(id: string): Promise<void> {
     const pending = this.historyDeletions.get(id);
@@ -345,28 +459,51 @@ export class G2ConversationController {
     if (this.importAbort) throw new Error("An Omi import is already running.");
     const abort = new AbortController(); this.importAbort = abort;
     this.bulkHistoryWrites++; this.syncHistoryWriteDelay(); // Sequential awaited writes: no coalescing window.
-    this.setHistoryStatus("Importing Omi conversations…");
+    // v0.16: the card has its own line (omiImport), so an error that names neither Omi nor conversations still shows there.
+    let latest: OmiImportProgress | undefined;
+    const report = (message: string, running: boolean) => {
+      this.omiImport = { running, message, imported: latest?.imported ?? 0, skipped: latest?.skipped ?? 0, failed: latest?.failed ?? 0 };
+      this.setHistoryStatus(message);
+    };
+    report("Importing Omi conversations…", true);
     const archives = this.archiveQueue;
     const completion = (async () => {
       try {
         await archives;
         // v0.13 skipInvalid: one conversation Helix cannot read is counted and skipped instead of failing every import.
-        const result = await importOmiConversations({ skipInvalid: true, ...request, store: this.history, signal: abort.signal,
-          onProgress: progress => this.setHistoryStatus(`Imported ${progress.imported} conversations · ${progress.pages} pages`) });
-        this.lastOmiImport = { ok: true, imported: result.imported, skipped: result.skipped ?? 0 };
-        this.setHistoryStatus(`Import complete: ${result.imported} conversations processed${result.skipped ? ` · ${result.skipped} skipped (Omi returned them in a form Helix cannot read)` : ""}. Repeated imports update existing records.`);
-      } catch (error) { this.lastOmiImport = { ok: false, message: errorMessage(error) }; this.setHistoryStatus(errorMessage(error)); }
+        const result = await importOmiConversations({ skipInvalid: true, ...(this.autoImport.summariesOnly ? { summariesOnly: true } : {}), ...request, store: this.history, signal: abort.signal,
+          onProgress: progress => { latest = progress; report(omiImportText(progress, false), true); } });
+        latest = result;
+        const message = omiImportText(result, true);
+        // A conversation that could not be saved (the import budget is full) makes the run a failure with that reason.
+        this.lastOmiImport = result.failed ? { ok: false, message } : { ok: true, imported: result.imported, skipped: result.skipped ?? 0 };
+        report(message, false);
+      } catch (error) {
+        const message = omiImportErrorText(errorMessage(error), latest);
+        this.lastOmiImport = { ok: false, message }; report(message, false);
+      }
       finally { this.importAbort = undefined; this.importCompletion = undefined; this.bulkHistoryWrites--; this.syncHistoryWriteDelay(); this.emitHistory(); }
     })();
     this.importCompletion = completion;
     await completion;
   }
   public cancelImport(): void { this.importAbort?.abort(); }
+  // ---- v0.16 imports ----
+  private omiImport: OmiImportView = { running: false, message: "", imported: 0, skipped: 0, failed: 0 };
+  public omiImportView(): OmiImportView { return this.omiImport; }
+  /** Omi imports keep summaries and no transcripts (saved with the auto-import switch; used by automatic imports too). */
+  public async setOmiSummariesOnly(enabled: boolean): Promise<void> {
+    const { summariesOnly: _old, ...kept } = this.autoImport;
+    this.autoImport = enabled ? { ...kept, summariesOnly: true } : kept;
+    this.emitHistory();
+    await this.saveAutoImport();
+  }
+  // ---- end v0.16 imports ----
 
   // ---- v0.13 Omi auto-import ----
   /** Outcome of the most recent importOmi() run (it reports through the status line and never throws). */
   private lastOmiImport?: { ok: true; imported: number; skipped: number } | { ok: false; message: string };
-  private autoImport: { enabled: boolean; lastAttemptAt?: string; lastSuccessAt?: string; lastImported?: number; lastError?: string } = { enabled: false };
+  private autoImport: { enabled: boolean; lastAttemptAt?: string; lastSuccessAt?: string; lastImported?: number; lastError?: string; summariesOnly?: boolean } = { enabled: false };
   private autoImportRunning = false;
   private autoImportKey?: () => string;
   private autoImportTimer?: ReturnType<typeof setInterval>;
@@ -683,7 +820,8 @@ export class G2ConversationController {
       const text = (value: unknown) => typeof value === "string" && value.length <= 600 ? value : undefined;
       const lastAttemptAt = text(saved.lastAttemptAt), lastSuccessAt = text(saved.lastSuccessAt), lastError = text(saved.lastError);
       this.autoImport = { enabled: saved.enabled === true, ...(lastAttemptAt ? { lastAttemptAt } : {}), ...(lastSuccessAt ? { lastSuccessAt } : {}), ...(lastError ? { lastError } : {}),
-        ...(typeof saved.lastImported === "number" && Number.isSafeInteger(saved.lastImported) ? { lastImported: saved.lastImported } : {}) };
+        ...(typeof saved.lastImported === "number" && Number.isSafeInteger(saved.lastImported) ? { lastImported: saved.lastImported } : {}),
+        ...(saved.summariesOnly === true ? { summariesOnly: true } : {}) };
     } catch { /* auto-import stays off */ }
     try { await this.history.load(); await this.tidyHistory(); this.setHistoryStatus("History is saved only on this phone."); }
     catch (error) { this.setHistoryStatus(errorMessage(error)); }
@@ -1469,30 +1607,59 @@ export class G2ConversationController {
     const sessions = this.history.listSessions().filter(session => !wanted || wanted.has(session.id));
     return sessions.length ? toVaultFiles(sessions.map(session => ({ session: this.titled(session), entries: this.history.getEntries(session.id) }))) : [];
   }
-  /** Obsidian -> Helix: parse .md notes and store them as source "obsidian" sessions. */
-  public async importMarkdownFiles(files: readonly { name: string; text: string }[]): Promise<{ imported: number; sessionIds: string[]; failed: { name: string; error: string }[] }> {
+  /**
+   * Obsidian -> Helix: parse .md notes and store them as source "obsidian" sessions.
+   * v0.16: notes are read, parsed and saved one at a time (`text` may be a function that reads the file),
+   * with progress per note. Each note replaces its earlier copy as a whole, so lines removed from the note
+   * do not stay; when it does not fit (the import budget is full) the earlier copy stays and the note is
+   * reported as failed with that reason. Two notes with one file name are both kept, and a note saved by
+   * an earlier version under its old id is replaced, not doubled (MarkdownImportPlanner).
+   */
+  public async importMarkdownFiles(files: readonly MarkdownImportItem[], options: { onProgress?: (progress: MarkdownImportProgress) => void } = {}): Promise<MarkdownImportResult> {
     if (this.disposed || this.exiting) throw new Error("Helix has exited.");
-    const parsed: { session: HistorySession; entries: HistoryEntry[] }[] = [];
-    const failed: { name: string; error: string }[] = [];
-    for (const file of files.slice(0, 200)) {
-      try { parsed.push(markdownSession(file.name, file.text)); } catch (error) { failed.push({ name: file.name, error: errorMessage(error) }); }
-    }
-    // v0.13: files past the batch limit are reported, not silently dropped.
-    for (const file of files.slice(200)) failed.push({ name: file.name, error: "Only 200 notes can be imported at once. Import this one in the next batch." });
-    const sessionIds: string[] = [];
+    const batch = files.slice(0, 200), outcomes: MarkdownFileOutcome[] = [];
+    const sessionIds: string[] = [], failed: { name: string; error: string }[] = [], skipped: { name: string; reason: string }[] = [], truncated: { name: string; detail: string }[] = [], superseded: string[] = [];
     await this.archiveQueue;
     this.bulkHistoryWrites++; this.syncHistoryWriteDelay();
+    const planner = new MarkdownImportPlanner(this.history);
     try {
-      for (const { session, entries } of parsed) {
+      for (const [index, file] of batch.entries()) {
+        try { options.onProgress?.({ done: index, total: batch.length, name: file.name }); } catch { /* progress display only */ }
         try {
-          await this.history.upsertSession({ ...session, source: "obsidian" });
-          if (entries.length) await this.history.upsertEntries(entries.map(entry => ({ ...entry, sessionId: session.id })));
+          const text = typeof file.text === "function" ? await file.text() : file.text;
+          const parsed = markdownSession(file.name, text, { ...(file.path ? { path: file.path } : {}), ...(file.lastModified ? { lastModified: file.lastModified } : {}), ...(file.pasted ? { pasted: true } : {}) });
+          const placed = planner.place(parsed, { pasted: !!file.pasted });
+          if (placed.duplicate) {
+            const reason = "The same note is in this import twice";
+            skipped.push({ name: file.name, reason }); outcomes.push({ name: file.name, state: "skipped", detail: reason });
+            continue;
+          }
+          const { session, entries } = placed.note;
+          // One all-or-nothing save: when it fails, nothing of the new version exists and the earlier copy is untouched.
+          // What was added to the saved copy on this phone (a generated summary, to-dos, notes) stays unless the note defines it.
+          const saved = this.history.getSession(session.id) ?? (placed.supersedes ? this.history.getSession(placed.supersedes) : undefined);
+          await this.history.replaceSession(withSavedAdditions({ ...session, source: "obsidian" }, saved?.source === "obsidian" ? saved : undefined), entries, placed.supersedes ? { supersedes: placed.supersedes } : {});
           sessionIds.push(session.id);
-        } catch (error) { failed.push({ name: session.title, error: errorMessage(error) }); }
+          if (placed.supersedes) superseded.push(placed.supersedes);
+          if (placed.note.truncated) truncated.push({ name: file.name, detail: placed.note.truncated });
+          outcomes.push({ name: file.name, state: "imported", ...(placed.note.truncated ? { detail: placed.note.truncated } : {}) });
+        } catch (error) {
+          const message = errorMessage(error);
+          failed.push({ name: file.name, error: message });
+          outcomes.push({ name: file.name, state: "failed", detail: message.replace(`${file.name}: `, "") });
+        }
       }
     } finally { this.bulkHistoryWrites--; this.syncHistoryWriteDelay(); }
-    this.setHistoryStatus(`Imported ${sessionIds.length} Obsidian note${sessionIds.length === 1 ? "" : "s"}${failed.length ? ` · ${failed.length} failed` : ""}.`);
-    return { imported: sessionIds.length, sessionIds, failed };
+    // v0.13: files past the batch limit are reported, not silently dropped.
+    for (const file of files.slice(200)) {
+      const error = "Only 200 notes can be imported at once. Import this one in the next batch.";
+      failed.push({ name: file.name, error }); outcomes.push({ name: file.name, state: "failed", detail: error });
+    }
+    // A note that moved to its new id leaves no copy behind in the OpenAI knowledge base: the next Sync removes the old file.
+    if (superseded.length) await this.forgetOpenAIKnowledge(superseded, "").catch(() => 0);
+    const message = markdownImportText(outcomes);
+    this.setHistoryStatus(message);
+    return { imported: sessionIds.length, sessionIds, failed, skipped, truncated, files: outcomes, message };
   }
   public omiExportSupport(): { supported: boolean; reason: string } {
     return { supported: true, reason: "" };

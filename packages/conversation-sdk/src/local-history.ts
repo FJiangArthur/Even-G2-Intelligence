@@ -1,5 +1,5 @@
 import type { KnowledgeSource } from "./copilot-types.js";
-import { CJK_CHAR, RetrievalCancelled, RetrievalIndex, bounded, normalize, retrievalClock, runNow, runSliced, terms, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
+import { CJK_CHAR, RetrievalCancelled, RetrievalIndex, bounded, knowledgeEntrySession, normalize, retrievalClock, runNow, runSliced, terms, yieldToHost, type RetrievalOptions, type RetrievalTiming } from "./history-retrieval.js";
 import { MAX_SESSION_NOTES, MAX_TODOS, cleanSessionNotes, cleanTodos, sameTodoText, type SessionNote, type TodoItem } from "./todo-list.js";
 
 /** Storage is provided by the phone host; no network or provider credentials are involved. */
@@ -105,7 +105,17 @@ interface ShardMeta { bytes: number; entries: number; chunks?: number }
 interface ChunkLayout { readonly refs: readonly (readonly HistoryEntry[])[]; readonly bytes: readonly number[] }
 /** shards: { bytes, entries[, chunks] } per session (an unreadable shard keeps its stored meta as is). */
 interface V2Index { version: 2; sessions: HistorySession[]; shards: Record<string, ShardMeta | unknown>; legacyV1?: true }
-const MAX_BYTES = 5 * 1024 * 1024;
+/**
+ * v0.16 storage budgets. The caps are our own (the Even bridge documents no size limit; it only advises
+ * splitting large content over several keys, which the shards do). Live Helix sessions keep the 5 MiB
+ * they always had. Imported sources (Omi, Obsidian notes and PDFs: every session whose source is not
+ * "helix") get a second 5 MiB of their own, so an archive saved by an earlier version always fits both
+ * budgets, and a full import budget never fails a live save. Each budget counts its sessions' shards
+ * plus their share of the index.
+ */
+export const LIVE_HISTORY_MAX_BYTES = 5 * 1024 * 1024;
+export const IMPORT_HISTORY_MAX_BYTES = 5 * 1024 * 1024;
+const MAX_BYTES = LIVE_HISTORY_MAX_BYTES;
 const MAX_WRITE_DELAY_MS = 60_000;
 /** Bridge round trips in flight at once (load, migration, multi-shard saves). */
 const IO_CONCURRENCY = 8;
@@ -124,9 +134,22 @@ const LOAD_FAILED = "Could not load local history from storage.";
 const SAVE_FAILED = "Could not save local history. Storage may be full or unavailable.";
 const TOO_LARGE = "Local history exceeds the 5 MiB storage limit.";
 const TOO_LARGE_SAVE = `${TOO_LARGE} Export or delete sessions before retrying.`;
+/** v0.16: an import did not fit the import budget. Nothing of it was saved and an earlier copy is unchanged. */
+export const IMPORT_STORAGE_FULL = "Imported knowledge is full (5 MiB for Omi, notes and PDFs). Remove imported sessions or import summaries only, then try again.";
+export function isImportStorageFull(error: unknown): boolean { return error instanceof Error && error.message === IMPORT_STORAGE_FULL; }
+/** Bytes a storage budget holds and may hold. */
+export interface StorageBudget { bytes: number; maxBytes: number }
+const importedSession = (session: HistorySession) => session.source !== "helix";
+/** A session's share of the index: its record plus its shard meta. Sessions are replaced, never edited, so the size is kept per object. */
+const indexShares = new WeakMap<HistorySession, number>();
+function indexShare(session: HistorySession): number {
+  let bytes = indexShares.get(session);
+  if (bytes === undefined) { bytes = utf8Length(JSON.stringify(session)) + utf8Length(JSON.stringify(session.id)) + 48; indexShares.set(session, bytes); }
+  return bytes;
+}
 interface Snapshot { version: 1; sessions: HistorySession[]; entries: HistoryEntry[] }
 // Only provenance belongs here. Arbitrary provider payloads, headers and credential fields do not.
-const METADATA_KEYS = new Set(["model", "provider", "endpoint", "promptVersion", "prompt_version", "latencyMs", "latency_ms", "noteId", "origin", "omiConversationId", "omiSegmentId", "speakerId", "startSeconds", "endSeconds", "language", "status", "checkedAt", "section"]);
+const METADATA_KEYS = new Set(["model", "provider", "endpoint", "promptVersion", "prompt_version", "latencyMs", "latency_ms", "noteId", "origin", "omiConversationId", "omiSegmentId", "speakerId", "startSeconds", "endSeconds", "language", "status", "checkedAt", "section", "partial"]);
 export const KNOWLEDGE_SOURCES: readonly KnowledgeSource[] = Object.freeze(["helix", "omi", "obsidian"]);
 const KNOWLEDGE_KEYS = ["summary", "keyFacts", "people", "concepts", "tags"] as const;
 const MAX_KNOWLEDGE_ITEMS = 20, MAX_KNOWLEDGE_CHARS = 500;
@@ -180,6 +203,18 @@ function cleanKnowledge(value: Record<string, unknown>): SessionKnowledge {
   return result;
 }
 const NOTEBOOK_KEYS = ["todos", "notes"] as const;
+/**
+ * v0.16: `session` (a fresh import of a note or conversation) plus what its saved copy holds and the
+ * import does not define: a generated summary, key facts, people, concepts, tags, to-dos, notes, the
+ * overview and the recap. The rule upsertSession applies, for a save through replaceSession, which
+ * writes the record exactly as given.
+ */
+export function withSavedAdditions(session: HistorySession, saved: HistorySession | undefined): HistorySession {
+  if (!saved) return session;
+  const result: HistorySession = { ...session };
+  for (const key of [...KNOWLEDGE_KEYS, ...NOTEBOOK_KEYS, ...RECAP_KEYS]) if (result[key] === undefined && saved[key] !== undefined) (result as unknown as Record<string, unknown>)[key] = saved[key];
+  return result;
+}
 /** Validated to-dos and notes present in `value` (invalid items are dropped, not fatal). */
 function cleanNotebook(value: Record<string, unknown>): SessionNotebookData {
   const result: SessionNotebookData = {};
@@ -248,7 +283,7 @@ function cleanEntry(value: unknown): HistoryEntry {
   return result;
 }
 function decode(raw: string): Snapshot {
-  if (utf8Length(raw) > MAX_BYTES) throw new Error(TOO_LARGE);
+  if (utf8Length(raw) > LIVE_HISTORY_MAX_BYTES + IMPORT_HISTORY_MAX_BYTES) throw new Error(TOO_LARGE);
   let data: unknown; try { data = JSON.parse(raw); } catch { throw invalid(); }
   if (!record(data) || data.version !== 1 || !Array.isArray(data.sessions) || !Array.isArray(data.entries)) throw invalid();
   const sessions = data.sessions.map(cleanSession), entries = data.entries.map(cleanEntry);
@@ -478,6 +513,48 @@ export class LocalHistoryStore {
     this.shardTotal += (bytes ?? 0) - (this.shardBytes.get(id) ?? 0);
     if (bytes === undefined) this.shardBytes.delete(id); else this.shardBytes.set(id, bytes);
   }
+  // ---- v0.16 storage budgets ----
+  /** Bytes of live (Helix) sessions and of imported ones: shards plus index share. */
+  private usageOf(sessions: readonly HistorySession[], bytesOf: (id: string) => number): { live: number; imports: number } {
+    let live = 0, imports = 0;
+    for (const session of sessions) { const bytes = bytesOf(session.id) + indexShare(session); if (importedSession(session)) imports += bytes; else live += bytes; }
+    return { live, imports };
+  }
+  /** Stored size of a session's entries as the chunks would be written (kept per list; lists are replaced, never edited). */
+  private readonly listSizes = new WeakMap<readonly HistoryEntry[], number>();
+  private listBytes(id: string, list: readonly HistoryEntry[] | undefined): number {
+    if (this.corrupt.has(id)) return this.shardBytes.get(id) ?? 0;
+    if (!list?.length) return 0;
+    if (list === this.state.entries.get(id) && this.shardBytes.has(id)) return this.shardBytes.get(id)!;
+    let bytes = this.listSizes.get(list);
+    if (bytes === undefined) {
+      bytes = 0;
+      for (let start = 0; start < list.length; start += this.chunkEntries) bytes += utf8Length(JSON.stringify(list.slice(start, start + this.chunkEntries)));
+      this.listSizes.set(list, bytes);
+    }
+    return bytes;
+  }
+  private importBytes(state: State): number {
+    let bytes = 0;
+    for (const session of state.sessions) if (importedSession(session)) bytes += indexShare(session) + this.listBytes(session.id, state.entries.get(session.id));
+    return bytes;
+  }
+  /**
+   * The import budget is checked here, on the one change that would exceed it, before that change joins
+   * a save: it alone is refused. Live lines saved in the same batch are not affected, and a save never
+   * fails because of imports (writeShards checks the live budget only). Removing imports always works.
+   */
+  private guardImportBudget(before: State, after: State): void {
+    if (before.sessions === after.sessions && before.entries === after.entries) return;
+    const bytes = this.importBytes(after);
+    if (bytes > IMPORT_HISTORY_MAX_BYTES && bytes > this.importBytes(before)) throw new Error(IMPORT_STORAGE_FULL);
+  }
+  /** v0.16: what each budget holds now (saved state). */
+  storageUsage(): { live: StorageBudget; imports: StorageBudget } {
+    const usage = this.usageOf(this.state.sessions, id => this.listBytes(id, this.state.entries.get(id)));
+    return { live: { bytes: usage.live, maxBytes: LIVE_HISTORY_MAX_BYTES }, imports: { bytes: usage.imports, maxBytes: IMPORT_HISTORY_MAX_BYTES } };
+  }
+  // ---- end storage budgets ----
   private async read(): Promise<void> {
     if (this.loaded) return;
     const index = await this.get(HISTORY_INDEX_KEY);
@@ -532,8 +609,8 @@ export class LocalHistoryStore {
       for (const entry of kept) owners.set(entry.id, session.id);
       if (kept.length) entries.set(session.id, kept);
     });
-    let total = utf8Length(raw); for (const size of bytes.values()) total += size;
-    if (total > MAX_BYTES) throw new Error(TOO_LARGE);
+    // v0.16: only live sessions can make a load fail. Imports over their budget still load; they only stop further imports.
+    if (this.usageOf(sessions, id => bytes.get(id) ?? 0).live > MAX_BYTES) throw new Error(TOO_LARGE);
     this.state = { sessions, entries };
     for (const [id, owner] of owners) this.owners.set(id, owner);
     for (const [id, size] of bytes) this.setBytes(id, size);
@@ -571,6 +648,7 @@ export class LocalHistoryStore {
         const draft = new Draft(open?.state.sessions ?? this.state.sessions, open?.state.entries ?? this.state.entries,
           open?.owners ?? new Map(), open?.touched ?? new Set(), this.owners, this.corrupt);
         change(draft);
+        this.guardImportBudget(open?.state ?? this.state, draft);
         const batch: Batch = open ?? { state: this.state, owners: draft.owners, touched: draft.touched, waiters: [] };
         batch.state = { sessions: draft.sessions, entries: draft.entries }; batch.owners = draft.owners; batch.touched = draft.touched;
         batch.waiters.push({ resolve, reject });
@@ -614,7 +692,8 @@ export class LocalHistoryStore {
       } catch { this.migrationRetryAt = Date.now() + MIGRATION_RETRY_MS; }
     }
     const raw = JSON.stringify({ version: 1, sessions: batch.state.sessions, entries: flatten(batch.state) });
-    if (utf8Length(raw) > MAX_BYTES) throw new Error(TOO_LARGE_SAVE);
+    // One value for both budgets; imports were already held to theirs when they were added.
+    if (utf8Length(raw) > LIVE_HISTORY_MAX_BYTES + IMPORT_HISTORY_MAX_BYTES) throw new Error(TOO_LARGE_SAVE);
     await this.put(LEGACY_HISTORY_KEY, raw);
     this.commit(batch);
   }
@@ -626,10 +705,11 @@ export class LocalHistoryStore {
     const present = new Set(next.sessions.map(s => s.id));
     const writes: { id: string; key: string; raw: string; bytes: number }[] = [], clears = new Map<string, string | undefined>();
     const written = new Map<string, ShardMeta>(), nextLayouts = new Map<string, ChunkLayout>();
-    let total = this.shardTotal;
+    /** Shard bytes after this save, for the shards it changes. */
+    const after = new Map<string, number>();
     for (const id of new Set([...changed, ...this.diverged])) {
       if (this.corrupt.has(id) && present.has(id)) continue;
-      const list = present.has(id) ? next.entries.get(id) ?? NO_ENTRIES : NO_ENTRIES, stored = this.shardBytes.get(id) ?? 0;
+      const list = present.has(id) ? next.entries.get(id) ?? NO_ENTRIES : NO_ENTRIES;
       const layout = this.diverged.has(id) ? undefined : this.layouts.get(id);
       const high = Math.max(1, this.chunkHigh.get(id) ?? 0, layout?.refs.length ?? 0, this.corrupt.has(id) ? chunkCount(this.corrupt.get(id)) : 0);
       if (list.length) {
@@ -645,9 +725,9 @@ export class LocalHistoryStore {
         }
         for (let k = refs.length; k < high; k++) clears.set(historyChunkKey(id, k), undefined); // Shrunk: cleared after the index.
         nextLayouts.set(id, { refs, bytes: sizes });
-        written.set(id, { bytes, entries: list.length, ...(refs.length > 1 ? { chunks: refs.length } : {}) }); total += bytes - stored;
+        written.set(id, { bytes, entries: list.length, ...(refs.length > 1 ? { chunks: refs.length } : {}) }); after.set(id, bytes);
       } else if (this.shardBytes.has(id) || this.diverged.has(id) || this.corrupt.has(id)) {
-        clears.set(historyShardKey(id), id); total -= stored;
+        clears.set(historyShardKey(id), id); after.set(id, 0);
         for (let k = 1; k < high; k++) clears.set(historyChunkKey(id, k), undefined);
       }
     }
@@ -667,7 +747,10 @@ export class LocalHistoryStore {
       const index: V2Index = { version: 2, sessions: next.sessions as HistorySession[], shards, ...(this.legacy !== "none" ? { legacyV1: true as const } : {}) };
       indexRaw = JSON.stringify(index); indexBytes = utf8Length(indexRaw);
     }
-    if (total + indexBytes > MAX_BYTES) throw new Error(TOO_LARGE_SAVE);
+    // v0.16: only the live budget can refuse a save, and only a save that makes live history larger.
+    // The import budget was applied to each import as it was made (guardImportBudget).
+    const live = this.usageOf(next.sessions, id => after.get(id) ?? this.shardBytes.get(id) ?? 0).live;
+    if (live > MAX_BYTES && live > this.usageOf(this.state.sessions, id => this.shardBytes.get(id) ?? 0).live) throw new Error(TOO_LARGE_SAVE);
     const results = await settleAll(writes, IO_CONCURRENCY, write => this.put(write.key, write.raw));
     // Written or not, those shards may now differ from the cache: the next save rewrites them.
     const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -891,11 +974,14 @@ export class LocalHistoryStore {
    * copy of the same session id. All or nothing: when the save fails (for example the 5 MiB cap),
    * neither the new session nor a half-written one exists and the earlier copy is untouched.
    */
-  async replaceSession(session: HistorySession, entries: HistoryEntry[]): Promise<void> {
+  async replaceSession(session: HistorySession, entries: HistoryEntry[], options: { supersedes?: string } = {}): Promise<void> {
     if (!Array.isArray(entries)) throw invalid();
     const clean = cleanSession(session), cleaned = [...new Map(entries.map(cleanEntry).map(entry => [entry.id, entry])).values()];
     if (cleaned.some(entry => entry.sessionId !== clean.id)) throw new Error("Cannot save history entries without their session.");
     return this.mutate(draft => {
+      // v0.16: an imported document saved under an earlier id is removed in the same save (never a live session).
+      const old = options.supersedes === undefined || options.supersedes === clean.id ? -1 : draft.sessions.findIndex(s => s.id === options.supersedes && importedSession(s));
+      if (old >= 0) { draft.writableSessions().splice(old, 1); draft.dropList(options.supersedes!); }
       const index = draft.sessions.findIndex(s => s.id === clean.id), sessions = draft.writableSessions();
       if (index < 0) sessions.push(clean); else sessions[index] = clean;
       draft.dropList(clean.id);
@@ -918,7 +1004,9 @@ export class LocalHistoryStore {
     const owner = this.owners.get(entryId);
     if (owner !== undefined) return this.state.entries.has(owner) ? owner : undefined;
     for (const [sessionId, entries] of this.state.entries) if (entries.some(entry => entry.id === entryId)) return sessionId;
-    return undefined;
+    // v0.16: a summary record of an imported session (history-retrieval.ts) belongs to that session.
+    const summary = knowledgeEntrySession(entryId);
+    return summary !== undefined && this.state.sessions.some(session => session.id === summary) ? summary : undefined;
   }
   getEntries(sessionId: string): HistoryEntry[] { return copy([...this.state.entries.get(sessionId) ?? NO_ENTRIES]).sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt) || a.id.localeCompare(b.id)); }
   search(query: string, limit?: number): RetrievedMemory[] { return this.rank(query, false).slice(0, bounded(limit, 50, 500)); }

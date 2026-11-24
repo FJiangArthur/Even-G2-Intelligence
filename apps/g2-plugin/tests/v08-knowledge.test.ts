@@ -114,7 +114,8 @@ describe("v0.8 knowledge transfers", () => {
     expect(session).toMatchObject({ source: "obsidian", title: "Edge logger", summary: ["Ring buffer on NVMe."], people: [{ name: "Marco" }] });
     expect(f.controller.knowledgeStats().obsidian).toMatchObject({ sessions: 1 });
     expect(f.controller.openHistorySession(session!.id)!.entries.some(entry => entry.text === "Offload at the depot." && entry.speaker === "Marco")).toBe(true);
-    expect(f.controller.historySnapshot().status).toBe("Imported 1 Obsidian note · 1 failed.");
+    // v0.16: the outcome names the counts and the main reason.
+    expect(f.controller.historySnapshot().status).toBe("Imported 1 of 2 notes · 1 failed: Markdown note is too large to import (2 MB limit).");
   });
 
   it("Helix/Obsidian -> Omi: calls the SDK exportToOmi per session, summarizes, and stops on auth errors", async () => {

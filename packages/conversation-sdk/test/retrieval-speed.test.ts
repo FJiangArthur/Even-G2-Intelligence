@@ -55,7 +55,12 @@ function oracle(snapshot: Snapshot, query: string, options: Options = {}): Retri
   const limit = bounded(options.limit, 5, 50);
   let remaining = bounded(options.maxChars, 3000, 20_000);
   const sessions = new Map(snapshot.sessions.map(s => [s.id, s]));
-  const eligible = snapshot.entries.filter(entry => entry.sessionId !== options.excludeSessionId && sessions.has(entry.sessionId) && KIND_WEIGHT[entry.kind] > 0
+  // v0.16: an imported session's summary, key facts and concepts are searched as records of that session.
+  const knowledge = snapshot.sessions.filter(session => session.source !== "helix").flatMap(session => ([["summary", "Summary"], ["keyFacts", "Key facts"], ["concepts", "Concepts"]] as const).flatMap(([key, speaker]): HistoryEntry[] => {
+    const text = (session[key] ?? []).join("\n");
+    return text ? [{ id: `${session.id}:knowledge:${key}`, sessionId: session.id, kind: "transcript", text, occurredAt: session.startedAt, speaker, metadata: { origin: "session-summary" } }] : [];
+  }));
+  const eligible = [...snapshot.entries, ...knowledge].filter(entry => entry.sessionId !== options.excludeSessionId && sessions.has(entry.sessionId) && KIND_WEIGHT[entry.kind] > 0
     && !(entry.kind === "transcript" && /^(assistant|ai|system|omi summary)$/i.test(entry.speaker?.trim() ?? ""))
     && entry.metadata?.origin !== "omi-summary" && !/^omi summary$/i.test(entry.speaker?.trim() ?? ""));
   const stats: RetrievalStats = { items: [], searchedEntries: eligible.length, matched: 0 };

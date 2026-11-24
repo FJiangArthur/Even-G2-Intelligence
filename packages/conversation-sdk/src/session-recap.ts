@@ -7,6 +7,7 @@
  * sessions that ended without a key or with a failed call, and interrupted sessions.
  */
 import type { HistoryEntry, HistorySession } from "./local-history.js";
+import type { KnowledgeSource } from "./copilot-types.js";
 
 export interface SessionRecapView {
   readonly title: string;
@@ -143,4 +144,151 @@ export function sessionRecap(session: HistorySession, entries: readonly HistoryE
 /** Total length of what was said in a session (decides whether a summary call is worth making). */
 export function spokenChars(entries: readonly HistoryEntry[]): number {
   return spoken(entries).reduce((sum, entry) => sum + entry.text.trim().length, 0);
+}
+
+/* ------------------------------------------------------------------ v0.16 history clean-up */
+
+/** A saved manual tap ("answer the last few sentences" / "the whole conversation"): a question entry with no words of the wearer's own. */
+export function contextAskScope(entry: Pick<HistoryEntry, "kind" | "speaker">): "recent" | "whole" | undefined {
+  if (entry.kind !== "question") return undefined;
+  const label = (entry.speaker ?? "").trim();
+  return /^local context$/iu.test(label) ? "recent" : /^whole conversation$/iu.test(label) ? "whole" : undefined;
+}
+
+export type CleanupReason = "little-speech" | "answers-only" | "duplicate-import";
+export interface CleanupRemoval {
+  readonly id: string; readonly reason: CleanupReason; readonly source: KnowledgeSource;
+  readonly title: string; readonly startedAt: string;
+  /** duplicate-import: the session that is kept. */
+  readonly duplicateOf?: string;
+}
+/** Two Helix sessions minutes apart: `fromId` (the later one) would be moved into `intoId`. */
+export interface CleanupMerge {
+  readonly fromId: string; readonly intoId: string; readonly fromTitle: string; readonly intoTitle: string;
+  readonly fromStartedAt: string; readonly intoStartedAt: string; readonly gapMs: number;
+}
+export interface HistoryCleanupProposal { readonly removals: CleanupRemoval[]; readonly merges: CleanupMerge[] }
+export interface CleanupRecord { readonly session: HistorySession; readonly entries: readonly HistoryEntry[] }
+export interface CleanupOptions {
+  /** Sessions that are never proposed: the live one, ones being removed, ones whose saved lines cannot be read. */
+  readonly skip?: Iterable<string>;
+  /** Longest pause between two Helix sessions that are offered as one (default CLEANUP_MERGE_GAP_MS). */
+  readonly mergeGapMs?: number;
+}
+/** A second Helix session that starts within this long of the first one ending is offered as a merge. */
+export const CLEANUP_MERGE_GAP_MS = 10 * 60_000;
+/** An Omi copy of a Helix session matches when the start times are this close (Omi may round to the second). */
+const SAME_START_MS = 1000;
+
+const flatText = (text: string) => text.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+const isDocument = (session: HistorySession) => session.id.startsWith("pdf:");
+/** True when the session carries something of its own that a clean-up must not throw away: a model recap, a chosen title, extracted knowledge, to-dos or notes. */
+function hasOwnRecap(session: HistorySession, entries: readonly HistoryEntry[]): boolean {
+  if (session.recap?.origin === "model" || session.overview?.trim()) return true;
+  if (session.summary?.length || session.keyFacts?.length || session.people?.length || session.concepts?.length || session.todos?.length || session.notes?.length) return true;
+  return !session.recap && !isAutoSessionTitle(session, entries);
+}
+/** A question the wearer typed: not a tap, and not detected from speech (its words are not in the transcript). */
+function hasTypedQuestion(entries: readonly HistoryEntry[]): boolean {
+  const said = entries.filter(entry => entry.kind === "transcript").map(entry => flatText(entry.text)).filter(Boolean);
+  return entries.some(entry => {
+    if (entry.kind !== "question" || contextAskScope(entry)) return false;
+    const asked = flatText(entry.text);
+    return !!asked && !said.some(text => text.includes(asked));
+  });
+}
+/** One Han, kana or Hangul character says about as much as three Latin letters. */
+const DENSE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
+/** spokenChars with dense scripts weighted, so a few Chinese, Japanese or Korean sentences are not "almost nothing". */
+function spokenWeight(entries: readonly HistoryEntry[]): number {
+  return spoken(entries).reduce((sum, entry) => sum + (entry.text.match(DENSE_SCRIPT)?.length ?? 0) * 2, spokenChars(entries));
+}
+/** A fact check, or an answer to a question that was spoken (not a tap): short, but something Helix was used for. */
+function hasSpokenExchange(entries: readonly HistoryEntry[]): boolean {
+  if (entries.some(entry => entry.kind === "fact-check" && entry.text.trim())) return true;
+  return entries.some(entry => entry.kind === "answer" && entry.text.trim()) && entries.some(entry => entry.kind === "question" && !contextAskScope(entry) && entry.text.trim());
+}
+/** True when every saved line of `copy` is also in `keep` (and, for a copy without lines, its summary and key facts are the same). */
+function containedIn(copy: CleanupRecord, keep: CleanupRecord): boolean {
+  const line = (entry: HistoryEntry) => `${entry.kind}|${entry.text.replace(/\s+/gu, " ").trim()}`;
+  const kept = new Set(keep.entries.map(line));
+  if (!copy.entries.every(entry => kept.has(line(entry)))) return false;
+  if (copy.entries.length) return true;
+  const knowledge = (session: HistorySession) => JSON.stringify([session.summary ?? [], session.keyFacts ?? []]);
+  return !keep.entries.length && knowledge(copy.session) === knowledge(keep.session);
+}
+function sessionEnd(session: HistorySession, entries: readonly HistoryEntry[]): number {
+  let end = Date.parse(session.endedAt ?? "");
+  for (const entry of entries) { const at = Date.parse(entry.occurredAt); if (Number.isFinite(at) && !(at <= end)) end = at; }
+  return Number.isFinite(end) ? end : Date.parse(session.updatedAt);
+}
+
+/**
+ * What History -> Clean up offers (pure; nothing is removed here). Removals, ticked by default:
+ * (a) Helix sessions with almost no speech, no fact check or answered spoken question, and no recap,
+ *     title, knowledge, to-dos or notes of their own;
+ * (b) Helix sessions that hold only answers to manual taps and no transcript;
+ * (c) duplicate imports: the same source, title and start time with no line the kept copy lacks, or an Omi conversation whose title and
+ *     start time match a Helix session (Helix sent it there).
+ * Merges, offered unticked: two Helix sessions where the second starts within `mergeGapMs` of the first ending.
+ * An imported session is never proposed under (a) or (b); PDF documents are never proposed at all.
+ */
+export function proposeHistoryCleanup(records: readonly CleanupRecord[], options: CleanupOptions = {}): HistoryCleanupProposal {
+  const skip = new Set(options.skip ?? []), gap = typeof options.mergeGapMs === "number" && options.mergeGapMs >= 0 ? options.mergeGapMs : CLEANUP_MERGE_GAP_MS;
+  const usable = records.filter(record => !skip.has(record.session.id) && !isDocument(record.session));
+  const titleOf = (record: CleanupRecord) => sessionRecap(record.session, record.entries).title;
+  const removals: CleanupRemoval[] = [], going = new Set<string>();
+  const remove = (record: CleanupRecord, reason: CleanupReason, duplicateOf?: string) => {
+    going.add(record.session.id);
+    removals.push({ id: record.session.id, reason, source: record.session.source, title: titleOf(record), startedAt: record.session.startedAt, ...(duplicateOf ? { duplicateOf } : {}) });
+  };
+  const helix = usable.filter(record => record.session.source === "helix");
+  for (const record of helix) {
+    const { session, entries } = record;
+    if (!entries.length || hasOwnRecap(session, entries) || hasTypedQuestion(entries)) continue;
+    const said = spokenChars(entries);
+    if (!said && entries.some(entry => entry.kind === "answer")) remove(record, "answers-only");
+    else if (spokenWeight(entries) < MIN_RECAP_TRANSCRIPT_CHARS && !hasSpokenExchange(entries)) remove(record, "little-speech");
+  }
+  // (c) the same import twice: the copy with the most saved lines (then the newest) is kept. A copy is
+  // proposed only when it holds nothing the kept one lacks: two notes can share a title and a day.
+  const imported = usable.filter(record => record.session.source !== "helix"), groups = new Map<string, CleanupRecord[]>();
+  for (const record of imported) {
+    const title = flatText(record.session.title), at = Date.parse(record.session.startedAt);
+    if (!title || !Number.isFinite(at)) continue;
+    const key = `${record.session.source}|${at}|${title}`, group = groups.get(key);
+    if (group) group.push(record); else groups.set(key, [record]);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const [keep, ...rest] = [...group].sort((a, b) => b.entries.length - a.entries.length || Date.parse(b.session.updatedAt) - Date.parse(a.session.updatedAt) || a.session.id.localeCompare(b.session.id));
+    for (const record of rest) if (containedIn(record, keep!)) remove(record, "duplicate-import", keep!.session.id);
+  }
+  // (c) an Omi conversation that is a Helix session sent to Omi and imported back.
+  const kept = helix.filter(record => !going.has(record.session.id)).map(record => ({ id: record.session.id, at: Date.parse(record.session.startedAt), titles: [flatText(record.session.title), flatText(titleOf(record))].filter(Boolean) }));
+  for (const record of imported) {
+    if (record.session.source !== "omi" || going.has(record.session.id)) continue;
+    const title = flatText(record.session.title), at = Date.parse(record.session.startedAt);
+    const original = title ? kept.find(item => Math.abs(item.at - at) <= SAME_START_MS && item.titles.includes(title)) : undefined;
+    if (original) remove(record, "duplicate-import", original.id);
+  }
+  // (d) merges: neighbours in time among the Helix sessions that stay.
+  const merges: CleanupMerge[] = [];
+  const line = helix.filter(record => !going.has(record.session.id) && Number.isFinite(Date.parse(record.session.startedAt)))
+    .sort((a, b) => Date.parse(a.session.startedAt) - Date.parse(b.session.startedAt) || a.session.id.localeCompare(b.session.id));
+  for (let i = 1; i < line.length; i++) {
+    const first = line[i - 1]!, second = line[i]!, pause = Date.parse(second.session.startedAt) - sessionEnd(first.session, first.entries);
+    if (!(pause >= 0 && pause <= gap)) continue;
+    merges.push({ fromId: second.session.id, intoId: first.session.id, fromTitle: titleOf(second), intoTitle: titleOf(first),
+      fromStartedAt: second.session.startedAt, intoStartedAt: first.session.startedAt, gapMs: pause });
+  }
+  return { removals, merges };
+}
+
+/** What History -> Remove all can be limited to. "all" also covers PDF documents. */
+export type HistoryRemoveScope = "helix" | "omi" | "obsidian" | "all";
+/** Ids of the saved sessions in a Remove-all scope (pure). PDFs are stored beside Obsidian notes but belong only to "all". */
+export function historyScopeIds(sessions: readonly HistorySession[], scope: HistoryRemoveScope, skip: Iterable<string> = []): string[] {
+  const out = new Set(skip);
+  return sessions.filter(session => !out.has(session.id) && (scope === "all" || (session.source === scope && !isDocument(session)))).map(session => session.id);
 }
