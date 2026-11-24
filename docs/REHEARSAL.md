@@ -238,7 +238,8 @@ What the test asserts:
 
 - With tagged roles (`self` / `other`): every line is heard with its speaker, no answer request reaches the provider, and the two guarded questions are detected but not answered. The script test also checks, from the script's own pauses, that each guarded question comes at least 60 s into the host's floor and that the on-device detector finds no question in any other line, so it is the guard that is tested and not the filter.
 - The phone gets at most three suggestions, all of kind `say`, and the Q&A tab heads them "Say next".
-- Without speaker tags (every line `unknown`) the same two questions are answered once each. The guard needs tagged roles.
+- With the wearer's three turns left out (every line tagged `other`, the wearer only listens): still no answer request. The guard does not need a turn from the wearer.
+- Without speaker tags (every line `unknown`) the same two questions are answered once each. The guard needs tagged roles, and a turn of unknown role between the host's turns starts the host's floor again.
 - The copilot request and every answer request carry the speech-recognition rule (`SPEECH_RECOGNITION_RULE`).
 - A manual tap ("last few sentences") after the talk sends the "say next" request (`lineRequest("local")`) with no answer-key instruction, and the phone feed labels the reply "Helix · say next". The same holds for a manual tap in Interviewer mode, where the wearer's own spoken question still gets its answer key.
 - No provider output, event, feed item, suggestion or glasses text of the run contains "Strong answer", "Probe:" or "Flag:".

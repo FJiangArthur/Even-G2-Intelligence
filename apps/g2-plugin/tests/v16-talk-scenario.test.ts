@@ -187,6 +187,28 @@ describe("talk-being-present with tagged roles", () => {
   });
 });
 
+describe("talk-being-present when the wearer never speaks", () => {
+  // Fix pass: the guard must not depend on a turn from the wearer. Same script, every wearer line left out.
+  it("none of the host's questions is answered, and they are still listed", async () => {
+    const current = await start({ mode: "general" });
+    const host = script.lines.filter(line => line.speaker === "other");
+    await drive((async () => {
+      for (const line of host) {
+        await current.api.say(line.text, "other", "none", line.case);
+        await new Promise(done => setTimeout(done, line.pauseMs ?? defaultPauseMs(line.text)));
+      }
+      await new Promise(done => setTimeout(done, 12_000));
+    })());
+    const report = current.api.report(), timeline = current.api.timeline();
+    expect(ofKind(timeline, "line.heard").map(record => record.data?.speaker)).toEqual(host.map(() => "other"));
+    expect(current.fake.byIntent("answer"), "no answer request reached the provider").toEqual([]);
+    expect(ofKind(timeline, "answer.completed")).toEqual([]);
+    const rows = report.rows.filter(row => row.case === "rhetorical-guarded");
+    expect(rows.map(row => [row.detected, row.timesAnswered, row.finalState])).toEqual([[true, 0, "ignored"], [true, 0, "ignored"]]);
+    expect(current.presentation.snapshot().suggestions.every(item => item.kind === "say")).toBe(true);
+  });
+});
+
 describe("talk-being-present without speaker tags", () => {
   it("still answers the questions: the monologue guard needs tagged roles", async () => {
     const current = await start({ mode: "general" });

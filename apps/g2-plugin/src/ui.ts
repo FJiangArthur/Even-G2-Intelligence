@@ -32,12 +32,11 @@ import * as glassesHud from "./glasses-hud";
 import type { G2ConversationController } from "./controller";
 import { SHORTCUT_ACTIONS, type ShortcutActionId } from "./shortcut-actions";
 import {
-  DEFAULT_CONFIG,
   DEFAULT_TRANSCRIPTION_PROVIDER,
   TRANSCRIPTION_PROVIDERS,
   isMixedSpeechLanguage,
-  pinnedSpeechLanguage,
-  speechLocale,
+  shownSpeechLanguage,
+  speechLanguageSettings,
   type PluginConfig,
   type ProviderCredentialLoadResult,
   type ProviderCredentialPersistenceResult,
@@ -712,7 +711,8 @@ export class CompanionUi {
       ...this.sessionIdentity,
       model: this.selectedAnswerModel(),
       instructions: this.textarea("instructions").value.trim(),
-      locale: speechLocale(this.input("speech-mixed").checked, this.input("locale").value),
+      // Mixed on stores "auto" and keeps the language in the (disabled) field for when it is turned off again.
+      ...speechLanguageSettings(this.input("speech-mixed").checked, this.input("locale").value),
       maxResponseSentences: Number.parseInt(this.input("sentence-limit").value, 10),
       conversationMode: this.select("conversation-mode").value as SessionFormState["conversationMode"],
       responseStrategy: this.select("response-strategy").value as SessionFormState["responseStrategy"],
@@ -2150,10 +2150,11 @@ export function withSaidLines(snapshot: PresentationSnapshot, said: ReadonlyMap<
 
 /**
  * v0.16 Setup "Speech language": the saved `locale` as the two controls. `mixed` = the "Mixed languages"
- * switch (locale "auto": speech recognition is not pinned to one language); `language` = the language field.
+ * switch (locale "auto": speech recognition is not pinned to one language); `language` = the language field,
+ * which keeps the language set before the switch was turned on.
  */
-export function speechLanguageFields(config: Pick<PluginConfig, "locale">): { readonly mixed: boolean; readonly language: string } {
-  return { mixed: isMixedSpeechLanguage(config), language: pinnedSpeechLanguage(config) ?? DEFAULT_CONFIG.locale };
+export function speechLanguageFields(config: Pick<PluginConfig, "locale" | "speechLanguage">): { readonly mixed: boolean; readonly language: string } {
+  return { mixed: isMixedSpeechLanguage(config), language: shownSpeechLanguage(config) };
 }
 
 export function retrievalNote(meta: AnswerMeta | undefined): string | undefined {

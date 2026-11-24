@@ -59,12 +59,26 @@ const ARABIC_QUESTION = /^(?:هل|ما|ماذا|من|متى|أين|لماذا|ك
 const SPANISH_QUESTION = /^¿?\s*(?:puedes|podrías|podria|podriais|qué|que\s+|cómo|como\s+|por\s+qué|cuando|cuándo|donde|dónde|quién|quien|cuál|cual|cuánto|cuanto|es\s+|son\s+)/iu;
 const JAPANESE_QUESTION = /^(?:なぜ|どう|何|いつ|どこ|誰|どれ|どの|できますか)|(?:ですか|ますか|でしょうか|できますか|なのか|だろうか)[。！!\s]*$/u;
 /**
- * v0.16 Korean without a question mark: an interrogative opening, or an ending that is only a question
- * (-습니까, -인가요, -을까요). Endings that are as often a statement (-나요 in 만나요, -가요 in 집에 가요) are left out.
+ * v0.16 Korean without a question mark: an ending that is only a question (-습니까, -인가요, -을까요), or an
+ * interrogative opening. Endings that are as often a statement (-나요 in 만나요, -가요 in 집에 가요) are left out.
+ * The interrogative syllables also begin common statements (왜냐하면 "because", 누구나 "everyone", 언제나
+ * "always", 무엇보다 "above all", 어느 정도 "to some extent", 어디든지 "anywhere"), so those forms are
+ * excluded, and an opening never makes a question of a clause with a plain statement ending (-니다, 모르겠어요).
  */
-const KOREAN_QUESTION = /^(?:왜|어떻게|어째서|무엇|무슨|뭘|누가|누구|언제|어디|어느|얼마|몇\s)|(?:[습입합됩십]니까|인가요|건가요|는가요|은가요|던가요|[을일할될]까요|[을일할될]까)[.。！!\s]*$/u;
+const KOREAN_QUESTION_ENDING = /(?:인가요|건가요|는가요|은가요|던가요|[을일할될]까요|[을일할될]까)[.。！!\s]*$/u;
+/** The formal question ending -ㅂ니까 / -습니까: 니까 after a syllable that ends in ㅂ (걸립니까, 있습니까), not the connective 하니까 "because". */
+const KOREAN_FORMAL_QUESTION = /([\uAC00-\uD7A3])니까[.。！!\s]*$/u;
+function koreanFormalQuestion(text: string): boolean {
+  const syllable = KOREAN_FORMAL_QUESTION.exec(text)?.[1];
+  return syllable !== undefined && (syllable.charCodeAt(0) - 0xAC00) % 28 === 17;
+}
+const KOREAN_QUESTION_OPENING = /^(?:왜(?!냐)|어떻게(?!든)|어째서|무엇(?!보다|이든|이나|이라도)|무슨|뭘|누가|누구(?!나|든|라도)|언제(?!나|든|라도|부턴가|인가)|어디(?!든|나|라도|선가|에나)|어느(?!\s*정도|\s*새|덧|\s*날)|얼마(?!든|\s*전|\s*후|\s*안|간)|몇\s)/u;
+const KOREAN_STATEMENT_ENDING = /(?:니다|(?:모르겠|몰라|모릅)\S*)[.。！!\s]*$/u;
+function koreanQuestion(text: string): boolean {
+  return KOREAN_QUESTION_ENDING.test(text) || koreanFormalQuestion(text) || (KOREAN_QUESTION_OPENING.test(text) && !KOREAN_STATEMENT_ENDING.test(text));
+}
 const SPACELESS_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const LEADING_FILLER =/^(?:(?:okay|ok|well|so|please|hey|um|uh|also|then)\b[,:]?\s*)+/i;
+const LEADING_FILLER = /^(?:(?:okay|ok|well|so|please|hey|um|uh|also|then)\b[,:]?\s*)+/i;
 const QUESTION_MARKS = new Set(["?", "？", "؟"]);
 const CLOSING_PUNCTUATION = new Set([
   '"', "'", "”", "’", "»", "›", ")", "]", "}", "）", "］", "｝", "】", "」", "』",
@@ -187,6 +201,11 @@ export class RecentQuestions {
  */
 const RHETORICAL_LEAD = String.raw`(?:(?:well|so|and|but|now|then|um+|uh+|hmm+|oh|okay|ok|gosh|wow|honestly|i mean)[,.\s]+)*`;
 const RHETORICAL_END = String.raw`[\s?!.…？！。]*$`;
+/**
+ * The rest of a clause after a talk opener ("You might wonder …"). It stops at a comma that begins a
+ * question of its own ("…, or do you prefer big companies?"), so a real question in the same clause is kept.
+ */
+const RHETORICAL_REST = String.raw`\b(?:(?!,\s+(?:(?:or|so|but|and|then)\s+)?${QUESTION_START}\b).)*`;
 const RHETORICAL = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
   String.raw`where (?:do|would|should|can) i (?:even |really )?(?:start|begin)`,
   String.raw`how (?:do|should|would|shall|can) i (?:even |best )?(?:put|say|phrase|describe|explain) (?:it|this|that)`,
@@ -194,15 +213,14 @@ const RHETORICAL = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
   String.raw`you know(?: what i mean)?|right|okay|ok|yeah|no|make sense|does that make sense|is that fair|you see what i mean`,
   String.raw`what do you call it|let me think|how to put (?:it|this)`,
   // v0.16 talk and podcast forms: the speaker voices a question for the audience and goes on to answer it.
-  String.raw`(?:you|some of you|people|one) (?:might|may|could|often|probably)(?: (?:well|now|often|then))? (?:ask|wonder|be asking|be wondering|be thinking)\b.*`,
-  String.raw`you(?:['’]re| are) probably (?:asking|wondering|thinking)\b.*`,
-  String.raw`have you ever (?:wondered|asked yourself|stopped to think)\b.*`,
-  String.raw`what if i told you\b.*`,
+  String.raw`(?:you|some of you|people|one) (?:might|may|could|often|probably)(?: (?:well|now|often|then))? (?:ask|wonder|be asking|be wondering|be thinking)${RHETORICAL_REST}`,
+  String.raw`you(?:['’]re| are) probably (?:asking|wondering|thinking)${RHETORICAL_REST}`,
+  String.raw`have you ever (?:wondered|asked yourself|stopped to think)${RHETORICAL_REST}`,
+  String.raw`what if i told you${RHETORICAL_REST}`,
   String.raw`(?:you )?know what|guess what|am i right|isn['’]t (?:it|that)(?: right| so)?|don['’]t you think(?: so)?`,
   String.raw`(?:do )?you (?:see|get|know) what i(?:['’]m| am) (?:saying|getting at)|see what i mean`,
   String.raw`what do i mean(?: by (?:that|this))?|what am i (?:saying|getting at|talking about)`,
-  String.raw`why (?:am i|do i) (?:telling you|saying|bringing (?:this|that) up|mention(?:ing)? (?:this|that))\b.*`,
-  String.raw`what(?:['’]s| is) (?:the|my) point(?: here)?`,
+  String.raw`why (?:am i|do i) (?:telling you|saying|bringing (?:this|that) up|mention(?:ing)? (?:this|that))${RHETORICAL_REST}`,
   // Korean tags and thinking aloud ("right?", "you know", "how shall I put it").
   String.raw`그렇죠|그쵸|그렇지(?:요)?|그렇잖아요|맞죠|맞지요|알겠죠|아시겠죠|있잖아요|뭐랄까(?:요)?|뭐라고\s*(?:해야\s*)?할까(?:요)?|어떻게\s*말해야\s*할까(?:요)?|무슨\s*말이냐면`,
   // Chinese tags and thinking aloud.
@@ -210,19 +228,39 @@ const RHETORICAL = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
 ].join("|") + `)${RHETORICAL_END}`, "iu");
 /**
  * v0.16 questions a speaker asks and then answers ("So what does that mean? It means…"). They are skipped
- * only when the same speaker goes on with a statement in the same line; said on their own they may be a
- * real question to the wearer ("What does that mean?"), so they stay questions.
+ * only when the same speaker goes on to answer in the same line (see ANSWER_OPENING); said on their own, or
+ * followed by anything else ("Why is that? Take your time."), they are real questions and stay questions.
+ * Forms about the listener ("What do you do?", "What can you do?") are deliberately not here.
  */
 const SELF_ANSWERED = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
   String.raw`what does (?:that|this|it|all of (?:that|this)) (?:even |really |actually )?mean(?: for (?:us|you|me))?`,
   String.raw`why is (?:that|this)(?: so| the case| important)?|why does (?:that|this|it) (?:matter|happen|work)|why(?: not)?`,
   String.raw`how does (?:that|this|it) (?:work|happen|help)|how (?:do|can) we (?:actually |really )?do (?:that|this|it)`,
-  String.raw`is there anything (?:we|you|i) can do(?: about (?:it|that|this))?`,
-  String.raw`what (?:can|should|do) (?:we|you|i) do(?: about (?:it|that|this))?`,
+  String.raw`is there anything (?:we|i) can do(?: about (?:it|that|this))?`,
+  String.raw`what (?:can|should|do) (?:we|i) do(?: about (?:it|that|this))?`,
   String.raw`where does (?:that|this) leave us|what happens (?:next|then)|what(?:['’]s| is) the (?:answer|solution|alternative|lesson|takeaway)`,
+  String.raw`what(?:['’]s| is) (?:the|my) point(?: here)?`,
   String.raw`왜\s*그럴까(?:요)?|왜일까(?:요)?|(?:이게\s*|그게\s*)?무슨\s*(?:뜻|의미)일까(?:요)?|어떻게\s*(?:하면|해야)\s*(?:될|할)까(?:요)?|우리가\s*할\s*수\s*있는\s*(?:게|것이)\s*(?:있을까|뭘까)(?:요)?`,
   String.raw`(?:这|那)(?:是|意味着)什么(?:意思)?呢?|为什么呢|为什么会这样呢?|我们(?:能|可以|该)(?:做(?:些)?什么|怎么办)呢?`,
 ].join("|") + `)${RHETORICAL_END}`, "iu");
+/**
+ * How a speaker opens the answer to their own question: "It means…", "Because…", "Yes, we can…", "There
+ * is.", "Mostly habit.", "The point is…". Any other follow-up ("I thought the tests passed.", "The deadline
+ * is Friday.") is not an answer, so the question before it is still put to the listener.
+ */
+const ANSWER_OPENING = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
+  String.raw`(?:it|that|this|which) (?:just |simply |really )?means\b`,
+  String.raw`(?:it|that)(?:['’]s| is) (?:because|simple|why|how)\b`,
+  String.raw`it (?:works|happens|matters|helps)\b`,
+  String.raw`because\b`,
+  String.raw`(?:yes|yeah|yep|no|nope)(?:,|\s+(?:we|you|it|that|there|not)\b)`,
+  String.raw`there(?:['’]s| is| are)\b`,
+  String.raw`(?:mostly|basically|simply|in short|in a word)\b`,
+  String.raw`the (?:short |simple |honest )?(?:answer|reason|solution|lesson|takeaway|alternative|point)(?: here)? is\b`,
+  String.raw`(?:we|you) can\b`,
+  String.raw`(?:是)?因为|意思(?:就)?是|(?:这|那)(?:就)?意味着|(?:这)?就是说|答案是|其实|有的|我们(?:能|可以)`,
+].join("|") + ")", "iu");
+const KOREAN_ANSWER = /때문|(?:뜻|의미)(?:입니다|이에요|예요|이죠)|^(?:네|예|아니요)[,\s]/u;
 export function isRhetoricalQuestion(text: string): boolean { return RHETORICAL.test(text.trim()); }
 /** True for a question that is rhetorical when its speaker continues with a statement (see extractQuestions). */
 export function isSelfAnsweredQuestion(text: string): boolean { return SELF_ANSWERED.test(text.trim()); }
@@ -243,7 +281,7 @@ function looksLikeUnpunctuatedQuestion(text: string): boolean {
     || CURIOUS_QUESTION_START.test(cleaned)
   ) return true;
   return CHINESE_QUESTION.test(cleaned)
-    || KOREAN_QUESTION.test(cleaned)
+    || koreanQuestion(cleaned)
     || ARABIC_QUESTION.test(cleaned)
     || SPANISH_QUESTION.test(cleaned)
     || JAPANESE_QUESTION.test(cleaned);
@@ -288,12 +326,20 @@ function sentenceClauses(input: string): Clause[] {
   return clauses;
 }
 
+export interface ExtractQuestionsOptions {
+  /**
+   * Keep a question even when its speaker goes on to answer it ("Why is that? Because…"). For Interviewer
+   * and Candidate modes, where every question of the other side is put to the listener.
+   */
+  readonly keepSelfAnswered?: boolean;
+}
+
 /**
  * Finds at most three speakable questions without an LLM round trip. The
  * detector deliberately favors recall for explicit questions and common
  * spoken interrogative forms, while preserving their source order.
  */
-export function extractQuestions(input: string, limit = 3): DetectedQuestion[] {
+export function extractQuestions(input: string, limit = 3, options: ExtractQuestionsOptions = {}): DetectedQuestion[] {
   if (!Number.isInteger(limit) || limit < 0) {
     throw new RangeError("limit must be a non-negative integer");
   }
@@ -308,18 +354,19 @@ export function extractQuestions(input: string, limit = 3): DetectedQuestion[] {
   const seen = new Set<string>();
   const clauses = sentenceClauses(normalizedInput);
   const isQuestion = (clause: Clause) => clause.explicitQuestion || looksLikeUnpunctuatedQuestion(clause.text.replace(LEADING_FILLER, "").trim());
-  /** The speaker goes on with a statement of some substance (not a tag, not another question). */
+  /** The speaker goes on to answer the question: a statement of some substance that opens like an answer. */
   const answeredBySpeaker = (index: number): boolean => {
     const next = clauses[index + 1];
     if (!next || isQuestion(next)) return false;
     const text = next.text.trim();
+    if (!ANSWER_OPENING.test(text) && !KOREAN_ANSWER.test(text)) return false;
     return SPACELESS_SCRIPT.test(text) ? [...text.replace(/[\p{P}\s]+/gu, "")].length >= 4 : (text.match(/[\p{L}\p{N}'’-]+/gu) ?? []).length >= 3;
   };
   for (const [index, clause] of clauses.entries()) {
     const cleaned = clause.text.replace(LEADING_FILLER, "").trim();
     if (!clause.explicitQuestion && !looksLikeUnpunctuatedQuestion(cleaned)) continue;
     if (isRhetoricalQuestion(cleaned)) continue;
-    if (isSelfAnsweredQuestion(cleaned) && answeredBySpeaker(index)) continue;
+    if (!options.keepSelfAnswered && isSelfAnsweredQuestion(cleaned) && answeredBySpeaker(index)) continue;
     // "X is hard to order and have a long lead time." is a statement: a bare
     // auxiliary after a conjunction continues the predicate, it is not a new question.
     if (!clause.explicitQuestion && clause.continuation && AUXILIARY_QUESTION_START.test(cleaned)

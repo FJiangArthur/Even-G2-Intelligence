@@ -37,7 +37,8 @@ const lastContent = (fetcher: ReturnType<typeof setup>["fetcher"]): string => {
 const backgroundOf = (content: string): string => JSON.parse(content.slice(content.indexOf("GLOBAL BACKGROUND\n") + "GLOBAL BACKGROUND\n".length, content.lastIndexOf("\nREQUEST\n")));
 const requestOf = (content: string): string => content.slice(content.lastIndexOf("\nREQUEST\n") + "\nREQUEST\n".length);
 const answered = (events: GatewayEvent[], count = 1) => vi.waitFor(() => expect(events.filter(e => e.type === "answer.completed")).toHaveLength(count));
-const OMITTED = /earlier speech .* is not included/i;
+// v0.16 fix pass: the note is worded about facts, not about what was captured (OMITTED_SPEECH_NOTE).
+const OMITTED = /If the answer depends on something not shown above, say you do not have that detail\./;
 
 describe("review of finding 23: only an explicit whole-session ask sends the whole window", () => {
   it("caps GLOBAL BACKGROUND for a typed question and says that earlier speech was left out", async () => {

@@ -63,6 +63,11 @@ export interface PluginConfig {
   readonly promptVersion: string;
   readonly instructions: string;
   readonly locale: string;
+  /**
+   * v0.16: the single speech language the user last set, kept while `locale` is "auto" (mixed languages) so
+   * turning the switch off restores it. Absent when never set; not used for recognition while mixed is on.
+   */
+  readonly speechLanguage?: string;
   readonly maxResponseSentences: number;
   readonly conversationMode: ConversationMode;
   readonly responseStrategy: ResponseStrategy;
@@ -126,15 +131,23 @@ export interface LocalConfigStore {
   setLocalStorage(key: string, value: string): Promise<boolean>;
 }
 
+/**
+ * The base prompt shipped up to v0.15. "Preserve uncertainty" made models comment on unclear speech, and
+ * "the detected question" is wrong for a line to say. Saved configs that still hold it move to the new default.
+ */
+export const LEGACY_DEFAULT_INSTRUCTIONS = "Answer the detected question directly and concisely. Preserve uncertainty and prefer useful next actions.";
+const LEGACY_PROMPT_VERSION = "1";
+
 export const DEFAULT_CONFIG: PluginConfig = Object.freeze({
   gatewayUrl: "", // Legacy field retained only for old config compatibility; never used.
   endpointId: "openai-direct",
   provider: "openai",
   model: DEFAULT_ANSWER_MODEL,
   promptId: "helix-direct",
-  promptVersion: "1",
+  // "2" (v0.16): base prompt limited to facts; speech-recognition and spoken-language rules; lines to say.
+  promptVersion: "2",
   instructions:
-    "Answer the detected question directly and concisely. Preserve uncertainty and prefer useful next actions.",
+    "Be direct and concise. Never invent facts: when a fact is not known, say so briefly. Prefer useful next actions.",
   locale: "en",
   maxResponseSentences: 3,
   conversationMode: "general",
@@ -175,6 +188,19 @@ export function isMixedSpeechLanguage(value: Pick<PluginConfig, "locale"> | stri
   const locale = typeof value === "string" ? value : value?.locale;
   return locale?.trim().toLowerCase() === SPEECH_LANGUAGE_AUTO;
 }
+/** A single speech language as typed: trimmed, at most 32 characters; undefined when blank or "auto". */
+function cleanSpeechLanguage(value: unknown): string | undefined {
+  const locale = typeof value === "string" ? value.trim().slice(0, 32) : "";
+  return locale && !isMixedSpeechLanguage(locale) ? locale : undefined;
+}
+/**
+ * What to store for the two Setup controls. Mixed on: `locale` "auto", and the language in the field is
+ * kept as `speechLanguage`, so it is not lost. Mixed off: `locale` is that language (default when blank).
+ */
+export function speechLanguageSettings(mixed: boolean, typed?: string): Pick<PluginConfig, "locale" | "speechLanguage"> {
+  const language = cleanSpeechLanguage(typed);
+  return { locale: speechLocale(mixed, typed), ...(mixed && language ? { speechLanguage: language } : {}) };
+}
 /**
  * The `locale` to store for a "mixed languages" switch: on gives "auto"; off gives `pinned` (the language
  * the user typed), or the default language when that is blank or itself "auto".
@@ -188,6 +214,10 @@ export function speechLocale(mixed: boolean, pinned?: string): string {
 export function pinnedSpeechLanguage(config: Pick<PluginConfig, "locale">): string | undefined {
   const locale = config.locale.trim();
   return locale && !isMixedSpeechLanguage(locale) ? locale : undefined;
+}
+/** The language to show in the Setup field: the pinned one, else the one kept from before mixed languages was turned on. */
+export function shownSpeechLanguage(config: Pick<PluginConfig, "locale" | "speechLanguage">): string {
+  return pinnedSpeechLanguage(config) ?? cleanSpeechLanguage(config.speechLanguage) ?? DEFAULT_CONFIG.locale;
 }
 
 /**
@@ -245,6 +275,7 @@ const PERSISTED_STRING_FIELDS = [
   "promptVersion",
   "instructions",
   "locale",
+  "speechLanguage",
   "copilotModel",
 ] as const satisfies readonly (keyof PluginConfig)[];
 
@@ -308,17 +339,25 @@ export function normalizePluginConfig(value: unknown): PluginConfig {
     ? value as Record<string, unknown>
     : {};
 
+  const promptId = cleanString(candidate.promptId, DEFAULT_CONFIG.promptId, 100);
+  const promptVersion = cleanString(candidate.promptVersion, DEFAULT_CONFIG.promptVersion, 32);
+  const instructions = cleanString(candidate.instructions, DEFAULT_CONFIG.instructions, 8_000);
+  const mixed = isMixedSpeechLanguage(typeof candidate.locale === "string" ? candidate.locale : undefined);
+  const speechLanguage = mixed ? cleanSpeechLanguage(candidate.speechLanguage) : undefined;
   return {
     gatewayUrl: cleanString(candidate.gatewayUrl, DEFAULT_CONFIG.gatewayUrl, 2_048),
     endpointId: cleanString(candidate.endpointId, DEFAULT_CONFIG.endpointId, 100),
     provider: cleanString(candidate.provider, DEFAULT_CONFIG.provider, 100),
     model: cleanString(candidate.model, DEFAULT_CONFIG.model, 100),
-    promptId: cleanString(candidate.promptId, DEFAULT_CONFIG.promptId, 100),
-    promptVersion: cleanString(candidate.promptVersion, DEFAULT_CONFIG.promptVersion, 32),
-    instructions: cleanString(candidate.instructions, DEFAULT_CONFIG.instructions, 8_000),
+    promptId,
+    // v0.16: the built-in prompt changed for everyone (mode and speech rules), so a saved built-in version
+    // "1" is recorded as the current one; a host's own prompt id or version is kept.
+    promptVersion: promptId === DEFAULT_CONFIG.promptId && promptVersion === LEGACY_PROMPT_VERSION ? DEFAULT_CONFIG.promptVersion : promptVersion,
+    // The old default base prompt is replaced; a prompt the user wrote is kept as it is.
+    instructions: instructions === LEGACY_DEFAULT_INSTRUCTIONS ? DEFAULT_CONFIG.instructions : instructions,
     // "Auto" / "AUTO" are the mixed-languages setting, stored in one spelling.
-    locale: isMixedSpeechLanguage(typeof candidate.locale === "string" ? candidate.locale : undefined)
-      ? SPEECH_LANGUAGE_AUTO : cleanString(candidate.locale, DEFAULT_CONFIG.locale, 32),
+    locale: mixed ? SPEECH_LANGUAGE_AUTO : cleanString(candidate.locale, DEFAULT_CONFIG.locale, 32),
+    ...(speechLanguage ? { speechLanguage } : {}),
     maxResponseSentences: cleanSentenceLimit(candidate.maxResponseSentences),
     // "office-discussion" was the old name of Meeting (v0.10).
     conversationMode: cleanChoice(

@@ -379,6 +379,20 @@ export class ConversationCopilot {
     }
     if (changed) this.emitSuggestions([...open, ...asked]);
   }
+  /**
+   * v0.16: the wearer marked an open suggestion as said by hand (a tap on the phone or glasses), with no
+   * speech to match. Same effect as hearing it said: it gets `askedAt`, the list is sent again, and the same
+   * sentence is not proposed again. False when there is no such open suggestion.
+   */
+  markSuggestionSaid(id: string): boolean {
+    const item = this.suggestionList.find(entry => entry.id === id);
+    if (!item || item.askedAt) return false;
+    this.askedQuestions.push(item.question);
+    if (this.askedQuestions.length > MAX_ASKED) this.askedQuestions.shift();
+    const rest = this.suggestionList.filter(entry => entry !== item);
+    this.emitSuggestions([...rest.filter(entry => !entry.askedAt), ...rest.filter(entry => entry.askedAt), { ...item, askedAt: now() }]);
+    return true;
+  }
   /** One refresh: the model's new list replaces the open suggestions; asked ones stay for exactly one refresh. */
   private refreshSuggestions(settings: CopilotSettings, proposed: unknown): void {
     const profile = modeProfile(settings.mode);

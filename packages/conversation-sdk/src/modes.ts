@@ -210,10 +210,19 @@ export const ANSWER_KEY_PREFIX = "ANSWER KEY.";
 /**
  * v0.16 request text of a manual "last few sentences" / "whole conversation" ask: the reply is the line
  * itself, ready to read aloud. `omitted` = earlier speech of the session is not in the request.
+ * `correction` false leaves the "Correction:" sentence out (see lineCorrection).
  */
-export function lineRequest(scope: "local" | "global", omitted = false): string {
+export function lineRequest(scope: "local" | "global", omitted = false, correction = true): string {
   const source = scope === "local" ? "the recent focus, using relevant earlier background" : omitted ? "the captured session" : "the whole captured session";
-  return `Give the wearer the single best thing to say next, word for word, in the language being spoken, as one or two sentences they can read aloud. Base it on ${source}. If the other person just asked something, the line answers it; otherwise it adds a substantive point, comparison, example or sharp question on the topic. Write only the line: no preamble, no label, no quotation marks and no labelled format. If something just said was factually wrong, add one sentence starting "Correction:".`;
+  return `Give the wearer the single best thing to say next, word for word, in the language being spoken, as one or two sentences they can read aloud. Base it on ${source}. If the other person just asked something, the line answers it; otherwise it adds a substantive point, comparison, example or sharp question on the topic. Write only the line: no preamble, no label, no quotation marks and no labelled format.${correction ? ' If something just said was factually wrong, add one sentence starting "Correction:".' : ""}`;
+}
+/**
+ * Whether a line to say may carry a "Correction:" sentence in this mode. Modes whose presets turn both
+ * fact lanes off (conflicts and claims: Partner, Social, Learning, Quiet) do not fact-check the other person.
+ */
+export function lineCorrection(mode: string | undefined): boolean {
+  const presets = modeProfile(mode).presets;
+  return presets.conflicts || presets.claims;
 }
 
 const MODE_INSTRUCTIONS: Readonly<Record<ConversationMode, string>> = Object.freeze(Object.fromEntries(

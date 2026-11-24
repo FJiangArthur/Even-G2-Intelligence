@@ -119,6 +119,7 @@ describe("v0.16 Setup: speech language", () => {
     expect(speechLanguageFields({ locale: "en" })).toEqual({ mixed: false, language: "en" });
     expect(speechLocale(true, "zh-CN")).toBe("auto");
     expect(speechLocale(false, "zh-CN")).toBe("zh-CN");
-    expect(uiSource).toContain('speechLocale(this.input("speech-mixed").checked, this.input("locale").value)');
+    // Fix pass: the form stores both the locale and the language kept behind the switch (speechLanguageSettings).
+    expect(uiSource).toContain('speechLanguageSettings(this.input("speech-mixed").checked, this.input("locale").value)');
   });
 });

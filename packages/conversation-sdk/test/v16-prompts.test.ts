@@ -256,7 +256,7 @@ describe("rhetorical questions in talks", () => {
     for (const text of [
       "You might ask why this matters at all?", "Now, you may wonder how anyone lives like that?", "Some of you might be wondering where this is going?",
       "Have you ever wondered why time feels faster as we age?", "What if I told you the future does not exist?", "And you know what?",
-      "Isn't it?", "Don't you think?", "So what do I mean by that?", "Why am I telling you this?", "What's the point?", "You see what I'm saying?",
+      "Isn't it?", "Don't you think?", "So what do I mean by that?", "Why am I telling you this?", "You see what I'm saying?",
     ]) {
       expect(isRhetoricalQuestion(text), text).toBe(true);
       expect(extractQuestions(text), text).toEqual([]);
@@ -268,7 +268,9 @@ describe("rhetorical questions in talks", () => {
       ["Why is that?", "Because attention is the only thing we really own."],
       ["Is there anything we can do?", "Yes, we can start with ten minutes a day."],
       ["So what can we do about it?", "We can practise noticing."],
-      ["How does that work?", "The mind returns to the breath every time."],
+      // Fix pass: only a follow-up that opens like an answer counts ("The mind returns…" could be anything).
+      ["How does that work?", "It works by returning to the breath every time."],
+      ["What's the point?", "The point is that attention can be trained."],
     ] as const) {
       expect(isSelfAnsweredQuestion(question), question).toBe(true);
       expect(extractQuestions(`${question} ${answer}`), question).toEqual([]);
@@ -393,13 +395,19 @@ describe("monologue guard", () => {
     await vi.waitFor(() => expect(ofType(h.events, "answer.completed")).toHaveLength(1));
     await h.client.dispose();
   });
-  it("only other-tagged turns, with no turn from the wearer yet, are not suppressed", async () => {
+  // Fix pass: a turn tagged other proves tags are present, so a wearer who never speaks is covered too.
+  it("only other-tagged turns, with no turn from the wearer at all, are suppressed after 60 s", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = harness({ mode: "general" });
     await h.client.start(base, { openai: "k" });
     for (let i = 0; i < 7; i++) { vi.setSystemTime(Date.now() + 10_000); await h.transport.injectTranscript(`Point number ${i} about the present.`, OTHER_SPEAKER); }
+    await settle();
+    const before = h.bodies.length;
     await h.transport.injectTranscript(QUESTION, OTHER_SPEAKER);
-    await vi.waitFor(() => expect(ofType(h.events, "answer.completed")).toHaveLength(1));
+    await settle();
+    expect(h.bodies).toHaveLength(before);
+    expect(ofType(h.events, "answer.completed")).toHaveLength(0);
+    expect(ofType(h.events, "question.detected").map(event => event.text)).toContain(QUESTION);
     await h.client.dispose();
   });
   it.each(["interviewer", "interviewee"] as const)("%s mode is exempt", async mode => {
