@@ -6,7 +6,7 @@ import type { GatewayEvent } from "@helix/conversation-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { G2ConversationController, type G2BridgePort } from "../src/controller";
 import {
-  AMBIENT_IDLE_MS, BODY_LINES, DEFAULT_GLASSES_DISPLAY, GlassesHud, HUD_LINE_WIDTH, hudTextWidth, resolveGlassesDisplay,
+  AMBIENT_IDLE_MS, AMBIENT_LINES, AMBIENT_LINE_WIDTH, DEFAULT_GLASSES_DISPLAY, GlassesHud, hudTextWidth, resolveGlassesDisplay,
 } from "../src/glasses-hud";
 import { glassesMirrorModel } from "../src/glasses-mirror";
 import type { GlassesRenderBridge } from "../src/glasses-renderer";
@@ -76,7 +76,14 @@ const names = (page: { textObject?: { containerName?: string }[] }) => (page.tex
 const capturing = (page: Partial<RebuildPageContainer>) => [...(page.textObject ?? []), ...(page.listObject ?? [])].filter(item => item.isEventCapture === 1).map(item => item.containerName);
 const blank = (text: string) => text.trim() === "";
 const PANELS = ["hud-body", "hud-header", "hud-status", "hud-caption", "hud-mode", "hud-views"];
-const allBlank = (bridge: PageBridge) => PANELS.every(name => blank(bridge.shown(name)));
+/** v0.16: the hidden-display page is one text container over the canvas. */
+const AMBIENT = ["hud-ambient"];
+/** Every text container of the page on the glasses is blank. */
+const allBlank = (bridge: PageBridge) => names(bridge.rebuilds.at(-1) ?? bridge.creates.at(-1)!).every(name => blank(bridge.shown(name!)));
+/** The pop-up on the hidden display as its non-blank lines, without the centring spaces. */
+const pop = (hud: GlassesHud) => hud.frame.body.split("\n").map(line => line.trim()).filter(Boolean);
+/** The last line of the hidden-display container: page marker, hint, problem. "" when the pop-up has none. */
+const footer = (hud: GlassesHud) => { const lines = hud.frame.body.split("\n"); return lines.length >= AMBIENT_LINES ? lines[AMBIENT_LINES - 1]!.trim() : ""; };
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -102,18 +109,18 @@ describe("ambient glasses display", () => {
     presentation.setStatus("listening");
     expect(hud.ambient).toBe(true);
     await vi.advanceTimersByTimeAsync(1000);
-    // The session page: no frame border, no image containers, BODY alone captures gestures.
+    // The session page: one text container, no frame border, no image containers; it captures the gestures.
     const page = bridge.rebuilds.at(-1)!;
-    expect(names(page)).toEqual(PANELS);
-    expect(page.containerTotalNum).toBe(6);
+    expect(names(page)).toEqual(AMBIENT);
+    expect(page.containerTotalNum).toBe(1);
     expect(page.imageObject ?? []).toHaveLength(0);
     expect(page.listObject ?? []).toHaveLength(0);
-    expect(capturing(page)).toEqual(["hud-body"]);
+    expect(capturing(page)).toEqual(["hud-ambient"]);
     expect(page.menuObject).toBeDefined(); // the OS menu stays
-    // A short "● listening" confirms the mic, then nothing at all.
-    expect(hud.frame.status.trim()).toBe("● listening");
+    // The mode and a short "● listening" confirm the session, then nothing at all.
+    expect(pop(hud)).toEqual(["Mode: Meeting", "● listening"]);
     await vi.advanceTimersByTimeAsync(5000);
-    expect(hud.frame.status.trim()).toBe("");
+    expect(blank(hud.frame.body)).toBe(true);
     expect(allBlank(bridge)).toBe(true);
     // Talk does not light the display: no caption, no LIVE view, no clock, no images, no page swaps.
     const rebuilds = bridge.rebuilds.length, writes = bridge.updates.length, images = bridge.images.length;
@@ -132,27 +139,25 @@ describe("ambient glasses display", () => {
     hud.dispose();
   });
 
-  it("pops an answer up in the HUD style with text writes only, then lets it disappear", async () => {
+  it("pops an answer up as centred content with text writes only, then lets it disappear", async () => {
     vi.useFakeTimers();
     const { bridge, hud, presentation } = await listening();
     const rebuilds = bridge.rebuilds.length;
     presentation.apply(question("q1", "How long is the Orin lead time?"));
     presentation.apply(completed("a1", "q1", "Twelve to sixteen weeks at major distributors."));
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1");
-    expect(hud.frame.body).toBe("Q: How long is the Orin lead time?\nTwelve to sixteen weeks at major distributors.");
-    expect(blank(hud.frame.caption) && blank(hud.frame.mode) && blank(hud.frame.views)).toBe(true);
+    // v0.16: the answer alone. No title, no "Q:" line, no hint for a one-page answer.
+    expect(pop(hud)).toEqual(["Twelve to sixteen weeks at major distributors."]);
+    expect([hud.frame.title, hud.frame.status, hud.frame.caption, hud.frame.mode, hud.frame.views].every(blank)).toBe(true);
     await vi.advanceTimersByTimeAsync(400);
-    expect(bridge.shown("hud-body")).toContain("Twelve to sixteen weeks");
-    expect(bridge.shown("hud-header")).toBe("◆ THEY ASKED 1/1");
-    expect(bridge.shown("hud-status").trim()).toBe("answer · tap to close");
-    expect(blank(bridge.shown("hud-caption"))).toBe(true);
+    expect(bridge.shown("hud-ambient")).toBe(hud.frame.body);
+    expect(bridge.updates.slice(bridge.rebuildAt.at(-1) ?? 0).every(update => update.containerName === "hud-ambient")).toBe(true);
     // 8 s after the answer completed it is gone, without a gesture.
     await vi.advanceTimersByTimeAsync(8200);
     expect(allBlank(bridge)).toBe(true);
     expect(hud.ambient).toBe(true);
     expect(bridge.rebuilds).toHaveLength(rebuilds); // a pop-up never swaps the page
     // Writes to one container stay at least the 120 ms debounce apart.
-    for (const name of PANELS) {
+    for (const name of AMBIENT) {
       const times = bridge.writes(name).map(write => write.at);
       for (let i = 1; i < times.length; i++) expect(times[i]! - times[i - 1]!).toBeGreaterThanOrEqual(120);
     }
@@ -163,27 +168,26 @@ describe("ambient glasses display", () => {
     vi.useFakeTimers();
     const { bridge, hud, presentation } = await listening();
     presentation.apply(question("q1", "What are the options?"));
-    presentation.apply(delta("a1", "q1", LONG.repeat(2)));
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/…");
-    expect(hud.frame.status.trim()).toBe("answering");
-    presentation.apply(completed("a1", "q1", LONG.repeat(4).trim()));
-    const pages = Number(/\/(\d+)$/u.exec(hud.frame.title)![1]);
+    presentation.apply(delta("a1", "q1", LONG.repeat(6)));
+    expect(footer(hud)).toBe("1/… · swipe ↓ more"); // more pages are known while it still streams
+    presentation.apply(completed("a1", "q1", LONG.repeat(8).trim()));
+    const pages = Number(/^\d+\/(\d+)/u.exec(footer(hud))![1]);
     expect(pages).toBeGreaterThan(2);
     const seen = new Set<string>();
     for (let i = 0; i < 80 && !blank(hud.frame.body); i++) {
-      seen.add(hud.frame.title);
-      for (const line of hud.frame.body.split("\n")) expect(hudTextWidth(line)).toBeLessThanOrEqual(HUD_LINE_WIDTH.body);
-      expect(hud.frame.body.split("\n").length).toBeLessThanOrEqual(BODY_LINES);
+      seen.add(/^\d+\/\d+/u.exec(footer(hud))![0]);
+      for (const line of hud.frame.body.split("\n")) expect(hudTextWidth(line)).toBeLessThanOrEqual(AMBIENT_LINE_WIDTH);
+      expect(hud.frame.body.split("\n").length).toBeLessThanOrEqual(AMBIENT_LINES);
       await vi.advanceTimersByTimeAsync(1000);
     }
     // Every page was shown in order, then the display went blank.
-    expect([...seen]).toEqual(Array.from({ length: pages }, (_, index) => `◆ THEY ASKED ${index + 1}/${pages}`));
+    expect([...seen]).toEqual(Array.from({ length: pages }, (_, index) => `${index + 1}/${pages}`));
     await vi.advanceTimersByTimeAsync(500);
     expect(allBlank(bridge)).toBe(true);
     // Nothing brings it back: later transcript events, the retained completed answer, or any old timer.
     const writes = bridge.updates.length;
     presentation.apply(final("t9", "Okay, thanks."));
-    presentation.apply(completed("a1", "q1", LONG.repeat(4).trim()));
+    presentation.apply(completed("a1", "q1", LONG.repeat(8).trim()));
     hud.render(presentation.snapshot().glasses, presentation.snapshot());
     await vi.advanceTimersByTimeAsync(120_000);
     expect(vi.getTimerCount()).toBe(0);
@@ -201,12 +205,12 @@ describe("ambient glasses display", () => {
     expect(hud.ambient).toBe(true);
     expect(hud.handleGesture("click")).toEqual({ type: "askLocal" });
     presentation.apply(question("q1", "What are the options?"));
-    presentation.apply(completed("a1", "q1", LONG.repeat(3).trim()));
-    expect(hud.frame.title).toMatch(/THEY ASKED 1\/\d/u);
+    presentation.apply(completed("a1", "q1", LONG.repeat(6).trim()));
+    expect(footer(hud)).toMatch(/^1\/\d · swipe ↓ more$/u);
     expect(hud.handleGesture("down")).toEqual({ type: "handled" });
-    expect(hud.frame.title).toMatch(/THEY ASKED 2\/\d/u);
+    expect(footer(hud)).toMatch(/^2\/\d/u);
     hud.handleGesture("up");
-    expect(hud.frame.title).toMatch(/THEY ASKED 1\/\d/u);
+    expect(footer(hud)).toMatch(/^1\/\d/u);
     for (let i = 0; i < 6 && !blank(hud.frame.body); i++) expect(hud.handleGesture("click")).toEqual({ type: "handled" });
     expect(blank(hud.frame.body) && blank(hud.frame.title)).toBe(true); // tap on the last page closes it
     expect(hud.ambient).toBe(true);
@@ -215,17 +219,17 @@ describe("ambient glasses display", () => {
     hud.dispose();
   });
 
-  it("shows Thinking… for a requested answer, and gesture feedback in the status corner", async () => {
+  it("shows Thinking… for a requested answer, and gesture feedback on the last line", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening();
     presentation.beginRequest();
     expect(presentation.snapshot().glasses.manualPending).toBe(true);
-    expect(hud.frame.title).toBe("◆ ANSWER");
-    expect(hud.frame.body).toMatch(/^Thinking…/u);
-    expect(hud.frame.status.trim()).toBe("thinking");
+    expect(pop(hud)).toEqual(["Thinking…"]);
+    expect(blank(hud.frame.title) && blank(hud.frame.status)).toBe(true);
     expect(hud.handleGesture("click")).toEqual({ type: "handled" }); // no second request while waiting
     presentation.setInteraction("HOLDING / RELEASE TO SUBMIT");
-    expect(hud.frame.status.trim()).toContain("● HOLD · release to send");
+    expect(pop(hud)).toEqual(["Thinking…", "● HOLD · release to send"]);
+    expect(footer(hud)).toBe("● HOLD · release to send");
     hud.dispose();
   });
 
@@ -233,11 +237,10 @@ describe("ambient glasses display", () => {
     vi.useFakeTimers();
     const { bridge, hud, presentation } = await listening();
     presentation.applyVerification(verdict("v1"));
-    expect(hud.frame.title).toBe("CHECK");
-    expect(hud.frame.body).toBe("● OK · supported · verify\nOrin lead time is 12 weeks\nDistributors list 12 to 16 weeks.");
-    expect(hud.frame.status.trim()).toBe("tap to close");
+    expect(pop(hud)).toEqual(["● OK · supported · verify", "Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
+    expect(footer(hud)).toBe(""); // one page: no marker, no hint
     await vi.advanceTimersByTimeAsync(400);
-    expect(bridge.shown("hud-body")).toContain("● OK · supported");
+    expect(bridge.shown("hud-ambient")).toContain("● OK · supported");
     await vi.advanceTimersByTimeAsync(5000);
     expect(allBlank(bridge)).toBe(true);
     // The same verdict again (snapshot re-emits) does not pop up twice.
@@ -249,10 +252,9 @@ describe("ambient glasses display", () => {
     presentation.apply(question("q1", "How long is the lead time?"));
     presentation.apply(completed("a1", "q1", "Twelve to sixteen weeks."));
     presentation.applyFactCheck({ id: "f1", claim: "The cap is $25,000", status: "contradicted", summary: "Finance approved $40,000.", sources: [], checkedAt: at } as never);
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/1");
+    expect(pop(hud)).toEqual(["Twelve to sixteen weeks."]);
     await vi.advanceTimersByTimeAsync(8100);
-    expect(hud.frame.title).toBe("FACT CHECK");
-    expect(hud.frame.body).toContain("▲ FALSE · contradicted · web check");
+    expect(pop(hud)).toEqual(["▲ FALSE · contradicted · web check", "The cap is $25,000", "Finance approved $40,000."]);
     await vi.advanceTimersByTimeAsync(5100);
     expect(blank(hud.frame.title) && blank(hud.frame.body)).toBe(true);
     await vi.advanceTimersByTimeAsync(60_000);
@@ -264,15 +266,14 @@ describe("ambient glasses display", () => {
     presentation.applySummary({ updatedAt: at, transcriptChars: 4000, bullets: ["Budget is open."], keyFacts: ["Quote due Thursday"] });
     expect(blank(hud.frame.body)).toBe(true);
     presentation.applyAsk({ id: "k1", kind: "lookup", topic: "Jetson lead time?", trigger: "lead time", status: "done", answer: "12 to 16 weeks.", createdAt: at });
-    expect(hud.frame.title).toBe("LOOKUP");
-    expect(hud.frame.body).toContain("Jetson lead time? 12 to 16 weeks.");
+    expect(pop(hud)).toEqual(["Jetson lead time? 12 to 16 weeks."]);
     expect(hud.handleGesture("click")).toEqual({ type: "handled" }); // tap closes a cue
     expect(blank(hud.frame.body)).toBe(true);
-    presentation.applyConcept({ id: "c1", term: "NVMe", explanation: LONG.repeat(4), createdAt: at, origin: "copilot" });
-    expect(hud.frame.title).toBe("CONCEPT 1/3"); // long cues page as well (at most 3 pages)
-    expect(hud.frame.status.trim()).toBe("swipe ↓ more");
+    presentation.applyConcept({ id: "c1", term: "NVMe", explanation: LONG.repeat(12), createdAt: at, origin: "copilot" });
+    expect(pop(hud)[0]).toMatch(/^NVMe — Jetson Orin modules/u);
+    expect(footer(hud)).toBe("1/3 · swipe ↓ more"); // long cues page as well (at most 3 pages)
     await vi.advanceTimersByTimeAsync(10_100);
-    expect(hud.frame.title).toBe("CONCEPT 2/3");
+    expect(footer(hud)).toBe("2/3 · swipe ↓ more");
     await vi.advanceTimersByTimeAsync(40_000);
     expect(allBlank(bridge)).toBe(true);
     hud.dispose();
@@ -302,8 +303,8 @@ describe("ambient glasses display", () => {
     expect(hud.menuOpen).toBe(false);
     expect(hud.ambient).toBe(true);
     await vi.advanceTimersByTimeAsync(600);
-    expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS);
-    expect(capturing(bridge.rebuilds.at(-1)!)).toEqual(["hud-body"]);
+    expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT);
+    expect(capturing(bridge.rebuilds.at(-1)!)).toEqual(["hud-ambient"]);
     expect(allBlank(bridge)).toBe(true);
     // The idle timer of the dismissed wake is stale: it changes nothing later.
     const rebuilds = bridge.rebuilds.length;
@@ -345,7 +346,7 @@ describe("ambient glasses display", () => {
     await vi.advanceTimersByTimeAsync(3500);
     expect(hud.ambient).toBe(true);
     await vi.advanceTimersByTimeAsync(600);
-    expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS);
+    expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT);
     expect(allBlank(bridge)).toBe(true);
     // The verdict that arrived while the HUD was awake was visible there: it does not pop up afterwards.
     await vi.advanceTimersByTimeAsync(60_000);
@@ -365,9 +366,9 @@ describe("ambient glasses display", () => {
     await vi.advanceTimersByTimeAsync(1500);
     expect(hud.menuOpen).toBe(false);
     expect(hud.ambient).toBe(true);
-    expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS);
-    expect(hud.frame.title).toBe("◆ THEY ASKED 1/…");
-    expect(bridge.shown("hud-body")).toContain("Twelve to sixteen weeks.");
+    expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT);
+    expect(pop(hud)).toEqual(["Twelve to sixteen weeks."]);
+    expect(bridge.shown("hud-ambient")).toContain("Twelve to sixteen weeks.");
     presentation.apply(completed("a1", "q1", "Twelve to sixteen weeks."));
     await vi.advanceTimersByTimeAsync(8500);
     expect(allBlank(bridge)).toBe(true);
@@ -378,7 +379,7 @@ describe("ambient glasses display", () => {
     vi.useFakeTimers();
     const { bridge, hud, presentation } = await listening();
     presentation.applyVerification(verdict("v1"));
-    expect(hud.frame.title).toBe("CHECK");
+    expect(pop(hud)[0]).toBe("● OK · supported · verify");
     presentation.setStatus("stopped");
     expect(hud.ambient).toBe(false);
     expect(hud.frame.title).toBe("HELIX");
@@ -390,8 +391,8 @@ describe("ambient glasses display", () => {
     presentation.setStatus("connecting");
     presentation.setStatus("connected");
     await vi.advanceTimersByTimeAsync(1500);
-    expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS);
-    expect(hud.frame.status.trim()).toBe("○ mic off");
+    expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT);
+    expect(pop(hud)).toEqual(["Mode: Meeting", "○ mic off"]);
     await vi.advanceTimersByTimeAsync(4000);
     expect(allBlank(bridge)).toBe(true);
     // A failed session needs attention: the HUD shows.
@@ -421,7 +422,7 @@ describe("ambient glasses display", () => {
     expect(hud.display).toBe("ambient");
     expect(hud.ambient).toBe(true);
     await vi.advanceTimersByTimeAsync(600);
-    expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS);
+    expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT);
     expect(allBlank(bridge)).toBe(true);
     hud.setDisplay("always-on");
     await vi.advanceTimersByTimeAsync(600);
@@ -434,7 +435,7 @@ describe("ambient glasses display", () => {
     vi.useFakeTimers();
     const { bridge, hud } = await listening();
     expect(await hud.repush()).toBe(true);
-    expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS);
+    expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT);
     // The glasses reject the wake page: the menu falls back to text in BODY, and the swap is retried once a second.
     bridge.rebuildOk = false;
     const before = bridge.rebuilds.length;
@@ -483,7 +484,7 @@ describe("ambient glasses display", () => {
     expect(model.lines.every(line => blank(line.text))).toBe(true);
     presentation.applyVerification(verdict("v1"));
     expect(glassesMirrorModel(hud.mirror).lines.filter(line => !blank(line.text)).map(line => line.text)).toEqual(
-      ["CHECK", "tap to close", "● OK · supported · verify", "Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
+      ["● OK · supported · verify", "Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
     hud.dispose();
   });
 });
@@ -538,7 +539,7 @@ describe("ambient display through the real controller", () => {
     await controller.initialize();
     const asked = vi.spyOn(controller, "askContext").mockResolvedValue(undefined as never);
     presentation.setStatus("listening");
-    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1) ?? {})).toEqual(PANELS));
+    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1) ?? {})).toEqual(AMBIENT));
     const emit = (event: object) => listener?.(event as EvenHubEvent);
     emit({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT, eventSource: 1 } });
     expect(hud.menuOpen).toBe(true);
@@ -564,10 +565,10 @@ describe("ambient display through the real controller", () => {
     const controller = new G2ConversationController(bridge, hud, presentation);
     await controller.initialize();
     presentation.setStatus("listening");
-    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1) ?? {})).toEqual(PANELS));
+    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1) ?? {})).toEqual(AMBIENT));
     const emit = (event: object) => listener?.(event as EvenHubEvent);
-    // Swipes on the blank BODY container are consumed and change nothing.
-    emit({ textEvent: { containerID: 2, containerName: "hud-body", eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT } });
+    // Swipes on the blank container are consumed and change nothing.
+    emit({ textEvent: { containerID: 2, containerName: "hud-ambient", eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT } });
     expect(hud.view).toBe("live");
     expect(hud.ambient).toBe(true);
     emit({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT, eventSource: 1 } });
@@ -581,7 +582,7 @@ describe("ambient display through the real controller", () => {
     emit({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT, eventSource: 1 } });
     emit({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT, eventSource: 1 } });
     expect(hud.ambient).toBe(true);
-    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1)!)).toEqual(PANELS));
+    await vi.waitFor(() => expect(names(bridge.rebuilds.at(-1)!)).toEqual(AMBIENT));
     await controller.dispose();
   });
 });

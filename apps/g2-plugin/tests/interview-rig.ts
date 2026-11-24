@@ -74,8 +74,8 @@ export async function createRig(options: RigOptions = {}) {
   return {
     api, fake, recorder, controller, presentation, hud, glasses, speech,
     get transport() { return holder.transport!; },
-    /** Text in the glasses BODY container right now. */
-    body: () => glasses.containers.get("hud-body") ?? "",
+    /** Text on the glasses right now: the one container of the hidden display, or the BODY container of the HUD. */
+    body: () => glasses.containers.get("hud-ambient") ?? glasses.containers.get("hud-body") ?? "",
     async dispose() { await drive(controller.dispose()); },
   };
 }

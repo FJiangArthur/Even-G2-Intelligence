@@ -156,7 +156,7 @@ describe("v15 glasses write deadline (finding 8)", () => {
     await settle(1000);
     expect(bridge.startedOf("text")).toHaveLength(1);
     await settle(4000);
-    expect(bridge.last("helix-main")).toBe("Second answer.");
+    expect(bridge.last("helix-main")?.trim()).toBe("Second answer."); // v0.16: a complete page is centred with leading blank lines and spaces
     renderer.dispose();
   });
 });

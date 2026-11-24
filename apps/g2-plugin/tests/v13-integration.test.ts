@@ -23,6 +23,8 @@ async function listening(options: ConstructorParameters<typeof GlassesHud>[1] = 
   await vi.advanceTimersByTimeAsync(6000);
   return { hud, presentation };
 }
+/** v0.16: the pop-up on the hidden display as its non-blank lines, without the centring spaces. */
+const pop = (hud: GlassesHud) => hud.frame.body.split("\n").map(line => line.trim()).filter(Boolean);
 const LONG = "Distributors currently list twelve to sixteen week lead times for the module, developer kits ship sooner but are allocation limited, and the fallback needs a larger supply. ";
 
 afterEach(() => { vi.useRealTimers(); });
@@ -44,8 +46,9 @@ describe("v0.13 integration: ambient pop-ups, news verdicts and answer length", 
     presentation.applyFactCheck({ id: "f1", sessionId: "s", transcriptId: "t1", claim: "The rate was cut this week", status: "contradicted",
       summary: "The bank held rates on Tuesday.", checkedAt: at, recency: "news", via: "DeepSeek",
       sources: [{ url: "https://news.example.org/rates", title: "Rates held", publishedAt: "2026-11-17", dateSource: "search" }] });
-    expect(hud.frame.title).toBe("FACT CHECK");
-    expect(hud.frame.body).toBe("▲ FALSE · contradicted · news check\nThe rate was cut this week\nThe bank held rates on Tuesday.\nSrc: news.example.org · 2026-11-17");
+    // v0.16: no title; the verdict line says what kind of check it was.
+    expect(hud.frame.title.trim()).toBe("");
+    expect(pop(hud)).toEqual(["▲ FALSE · contradicted · news check", "The rate was cut this week", "The bank held rates on Tuesday.", "Src: news.example.org · 2026-11-17"]);
     await vi.advanceTimersByTimeAsync(6000);
     expect(hud.frame.body.trim()).toBe("");
     // A general (not time-sensitive) check keeps the old wording.
@@ -62,7 +65,7 @@ describe("v0.13 integration: ambient pop-ups, news verdicts and answer length", 
     const ask = (id: string) => ({ id, kind: "lookup" as const, topic: "Lead time?", trigger: "lead time", status: "done" as const, answer, createdAt: at });
     const standard = await listening();
     standard.presentation.applyAsk(ask("k1"));
-    expect(standard.hud.frame.title).toBe("LOOKUP 1/3");
+    expect(pop(standard.hud).at(-1)).toBe("1/3 · swipe ↓ more"); // v0.16: the page marker is the last line of the pop-up
     standard.hud.setAnswerLength("detailed");
     standard.presentation.applyAsk(ask("k2"));
     standard.hud.handleGesture("up"); // stay on the display
@@ -70,7 +73,7 @@ describe("v0.13 integration: ambient pop-ups, news verdicts and answer length", 
     standard.hud.dispose();
     const long = await listening({ answerLength: "detailed" });
     long.presentation.applyAsk(ask("k1"));
-    expect(long.hud.frame.title).toMatch(/^LOOKUP 1\/[456]$/u);
+    expect(pop(long.hud).at(-1)).toMatch(/^1\/[456] · swipe ↓ more$/u);
     long.hud.dispose();
   });
 

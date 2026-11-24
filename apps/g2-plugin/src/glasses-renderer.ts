@@ -9,7 +9,7 @@ import {
   type ImageRawDataUpdate,
   type ImageRawDataUpdateResult,
 } from "@evenrealities/even_hub_sdk";
-import { AnswerPager, paginateAnswer } from "./answer-pager";
+import { AnswerPager, centrePage, paginateAnswer } from "./answer-pager";
 import { SHORTCUT_ACTIONS } from "./shortcut-actions";
 
 export const GLASSES_CONTAINER_ID = 1;
@@ -108,9 +108,20 @@ export class GlassesRenderer {
   private readonly consumedCues = new Set<string>();
   private readonly pager = new AnswerPager((text) => {
     if (text) this.clearCue();
-    this.currentFrame = [answerPanel(text || this.cueText)];
+    this.currentFrame = [answerPanel(this.shownText())];
     this.schedule();
   });
+
+  /**
+   * v0.16: the text for the one container. A complete answer page or cue is centred on the canvas
+   * (centrePage); the page a streaming answer is still filling stays top-left, so it does not move at
+   * every token and is written once more, centred, when it is complete.
+   */
+  private shownText(): string {
+    const text = this.pager.text;
+    if (text) return this.pager.isStreaming && this.pager.pageIndex + 1 >= this.pager.pageCount ? text : centrePage(text);
+    return this.cueText ? centrePage(this.cueText) : "";
+  }
 
   public constructor(
     private readonly bridge: GlassesRenderBridge,
@@ -158,10 +169,10 @@ export class GlassesRenderer {
       if (this.consumedCues.size > 200) this.consumedCues.delete(this.consumedCues.values().next().value!);
       if (eligible) {
         this.cueId = state.cue.id; this.cueText = paginateAnswer(state.cue.text)[0] ?? "";
-        this.cueTimer = setTimeout(() => { this.clearCue(); this.currentFrame = [answerPanel(this.pager.text)]; this.schedule(); }, 8000);
+        this.cueTimer = setTimeout(() => { this.clearCue(); this.currentFrame = [answerPanel(this.shownText())]; this.schedule(); }, 8000);
       }
     }
-    this.currentFrame = [answerPanel(this.pager.text || this.cueText)]; this.schedule();
+    this.currentFrame = [answerPanel(this.shownText())]; this.schedule();
   }
 
   private clearCue(): void { clearTimeout(this.cueTimer); this.cueTimer = undefined; this.cueText = ""; this.cueId = undefined; }

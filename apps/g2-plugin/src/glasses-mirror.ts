@@ -5,12 +5,14 @@
  * MENU list with its highlight), the splash while not connected, and the caption. Coordinates
  * follow the HUD geometry (glasses-hud.ts HUD_PANELS / HUD_MENU_LIST / HUD_IMAGES) in an SVG
  * viewBox, so it scales to any width the phone gives it.
+ * v0.16: the hidden (ambient) display is one container over the canvas (HUD_AMBIENT_PANEL: 10 lines,
+ * 27 px pitch) with the pop-up centred in it; the mirror draws exactly those lines.
  *
  *   renderGlassesMirror(element, snapshot.hud)   // call on every presentation snapshot
  *   ui.selectTab(tabForHudView(snapshot.hud.view)) // optional: phone follows the glasses
  */
 import type { HudMirror } from "@helix/conversation-sdk";
-import { HUD_FRAME, HUD_IMAGES, HUD_LINE_HEIGHT, HUD_LINE_WIDTH, HUD_MENU_LIST, HUD_PANELS, hudTextWidth, renderImage, tabForHudView } from "./glasses-hud";
+import { AMBIENT_LINE_WIDTH, HUD_AMBIENT_PANEL, HUD_FRAME, HUD_IMAGES, HUD_LINE_HEIGHT, HUD_LINE_WIDTH, HUD_MENU_LIST, HUD_PANELS, hudTextWidth, renderImage, tabForHudView } from "./glasses-hud";
 
 export { tabForHudView };
 
@@ -47,6 +49,19 @@ export function glassesMirrorModel(mirror: HudMirror): MirrorModel {
   const lines: MirrorLine[] = [];
   const header = HUD_PANELS.header, body = HUD_PANELS.body, caption = HUD_PANELS.caption;
   const baseline = 21; // first baseline below a region's top edge (21 px font in a 27 px line)
+  if (mirror.ambient) {
+    // Hidden display: the one full-canvas container. The glasses centre with leading spaces; the mirror
+    // draws each line where those spaces put it, at the width it has on the glasses.
+    const box = HUD_AMBIENT_PANEL, content = mirror.content ?? mirror.body;
+    content.split("\n").slice(0, box.lines).forEach((line, row) => {
+      const text = line.trim();
+      if (!text) return;
+      const lead = hudTextWidth(line.slice(0, line.length - line.trimStart().length));
+      lines.push({ text, x: box.xPosition + lead, y: box.yPosition + baseline + row * HUD_LINE_HEIGHT, level: 4, width: lineWidth(text, AMBIENT_LINE_WIDTH - lead) });
+    });
+    const shown = content.replace(/\s+/gu, " ").trim();
+    return { view: mirror.view, tab: tabForHudView(mirror.view), menuOpen: false, lines, label: `Glasses: ${shown || "display hidden"}`, images: [] };
+  }
   if (mirror.title !== undefined) {
     // v0.10: bright title on the left, dim status ending at the right of its container.
     const title = mirror.title.trim(), status = (mirror.status ?? "").trim(), statusBox = HUD_PANELS.status;

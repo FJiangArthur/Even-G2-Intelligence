@@ -75,6 +75,34 @@ export function paginateAnswer(text: string, layout: PageLayout = FULL_CANVAS_PA
   return pages;
 }
 
+/**
+ * v0.16: one page, centred for display. The Even SDK has no text alignment, so each line gets leading
+ * spaces and the block gets leading blank lines. The page is wrapped by the same line rule as
+ * paginateAnswer. This changes what is drawn only: the pager's pages still join to the exact answer.
+ * A page that does not fit the layout, or would pass its byte ceiling with the padding, is returned
+ * as it is. Use it for a complete page; a page that is still streaming would move at every token.
+ */
+export function centrePage(text: string, layout: PageLayout = FULL_CANVAS_PAGE): string {
+  const glyphWidth = layout.measure ?? defaultGlyphWidth;
+  // The built-in measure is a heuristic that reads the G2 font up to 16 % narrow ("m" 14 for 16 px, "a" 9.5
+  // for 11). Padding is worked out for the widest the line can be, so it never pushes a line over the edge.
+  const margin = layout.measure ? 1 : 1.16;
+  const space = glyphWidth(" ");
+  let lines = paginateAnswer(text, { lineWidth: layout.lineWidth, lines: 1, bytes: Number.MAX_SAFE_INTEGER, measure: glyphWidth }).map(line => line.trim());
+  while (lines.length && !lines[0]) lines = lines.slice(1);
+  while (lines.length && !lines[lines.length - 1]) lines = lines.slice(0, -1);
+  if (!lines.length || lines.length > layout.lines) return text;
+  const padded = lines.map(line => {
+    if (!line) return "";
+    let width = 0;
+    for (const item of segmenter.segment(line)) width += glyphWidth(item.segment);
+    const pad = Math.round((layout.lineWidth - width * margin) / 2 / space);
+    return pad > 0 ? `${" ".repeat(pad)}${line}` : line;
+  });
+  const centred = `${"\n".repeat(Math.floor((layout.lines - lines.length) / 2))}${padded.join("\n")}`;
+  return encoder.encode(centred).length > (layout.bytes ?? PAGE_BYTES) ? text : centred;
+}
+
 export function pageReadingMs(visibleCharacters: number): number {
   return Math.min(10000, Math.max(3000, visibleCharacters * 45));
 }
@@ -133,6 +161,8 @@ export class AnswerPager {
   private shownAt = 0;
   private swapTimer?: ReturnType<typeof setTimeout>;
   private stallTimer?: ReturnType<typeof setTimeout>;
+  /** Geometry the pages of the answer on screen were made for. */
+  private pageLayout?: PageLayout;
 
   public constructor(
     private readonly onChange: (text: string) => void,
@@ -145,6 +175,30 @@ export class AnswerPager {
    * shown keep their boundaries; takes effect for unfrozen text only.
    */
   public setLayout(layout: PageLayout): void { this.layout = layout; }
+
+  /**
+   * The display changed size (v0.16: the glasses HUD swaps between its hidden-display page and the
+   * awake page): `map` gives the new geometry for each layout in use. The answer on screen is paged
+   * again from its start and stays on the page that holds the text being read; that page's reading time
+   * starts over. Waiting answers take their new layout when their turn comes.
+   */
+  public relayout(map: (layout: PageLayout) => PageLayout): void {
+    if (this.disposed) return;
+    this.queue = this.queue.map(item => item.answer.layout ? { ...item, answer: { ...item.answer, layout: map(item.answer.layout) } } : item);
+    if (!this.pageLayout || !this.pages.length) return;
+    const next = map(this.pageLayout);
+    if (next === this.pageLayout) return;
+    this.pageLayout = next;
+    const read = this.pages.slice(0, this.index).reduce((sum, page) => sum + page.length, 0);
+    this.pages = paginateAnswer(this.source, next);
+    let index = 0, before = 0;
+    while (index + 1 < this.pages.length && before + this.pages[index]!.length <= read) before += this.pages[index++]!.length;
+    this.index = index;
+    if (this.hidden) return;
+    this.cancelTimer();
+    this.onChange(this.text);
+    this.schedule();
+  }
 
   public get text(): string { return this.hidden ? "" : this.pages[this.index] ?? ""; }
   public get pageIndex(): number { return this.index; }
@@ -230,7 +284,8 @@ export class AnswerPager {
     const frozen = this.pages.slice(0, Math.max(0, this.pages.length - 1));
     const offset = frozen.reduce((sum, page) => sum + page.length, 0);
     const first = !this.pages.length;
-    this.pages = [...frozen, ...paginateAnswer(text.slice(offset), answer.layout ?? this.layout)];
+    this.pageLayout = answer.layout ?? this.layout;
+    this.pages = [...frozen, ...paginateAnswer(text.slice(offset), this.pageLayout)];
     if (first && this.pages.length) this.shownAt = this.now();
     const grew = text !== this.source;
     this.source = text;
@@ -316,6 +371,7 @@ export class AnswerPager {
     this.cut = false;
     this.streaming = true;
     this.shownAt = 0;
+    this.pageLayout = undefined;
   }
 
   private schedule(): void {

@@ -41,12 +41,12 @@ describe("G2 glasses renderer", () => {
     const answer = { id: "answer", text: "Manual answer", streaming: false };
     const cue = { id: "during-answer", text: "Do not show" };
     renderer.render({ status: "listening", answer, cue }); await renderer.flush();
-    expect(bridge.updates.at(-1)?.content).toBe("Manual answer");
+    expect(bridge.updates.at(-1)?.content?.trim()).toBe("Manual answer"); // v0.16: complete pages are centred
     await vi.advanceTimersByTimeAsync(8000); await renderer.flush();
     renderer.render({ status: "listening", answer, cue }); await renderer.flush();
     expect(bridge.updates.at(-1)?.content?.trim()).toBe("");
     renderer.render({ status: "listening", answer, cue: { id: "fresh", text: "Fresh idle insight" } }); await renderer.flush();
-    expect(bridge.updates.at(-1)?.content).toBe("Fresh idle insight");
+    expect(bridge.updates.at(-1)?.content?.trim()).toBe("Fresh idle insight");
     renderer.render({ status: "listening", manualPending: true }); await renderer.flush();
     await vi.advanceTimersByTimeAsync(9000); await renderer.flush();
     expect(bridge.updates.at(-1)?.content?.trim()).toBe(""); renderer.dispose();
@@ -66,7 +66,7 @@ describe("G2 glasses renderer", () => {
     await renderer.initialize();
     const cue = { id: "c", text: "RAG: Retrieval." };
     renderer.render({ status: "listening", cue }); await renderer.flush();
-    expect(bridge.updates.at(-1)?.content).toBe("RAG: Retrieval.");
+    expect(bridge.updates.at(-1)?.content?.trim()).toBe("RAG: Retrieval."); // v0.16: a cue is centred
     await vi.advanceTimersByTimeAsync(8000); await renderer.flush();
     expect(bridge.updates.at(-1)?.content?.trim()).toBe("");
     renderer.render({ status: "listening", cue }); await renderer.flush();
