@@ -264,6 +264,15 @@ export const HUD_IMAGES = Object.freeze({
   badge: Object.freeze({ containerID: 11, containerName: "hud-badge", xPosition: 536, yPosition: 0, width: 40, height: 36 }),
   splash: Object.freeze({ containerID: 12, containerName: "hud-splash", xPosition: 70, yPosition: 44, width: 288, height: 128 }),
 });
+/**
+ * v0.16: the hidden-display (ambient) page is ONE text container over the whole canvas. Pop-ups are
+ * centred in it with leading spaces and blank lines (the SDK has no alignment). It keeps the BODY
+ * container id, so it is the gesture target on that page; the other five panels do not exist there.
+ */
+export const HUD_AMBIENT_PANEL = Object.freeze({ containerID: 2, containerName: "hud-ambient", xPosition: 8, yPosition: 8, width: 560, height: 272,
+  borderWidth: 0, borderColor: 0, borderRadius: 0, paddingLength: 0, textColor: 4, isEventCapture: 1, lines: 10 });
+export const AMBIENT_LINES = HUD_AMBIENT_PANEL.lines;
+export const AMBIENT_LINE_WIDTH = HUD_AMBIENT_PANEL.width - HEADROOM;
 type ImageKey = keyof typeof HUD_IMAGES;
 type PanelKey = keyof typeof HUD_PANELS;
 const PANEL_ORDER: readonly PanelKey[] = ["body", "header", "status", "caption", "mode", "views"];

@@ -47,6 +47,11 @@ export interface ModeProfile {
    * ask next and questions the wearer could ask. Other modes only have the second kind.
    */
   readonly suggestionKinds?: boolean;
+  /**
+   * v0.16. True when this mode's suggestions are lines to say (CopilotSuggestion.kind "say") rather
+   * than questions to ask: Meeting, Learning, Social and Partner. Never together with suggestionKinds.
+   */
+  readonly sayLines?: boolean;
 }
 
 /** The two kinds of suggestion in Candidate mode, with the panel heading for each. */
@@ -60,7 +65,7 @@ const CANDIDATE_GUARD = "Never invent experience, employers, numbers or titles f
 const DEFAULT_SUGGESTIONS = "at most 5 useful questions the WEARER could ask the other party next, phrased exactly as the wearer would say them aloud to that person (e.g. 'What lead time are you seeing for the Jetson boards?'), spanning the whole conversation, each with a short why. Never questions for the wearer to answer, and never questions that were already asked or answered in the conversation.";
 const ALL_ON: ModePresets = Object.freeze({ summarize: true, concepts: true, conflicts: true, suggestions: true, implicitAsks: true, webGrounding: true, claims: true, people: true, autoAnswer: true, responseStrategy: "reactive" });
 
-const profile = (value: Omit<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions" | "guard" | "suggestionKinds"> & Partial<Pick<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions" | "guard" | "suggestionKinds">>): ModeProfile =>
+const profile = (value: Omit<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions" | "guard" | "suggestionKinds" | "sayLines"> & Partial<Pick<ModeProfile, "picker" | "selfQuestions" | "copilot" | "suggestions" | "guard" | "suggestionKinds" | "sayLines">>): ModeProfile =>
   Object.freeze({ picker: true, selfQuestions: "ignore", copilot: "", suggestions: DEFAULT_SUGGESTIONS, ...value });
 
 export const MODE_PROFILES: Readonly<Record<ConversationMode, ModeProfile>> = Object.freeze({
