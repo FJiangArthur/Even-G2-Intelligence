@@ -174,7 +174,7 @@ describe("ambient glasses display", () => {
     const pages = Number(/^\d+\/(\d+)/u.exec(footer(hud))![1]);
     expect(pages).toBeGreaterThan(2);
     const seen = new Set<string>();
-    for (let i = 0; i < 80 && !blank(hud.frame.body); i++) {
+    for (let i = 0; i < 200 && !blank(hud.frame.body); i++) { // a full page stays up to 25 s (v0.16 fix)
       seen.add(/^\d+\/\d+/u.exec(footer(hud))![0]);
       for (const line of hud.frame.body.split("\n")) expect(hudTextWidth(line)).toBeLessThanOrEqual(AMBIENT_LINE_WIDTH);
       expect(hud.frame.body.split("\n").length).toBeLessThanOrEqual(AMBIENT_LINES);
@@ -237,10 +237,10 @@ describe("ambient glasses display", () => {
     vi.useFakeTimers();
     const { bridge, hud, presentation } = await listening();
     presentation.applyVerification(verdict("v1"));
-    expect(pop(hud)).toEqual(["● OK · supported · verify", "Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
+    expect(pop(hud)).toEqual(["True: Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
     expect(footer(hud)).toBe(""); // one page: no marker, no hint
     await vi.advanceTimersByTimeAsync(400);
-    expect(bridge.shown("hud-ambient")).toContain("● OK · supported");
+    expect(bridge.shown("hud-ambient")).toContain("True: Orin lead time is 12 weeks");
     await vi.advanceTimersByTimeAsync(5000);
     expect(allBlank(bridge)).toBe(true);
     // The same verdict again (snapshot re-emits) does not pop up twice.
@@ -254,7 +254,7 @@ describe("ambient glasses display", () => {
     presentation.applyFactCheck({ id: "f1", claim: "The cap is $25,000", status: "contradicted", summary: "Finance approved $40,000.", sources: [], checkedAt: at } as never);
     expect(pop(hud)).toEqual(["Twelve to sixteen weeks."]);
     await vi.advanceTimersByTimeAsync(8100);
-    expect(pop(hud)).toEqual(["▲ FALSE · contradicted · web check", "The cap is $25,000", "Finance approved $40,000."]);
+    expect(pop(hud)).toEqual(["Correction: Finance approved $40,000."]);
     await vi.advanceTimersByTimeAsync(5100);
     expect(blank(hud.frame.title) && blank(hud.frame.body)).toBe(true);
     await vi.advanceTimersByTimeAsync(60_000);
@@ -272,9 +272,12 @@ describe("ambient glasses display", () => {
     presentation.applyConcept({ id: "c1", term: "NVMe", explanation: LONG.repeat(12), createdAt: at, origin: "copilot" });
     expect(pop(hud)[0]).toMatch(/^NVMe — Jetson Orin modules/u);
     expect(footer(hud)).toBe("1/3 · swipe ↓ more"); // long cues page as well (at most 3 pages)
+    // A full nine-line page stays for its reading time (about 25 s), not the 10 s of a small page (v0.16 fix).
     await vi.advanceTimersByTimeAsync(10_100);
+    expect(footer(hud)).toBe("1/3 · swipe ↓ more");
+    await vi.advanceTimersByTimeAsync(15_000);
     expect(footer(hud)).toBe("2/3 · swipe ↓ more");
-    await vi.advanceTimersByTimeAsync(40_000);
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(allBlank(bridge)).toBe(true);
     hud.dispose();
   });
@@ -379,7 +382,7 @@ describe("ambient glasses display", () => {
     vi.useFakeTimers();
     const { bridge, hud, presentation } = await listening();
     presentation.applyVerification(verdict("v1"));
-    expect(pop(hud)[0]).toBe("● OK · supported · verify");
+    expect(pop(hud)[0]).toBe("True: Orin lead time is 12 weeks");
     presentation.setStatus("stopped");
     expect(hud.ambient).toBe(false);
     expect(hud.frame.title).toBe("HELIX");
@@ -484,7 +487,7 @@ describe("ambient glasses display", () => {
     expect(model.lines.every(line => blank(line.text))).toBe(true);
     presentation.applyVerification(verdict("v1"));
     expect(glassesMirrorModel(hud.mirror).lines.filter(line => !blank(line.text)).map(line => line.text)).toEqual(
-      ["● OK · supported · verify", "Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
+      ["True: Orin lead time is 12 weeks", "Distributors list 12 to 16 weeks."]);
     hud.dispose();
   });
 });

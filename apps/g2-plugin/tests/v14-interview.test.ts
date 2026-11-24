@@ -423,7 +423,7 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
     expect(pop(hud)).toEqual(["What was your own part?"]);
   });
 
-  it("shows the pop-up without a title in every mode (v0.16); the woken list still carries the mode's label and the Q: mark", async () => {
+  it("shows the pop-up without a title in every mode (v0.16), marks what the other side may ask inside the sentence; the woken list still carries the mode's label and the Q: mark", async () => {
     vi.useFakeTimers();
     const meeting = await listening("general");
     meeting.presentation.setSuggestions([suggestion("s1", "Who owns the purchase request?")]);
@@ -431,7 +431,7 @@ describe("v0.14 glasses: suggested questions pop up on the ambient display", () 
     expect(blank(meeting.hud.frame.title)).toBe(true);
     const candidate = await listening("interviewee");
     candidate.presentation.setSuggestions([suggestion("s1", "Why are you leaving your current role?", "They may ask: you mentioned a reorg.", { kind: "they-ask" })]);
-    expect(pop(candidate.hud)).toEqual(["Why are you leaving your current role?"]);
+    expect(pop(candidate.hud)).toEqual(["They may ask: Why are you leaving your current role?"]);
     expect(candidate.hud.frame.body).not.toMatch(/THEY MAY ASK|Why:|reorg/u);
     candidate.hud.handleGesture("click");
     await vi.advanceTimersByTimeAsync(SUGGESTION_CUE_GAP_MS);

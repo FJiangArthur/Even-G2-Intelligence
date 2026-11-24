@@ -40,21 +40,21 @@ describe("v0.13 integration: ambient pop-ups, news verdicts and answer length", 
     ])).toBe("Src: Example News · 2026-11-18 · +2");
   });
 
-  it("a news fact verdict pops up as a news check with its dated source", async () => {
+  it("a news fact verdict pops up as a correction with its dated source", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await listening();
     presentation.applyFactCheck({ id: "f1", sessionId: "s", transcriptId: "t1", claim: "The rate was cut this week", status: "contradicted",
       summary: "The bank held rates on Tuesday.", checkedAt: at, recency: "news", via: "DeepSeek",
       sources: [{ url: "https://news.example.org/rates", title: "Rates held", publishedAt: "2026-11-17", dateSource: "search" }] });
-    // v0.16: no title; the verdict line says what kind of check it was.
+    // v0.16: no title and no kind heading; the dated source line shows how fresh the evidence is.
     expect(hud.frame.title.trim()).toBe("");
-    expect(pop(hud)).toEqual(["▲ FALSE · contradicted · news check", "The rate was cut this week", "The bank held rates on Tuesday.", "Src: news.example.org · 2026-11-17"]);
+    expect(pop(hud)).toEqual(["Correction: The bank held rates on Tuesday.", "Src: news.example.org · 2026-11-17"]);
     await vi.advanceTimersByTimeAsync(6000);
     expect(hud.frame.body.trim()).toBe("");
-    // A general (not time-sensitive) check keeps the old wording.
+    // A general (not time-sensitive) check reads the same way, with no kind heading.
     presentation.applyFactCheck({ id: "f2", sessionId: "s", transcriptId: "t2", claim: "Water boils at 90 C", status: "contradicted",
       summary: "It boils at 100 C at sea level.", checkedAt: at, recency: "general", sources: [] });
-    expect(hud.frame.body).toContain("· web check");
+    expect(pop(hud)).toEqual(["Correction: It boils at 100 C at sea level."]);
     hud.dispose();
   });
 

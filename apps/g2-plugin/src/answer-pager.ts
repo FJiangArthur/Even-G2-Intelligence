@@ -28,6 +28,8 @@ export interface PageLayout {
   readonly bytes?: number;
   /** Width of one grapheme cluster; defaults to the full-canvas heuristic. */
   readonly measure?: (glyph: string) => number;
+  /** Longest time one page of this layout is given before it turns (default 10 s). A larger page needs more. */
+  readonly maxReadingMs?: number;
 }
 export const FULL_CANVAS_PAGE: PageLayout = Object.freeze({ lineWidth: LINE_WIDTH, lines: PAGE_LINES, bytes: PAGE_BYTES });
 
@@ -103,9 +105,12 @@ export function centrePage(text: string, layout: PageLayout = FULL_CANVAS_PAGE):
   return encoder.encode(centred).length > (layout.bytes ?? PAGE_BYTES) ? text : centred;
 }
 
-export function pageReadingMs(visibleCharacters: number): number {
-  return Math.min(10000, Math.max(3000, visibleCharacters * 45));
+/** Reading time of a page: 45 ms a character, at least 3 s, at most `maxMs` (PageLayout.maxReadingMs; 10 s by default). */
+export function pageReadingMs(visibleCharacters: number, maxMs = 10000): number {
+  return Math.min(maxMs, Math.max(3000, visibleCharacters * 45));
 }
+/** The last page of an answer stays at least this long, and longer when its reading time is longer. */
+const LAST_PAGE_MS = 8000;
 
 /** Appended to an answer the provider cut short, so both glasses layouts show where it stops. */
 export const CUT_OFF_MARK = " … (cut off)";
@@ -302,7 +307,12 @@ export class AnswerPager {
   private dwellLeft(): number {
     if (this.index !== 0 || !this.text) return 0;
     const visibleCharacters = [...segmenter.segment(this.text.trim())].length;
-    return Math.max(0, this.shownAt + pageReadingMs(visibleCharacters) - this.now());
+    return Math.max(0, this.shownAt + this.readingMs(visibleCharacters) - this.now());
+  }
+
+  /** Reading time of a page of the answer on screen, under its layout's ceiling. */
+  private readingMs(visibleCharacters: number): number {
+    return pageReadingMs(visibleCharacters, (this.pageLayout ?? this.layout).maxReadingMs);
   }
 
   private fresh(item: WaitingAnswer): boolean { return this.now() - item.arrivedAt <= MAX_WAITING_AGE_MS; }
@@ -335,7 +345,7 @@ export class AnswerPager {
       // Everything waiting was too old: the answer on screen carries on.
       this.onChange(this.text);
       this.schedule();
-    }, this.index === 0 ? this.dwellLeft() : pageReadingMs(visibleCharacters));
+    }, this.index === 0 ? this.dwellLeft() : this.readingMs(visibleCharacters));
   }
   private cancelSwap(): void {
     if (this.swapTimer !== undefined) clearTimeout(this.swapTimer);
@@ -390,7 +400,7 @@ export class AnswerPager {
       else this.hidden = true;
       this.onChange(this.text);
       if (!this.hidden) this.schedule();
-    }, kind === "advance" ? pageReadingMs(visibleCharacters) : 8000);
+    }, kind === "advance" ? this.readingMs(visibleCharacters) : Math.max(LAST_PAGE_MS, this.readingMs(visibleCharacters)));
   }
 
   private cancelTimer(): void {

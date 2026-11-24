@@ -94,6 +94,8 @@ const shownLines = (text: string) => rows(text).map(line => line.trim()).filter(
 const lead = (line: string) => hudTextWidth(line.slice(0, line.length - line.trimStart().length));
 /** Headings and prefixes that no longer belong on the hidden display. */
 const LABELS = /\bQ:|\bWhy:|ASK THEM|THEY MAY ASK|THEY ASKED|YOUR REPLY|ANSWER KEY|◆ ANSWER|\bCONCEPTS?\b|\bLOOKUP\b|\bFACT CHECK\b|\bCHECK\b|\bTO-DO\b|tap to close/u;
+/** Kind headings and field labels of verdicts and conflicts, in any case. */
+const KIND_LABELS = /web check|news check|\bverify\b|conflict:|\bwas:|\bnow:|fact check/iu;
 
 /** Every rule a pop-up must keep, whatever it shows. */
 function expectPopUp(text: string, width: number = AMBIENT_LINE_WIDTH, lines: number = AMBIENT_LINES): void {
@@ -102,6 +104,7 @@ function expectPopUp(text: string, width: number = AMBIENT_LINE_WIDTH, lines: nu
   expect(rows(text).length).toBeLessThanOrEqual(lines);
   for (const line of rows(text)) expect(hudTextWidth(line), JSON.stringify(line)).toBeLessThanOrEqual(width);
   expect(text).not.toMatch(LABELS);
+  expect(text).not.toMatch(KIND_LABELS);
 }
 /** Centred: left and right margins of every line differ by at most one space, top and bottom by at most one line. */
 function expectCentred(text: string, room: number = AMBIENT_LINES, width: number = AMBIENT_LINE_WIDTH): void {
@@ -238,7 +241,7 @@ describe("v0.16 hidden-display page", () => {
     // The hidden page takes pop-ups again, and still nothing went to a missing container.
     presentation.applyVerification({ id: "v1", target: "Orin lead time is 12 weeks", status: "supported", summary: "Distributors list 12 to 16 weeks.", sources: [], checkedAt: at, requestedBy: "auto" });
     await vi.advanceTimersByTimeAsync(400);
-    expect(bridge.shown).toContain("● OK · supported");
+    expect(bridge.shown).toContain("True: Orin lead time is 12 weeks");
     expect(bridge.pageWrites.every(write => write.containerID === 2 && write.containerName === "hud-ambient")).toBe(true);
     expect(bridge.stray).toEqual([]);
     const settled = bridge.rebuilds.length;
@@ -304,12 +307,12 @@ describe("v0.16 pop-up content", () => {
     presentation.applyConcept({ id: "c1", term: "NVMe", explanation: "PCIe storage protocol for SSDs.", createdAt: at, origin: "copilot" });
     check("NVMe — PCIe storage protocol for SSDs.");
     await vi.advanceTimersByTimeAsync(6000);
-    // Verdicts keep their one-line wording.
+    // Verdicts: one verdict word and the claim, no kind heading.
     presentation.applyVerification({ id: "v1", target: "Orin lead time is 12 weeks", status: "supported", summary: "Distributors list 12 to 16 weeks.", sources: [], checkedAt: at, requestedBy: "auto" });
-    check("● OK · supported · verify Orin lead time is 12 weeks Distributors list 12 to 16 weeks.");
+    check("True: Orin lead time is 12 weeks Distributors list 12 to 16 weeks.");
     await vi.advanceTimersByTimeAsync(6000);
     presentation.applyFactCheck({ id: "f1", claim: "The cap is $25,000", status: "uncertain", summary: "No source found.", sources: [], checkedAt: at } as never);
-    check("◆ UNSURE · uncertain · web check The cap is $25,000 No source found.");
+    check("Unsure: The cap is $25,000 No source found.");
     await vi.advanceTimersByTimeAsync(6000);
     // A contradicted fact check arrives as an answer and stays "Correction: …".
     presentation.applyFactCheck({ id: "f2", claim: "The cap is $25,000", status: "contradicted", summary: "Finance approved $40,000.", sources: [{ url: "https://example.com/budget", title: "Budget memo" }], checkedAt: at } as never, true);
@@ -321,7 +324,7 @@ describe("v0.16 pop-up content", () => {
     check("Jetson lead time? 12 to 16 weeks.");
     await vi.advanceTimersByTimeAsync(6000);
     presentation.applyConflict({ id: "x1", earlier: "Budget is $25,000", later: "Budget is $40,000", explanation: "The budget changed.", createdAt: at } as never);
-    check("▲ Conflict: The budget changed. Was: Budget is $25,000 Now: Budget is $40,000");
+    check("The budget changed. Was “Budget is $25,000”, now “Budget is $40,000”.");
     await vi.advanceTimersByTimeAsync(6000);
     // A suggestion of any kind: the bare sentence.
     presentation.setSuggestions([suggestion("s1", "What lead time are you seeing for the Jetson boards?")]);
@@ -339,7 +342,7 @@ describe("v0.16 pop-up content", () => {
     hud.dispose();
   });
 
-  it("shows a suggestion of each kind as the bare sentence", async () => {
+  it("shows a suggestion as the bare sentence, and marks one the other side may ask inside the sentence", async () => {
     for (const kind of [undefined, "ask-them", "they-ask", "say"] as const) {
       vi.useFakeTimers();
       const { hud, presentation } = await listening();
@@ -348,7 +351,7 @@ describe("v0.16 pop-up content", () => {
       presentation.setSuggestions([suggestion("s1", line, kind, "They may ask: it tests depth.")]);
       expectPopUp(hud.frame.body);
       expectCentred(hud.frame.body);
-      expect(shownLines(hud.frame.body).join(" ")).toBe(line);
+      expect(shownLines(hud.frame.body).join(" ")).toBe(kind === "they-ask" ? `They may ask: ${line}` : line);
       hud.dispose();
       vi.useRealTimers();
     }
@@ -641,12 +644,12 @@ describe("v0.16 mode notice at session start", () => {
     hud.dispose();
   });
 
-  it("shows on every new session, gives way to an answer, and a tap closes it without asking", async () => {
+  it("shows on every new session, gives way to an answer, and a tap closes it and asks", async () => {
     vi.useFakeTimers();
     const { hud, presentation } = await mount();
     presentation.setStatus("listening");
     expect(shownLines(hud.frame.body)[0]).toBe("Mode: Meeting");
-    expect(hud.handleGesture("click")).toEqual({ type: "handled" }); // not a billed question
+    expect(hud.handleGesture("click")).toEqual({ type: "askLocal" }); // the tap is never dropped (v0.16 fix)
     expect(hud.frame.body).not.toContain("Mode:");
     expect(hud.handleGesture("click")).toEqual({ type: "askLocal" });
     presentation.setStatus("stopped");

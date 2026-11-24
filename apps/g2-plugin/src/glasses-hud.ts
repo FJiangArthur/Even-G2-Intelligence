@@ -431,17 +431,23 @@ export const AMBIENT_MAX_BYTES = 960;
  * The ambient container text from its lines, never over AMBIENT_MAX_BYTES (UTF-8, so never over that many
  * characters either): the centring spaces go first, then the end of the text.
  */
-function ambientContent(lines: readonly string[]): string {
+function ambientContent(lines: readonly string[], footer = "", rows = lines.length): string {
   const size = (text: string) => utf8.encode(text).length;
-  let text = lines.join("\n");
+  // The footer (page marker, hint, problem) is the last row of the container: blank rows fill up to it.
+  const join = (content: readonly string[], foot: string) => foot
+    ? [...content, ...Array.from({ length: Math.max(0, rows - content.length) }, () => ""), foot].join("\n") : content.join("\n");
+  let text = join(lines, footer);
   if (!text.trim()) return " ";
   if (size(text) <= AMBIENT_MAX_BYTES) return text;
-  text = lines.map(line => line.trimStart()).join("\n");
+  const content = lines.map(line => line.trimStart()), foot = footer.trimStart();
+  text = join(content, foot);
   if (size(text) <= AMBIENT_MAX_BYTES) return text;
-  const glyphs = graphemes(text), budget = AMBIENT_MAX_BYTES - size("…");
+  // Still too long: the end of the content is cut. The footer stays, so the page marker is never lost.
+  const glyphs = graphemes(content.join("\n"));
+  const budget = AMBIENT_MAX_BYTES - size("…") - (foot ? size(foot) + Math.max(1, rows) : 0);
   let used = 0, cut = 0;
   while (cut < glyphs.length && used + size(glyphs[cut]!) <= budget) used += size(glyphs[cut++]!);
-  return `${glyphs.slice(0, cut).join("").trimEnd()}…`;
+  return join(`${glyphs.slice(0, cut).join("").trimEnd()}…`.split("\n"), foot);
 }
 
 /** The last `maxLines` wrapped lines; a cut head is marked with "…". */
@@ -538,7 +544,11 @@ const THEY_ASKED_LAYOUT: PageLayout = Object.freeze({ ...ANSWER_LAYOUT, lines: B
  * "small" is the same pop-up in the BODY box, for a host that cannot swap pages.
  */
 type LayoutMode = "awake" | "full" | "small";
-const AMBIENT_PAGE: PageLayout = Object.freeze({ lineWidth: AMBIENT_LINE_WIDTH, lines: AMBIENT_LINES - 1, bytes: 700, measure: hudGlyphWidth });
+/** A full hidden-display page holds about 550 characters (nine lines of 548 px): at 45 ms a character that is about 25 s, not the 10 s of the smaller pages. */
+export const AMBIENT_READ_MS = 25_000;
+/** Text bytes of one cue page on the hidden display; like answer pages, it leaves room for the centring spaces and the last line. */
+const CUE_PAGE_BYTES = 700;
+const AMBIENT_PAGE: PageLayout = Object.freeze({ lineWidth: AMBIENT_LINE_WIDTH, lines: AMBIENT_LINES - 1, bytes: 700, measure: hudGlyphWidth, maxReadingMs: AMBIENT_READ_MS });
 const AMBIENT_SMALL_PAGE: PageLayout = Object.freeze({ lineWidth: HUD_LINE_WIDTH.body, lines: BODY_LINES - 1, bytes: 700, measure: hudGlyphWidth });
 /** One layout object per mode and answer kind, so a page swap can map each answer's layout to the other mode. */
 const ANSWER_LAYOUTS: Readonly<Record<LayoutMode, readonly [plain: PageLayout, asked: PageLayout]>> = Object.freeze({
@@ -619,6 +629,16 @@ export function verdictSourceLine(sources: readonly { url: string; title?: strin
 
 const ASK_LABEL: Readonly<Record<string, string>> = { lookup: "LOOKUP", propose: "PROPOSAL", question: "QUESTION" };
 
+/**
+ * v0.16 verdict on the hidden display, with no kind heading ("web check", "verify") and the verdict said
+ * once: a contradiction is "Correction: …" (what is right), any other verdict is one word and the claim.
+ */
+function verdictPopUp(status: string, claim: string, summary: string): string {
+  if (status === "contradicted") return summary ? `Correction: ${summary}` : `Not true: ${claim}`;
+  const word = status === "supported" ? "True" : status === "uncertain" ? "Unsure" : status === "unavailable" ? "Not checked" : "";
+  return `${word ? `${word}: ` : ""}${claim}${summary ? `\n${summary}` : ""}`;
+}
+
 function collectItems(snapshot: PresentationSnapshot): HudItem[] {
   const items: HudItem[] = [];
   for (const concept of snapshot.concepts) {
@@ -631,7 +651,10 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
     items.push({ key: `x:${conflict.id}`, sig: `${conflict.explanation}|${conflict.later}`, kind: "conflict",
       live: `▲ Conflict: ${what}`,
       check: `▲ CONFLICT\n${what}${conflict.earlier ? `\nWas: ${oneLine(conflict.earlier)}` : ""}${conflict.later && conflict.explanation ? `\nNow: ${oneLine(conflict.later)}` : ""}`,
-      ambient: `▲ Conflict: ${what}${conflict.earlier ? `\nWas: ${oneLine(conflict.earlier)}` : ""}${conflict.later && conflict.explanation ? `\nNow: ${oneLine(conflict.later)}` : ""}` });
+      // Hidden display: sentences, no "Conflict:" / "Was:" / "Now:" labels.
+      ambient: `${what}${conflict.earlier
+        ? `\nWas “${oneLine(conflict.earlier)}”${conflict.later && conflict.explanation ? `, now “${oneLine(conflict.later)}”` : ""}.`
+        : conflict.later && conflict.explanation ? `\nNow “${oneLine(conflict.later)}”.` : ""}` });
   }
   for (const ask of snapshot.asks) {
     // Implicit asks (lookup / propose): "→ LOOKUP · topic: result".
@@ -651,7 +674,7 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
     const check = `${verdictLine(result)} · ${checkKind(result, "verify")}\n${oneLine(result.target)}${summary ? `\n${summary}` : ""}`;
     items.push({ key: `v:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "verification",
       live: titled(verdictLabel(result.status), `${oneLine(result.target)}${summary ? ` — ${summary}` : ""}`),
-      check, ambient: check, ...(source ? { source } : {}) });
+      check, ambient: verdictPopUp(result.status, oneLine(result.target), summary), ...(source ? { source } : {}) });
   }
   for (const result of snapshot.factChecks) {
     const summary = oneLine(result.summary);
@@ -659,7 +682,7 @@ function collectItems(snapshot: PresentationSnapshot): HudItem[] {
     const check = `${verdictLine(result)} · ${checkKind(result, "web check")}\n${oneLine(result.claim)}${summary ? `\n${summary}` : ""}`;
     items.push({ key: `f:${result.id}`, sig: `${result.status}|${result.summary}`, kind: "fact-check",
       live: titled(verdictLabel(result.status), `${oneLine(result.claim)}${summary ? ` — ${summary}` : ""}`),
-      check, ambient: check, ...(source ? { source } : {}) });
+      check, ambient: verdictPopUp(result.status, oneLine(result.claim), summary), ...(source ? { source } : {}) });
   }
   for (const fact of snapshot.summary?.keyFacts ?? []) {
     items.push({ key: `kf:${oneLine(fact).toLowerCase()}`, sig: "", kind: "fact", live: `Fact: ${oneLine(fact)}` });
@@ -861,6 +884,16 @@ export class GlassesHud implements GlassesSurface {
   private layoutMode: LayoutMode = "awake";
   /** Session start: the active mode shows for MODE_NOTICE_MS. */
   private modeNoticeAt?: number;
+  /** The session went to "connecting" straight from running (a transport reconnect): no mode notice when it is back. */
+  private reconnecting = false;
+  /**
+   * The hidden-display page is wanted but the glasses rejected it, or writes are backing off. Until it is
+   * accepted, pop-ups are drawn in the BODY box of the page that is still up (the "small" layout), so the
+   * wearer is never left with a blank display. Set and cleared in holdAmbient().
+   */
+  private ambientHeld = false;
+  /** True only while rebuild() composes the ambient page itself, which is always the full canvas. */
+  private buildingAmbient = false;
   /** Lines to say (normalized text) the wearer tapped: said, no longer offered on the glasses. */
   private readonly saidLines = new Set<string>();
   private cue?: AmbientCue;
@@ -1119,12 +1152,18 @@ export class GlassesHud implements GlassesSurface {
     const now = this.now();
     this.syncLayout();
     if (status !== this.previousStatus) {
-      if ((status === "connecting" || status === "authorizing") && !["connecting", "authorizing"].includes(this.previousStatus)) this.resetSession();
+      const linking = status === "connecting" || status === "authorizing";
+      if (linking && !["connecting", "authorizing"].includes(this.previousStatus)) {
+        // Connecting straight from a running session is the link coming back, not a new session.
+        this.reconnecting = ACTIVE.includes(this.previousStatus);
+        this.resetSession();
+      } else if (!linking && !ACTIVE.includes(status)) this.reconnecting = false;
       const started = ACTIVE.includes(status) && !ACTIVE.includes(this.previousStatus);
       this.previousStatus = status;
       if (ACTIVE.includes(status)) this.statusCueAt = now;
-      // A mode left on from an earlier session is easy to miss: name it when the session starts.
-      if (started) this.modeNoticeAt = now;
+      // A mode left on from an earlier session is easy to miss: name it when the session starts (once; not on a reconnect).
+      if (started && !this.reconnecting) this.modeNoticeAt = now;
+      if (started) this.reconnecting = false;
     }
     if (ACTIVE.includes(status) && this.sessionStart === undefined) this.sessionStart = now;
     if (glasses.interaction !== this.interaction?.text) this.interaction = glasses.interaction ? { text: glasses.interaction, at: now } : undefined;
@@ -1270,7 +1309,24 @@ export class GlassesHud implements GlassesSurface {
   }
 
   /** The hidden display has its own full-canvas page; a host that cannot swap pages shows the pop-up in the BODY box. */
-  private get fullCanvas(): boolean { return typeof this.bridge.rebuildPageContainer === "function"; }
+  private get fullCanvas(): boolean {
+    return typeof this.bridge.rebuildPageContainer === "function" && (!this.ambientHeld || this.buildingAmbient);
+  }
+  /**
+   * Follows whether the swap to the hidden-display page is held back. It is, once the page is wanted, is
+   * not on the glasses and cannot go out now (the glasses rejected it, or writes are backing off). It stays
+   * so until the page is accepted or no longer wanted: the pop-up layout then changes once each way, not at
+   * every retry (a layout change starts the reading time of the page on screen again).
+   */
+  private holdAmbient(): void {
+    const wanted = this.initialized && typeof this.bridge.rebuildPageContainer === "function" && this.ambientActive()
+      && !(this.page === "hud" && this.pageAmbient);
+    if (!wanted) this.ambientHeld = false;
+    else if (!this.ambientHeld) {
+      const now = this.now();
+      if (now < this.blockedUntil || now < this.timeoutUntil) this.ambientHeld = true;
+    }
+  }
   /** Line width and line count of the container a pop-up on the hidden display is drawn in. */
   private ambientBox(): { readonly width: number; readonly lines: number } {
     return this.fullCanvas ? { width: AMBIENT_LINE_WIDTH, lines: AMBIENT_LINES } : { width: HUD_LINE_WIDTH.body, lines: BODY_LINES };
@@ -1281,6 +1337,7 @@ export class GlassesHud implements GlassesSurface {
    * being read stays on screen. Runs before every compose; a no-op unless the display changed.
    */
   private syncLayout(): void {
+    this.holdAmbient();
     const mode: LayoutMode = !this.ambientActive() ? "awake" : this.fullCanvas ? "full" : "small";
     if (mode === this.layoutMode) return;
     this.layoutMode = mode;
@@ -1331,10 +1388,20 @@ export class GlassesHud implements GlassesSurface {
     const pages: string[] = [];
     // Setup → Answer length "Detailed" writes longer lookups and verdicts: allow them more pages before the "…".
     const CUE_PAGES = this.cuePages;
-    for (let index = 0; index < lines.length && pages.length < CUE_PAGES; index += room) {
-      const page = lines.slice(index, index + room);
+    let index = 0;
+    while (index < lines.length && pages.length < CUE_PAGES) {
+      // A page closes at `room` lines or at its byte budget, whichever comes first (scripts with multi-byte
+      // clusters fill the bytes before the lines); the rest carries over to the next page.
+      const page: string[] = [];
+      let bytes = 0;
+      while (index < lines.length && page.length < room) {
+        const size = utf8.encode(lines[index]!).length + 1;
+        if (page.length && bytes + size > CUE_PAGE_BYTES) break;
+        page.push(lines[index++]!);
+        bytes += size;
+      }
       // The last allowed page ends with "…" when text is left over (all of it is in the woken HUD and on the phone).
-      const rest = lines[index + room];
+      const rest = lines[index];
       if (pages.length + 1 === CUE_PAGES && rest !== undefined) page[page.length - 1] = ellipsize(`${page[page.length - 1]!} ${rest}`, box.width);
       if (page.some(line => line.trim())) pages.push(page.join("\n"));
     }
@@ -1345,7 +1412,8 @@ export class GlassesHud implements GlassesSurface {
 
   /** Reading time of the cue's current page; the last page stays at least CUE_LAST_PAGE_MS. */
   private cueReadMs(cue: AmbientCue): number {
-    const ms = pageReadingMs(graphemes(cue.pages[cue.page] ?? "").length);
+    // A cue page can fill the whole hidden display, so it gets that page's ceiling (a BODY-box page never reaches it).
+    const ms = pageReadingMs(graphemes(cue.pages[cue.page] ?? "").length, AMBIENT_READ_MS);
     return cue.page + 1 < cue.pages.length ? ms : Math.max(cue.minMs ?? CUE_LAST_PAGE_MS, ms);
   }
 
@@ -1368,7 +1436,9 @@ export class GlassesHud implements GlassesSurface {
     const due = this.suggestionCueAt + SUGGESTION_CUE_GAP_MS;
     if (now < due) { this.suggestionDue = due; return; }
     const box = this.ambientBox();
-    const lines = fitLines(clean(oneLine(top.question)), box.lines - 1, box.width);
+    // Candidate mode: a question the other side may ask is not a line to say. With no title on the hidden
+    // display, the sentence itself says so ("They may ask: …"), like "Correction: …".
+    const lines = fitLines(clean(`${theyMayAsk(top) ? "They may ask: " : ""}${oneLine(top.question)}`), box.lines - 1, box.width);
     this.suggestionCueAt = now;
     // One suggestion at a time: a newer top one replaces an older one still waiting.
     this.cueQueue = [...this.cueQueue.filter(cue => !cue.key.startsWith("s:")),
@@ -1416,13 +1486,15 @@ export class GlassesHud implements GlassesSurface {
   private scheduleAmbient(): void {
     if (this.ambientTimer) clearTimeout(this.ambientTimer);
     this.ambientTimer = undefined;
-    if (this.displayMode !== "ambient" || this.disposed) return;
+    if (this.disposed) return;
     const now = this.now();
-    const deadlines = [this.awakeUntil, this.cue?.until ?? 0, (this.statusCueAt ?? -STATUS_CUE_MS) + STATUS_CUE_MS,
+    // A page swap that waits for the write back-off is retried when it ends, with either display setting.
+    const swapAt = this.pageSwapDue() || this.splashSwapDue() ? Math.max(this.blockedUntil, this.timeoutUntil) : 0;
+    const deadlines = (this.displayMode !== "ambient" ? [swapAt] : [this.awakeUntil, this.cue?.until ?? 0, (this.statusCueAt ?? -STATUS_CUE_MS) + STATUS_CUE_MS,
       this.interaction ? this.interaction.at + 4001 : 0, ...this.cueQueue.map(cue => cue.at + CUE_STALE_MS),
       this.suggestionDue, this.notice ? this.notice.at + NOTICE_MS : 0,
       this.modeNoticeAt === undefined ? 0 : this.modeNoticeAt + MODE_NOTICE_MS,
-      this.pageSwapDue() ? this.blockedUntil : 0].filter(time => time > now);
+      swapAt]).filter(time => time > now);
     if (!deadlines.length) return;
     this.ambientTimer = setTimeout(() => {
       this.ambientTimer = undefined;
@@ -1434,6 +1506,12 @@ export class GlassesHud implements GlassesSurface {
   /** The glasses show the wrong one of the HUD page / blank ambient page (and the bridge can swap pages). */
   private pageSwapDue(): boolean {
     return this.initialized && this.page === "hud" && typeof this.bridge.rebuildPageContainer === "function" && this.ambientActive() !== this.pageAmbient;
+  }
+
+  /** The glasses show the page with the SPLASH container when they should not, or the other way round (connect / disconnect). */
+  private splashSwapDue(): boolean {
+    return this.initialized && this.page === "hud" && typeof this.bridge.rebuildPageContainer === "function" && this.imagesOn
+      && this.splashActive() !== this.pageSplash;
   }
 
   /** Gestures on the blank display: double-tap wakes the HUD; tap / swipe act on the pop-up only. */
@@ -1460,10 +1538,11 @@ export class GlassesHud implements GlassesSurface {
       else if (page >= 0) { cue.page = page; cue.until = this.now() + this.cueReadMs(cue); }
       return HANDLED;
     }
-    // The mode notice is on screen: a tap closes it (the wearer has nothing to ask about yet).
-    if (this.modeNoticeShown()) { if (gesture === "click") this.modeNoticeAt = undefined; return HANDLED; }
-    // Nothing on screen: a tap asks about the last few sentences (the answer pops up); swipes have nothing to turn.
-    return gesture === "click" ? { type: "askLocal" } : HANDLED;
+    // Nothing but the mode notice, or nothing at all: a tap asks about the last few sentences (the answer
+    // pops up) and closes the notice; it is never dropped without a sign. Swipes have nothing to turn.
+    if (gesture !== "click") return HANDLED;
+    this.modeNoticeAt = undefined;
+    return { type: "askLocal" };
   }
 
   /** The wearer tapped a line to say: it is said, and not offered again on the glasses. */
@@ -1528,11 +1607,8 @@ export class GlassesHud implements GlassesSurface {
     const footer = parts.length ? ellipsize(parts.join(" · "), box.width) : "";
     const room = footer ? box.lines - 1 : box.lines;
     const lines: string[] = !pop ? [] : pop.centred ? centreBlock(pop.lines, box.width, room) : pop.lines.slice(0, room).map(line => line.trimEnd());
-    if (footer) {
-      while (lines.length < box.lines - 1) lines.push("");
-      lines.push(centreLine(footer, box.width));
-    }
-    return { header: " ", title: " ", status: " ", body: ambientContent(lines), caption: " ", mode: " ", views: " " };
+    const body = ambientContent(lines, footer ? centreLine(footer, box.width) : "", box.lines - 1);
+    return { header: " ", title: " ", status: " ", body, caption: " ", mode: " ", views: " " };
   }
 
   /** "! message" for a session-ending error, or for NOTICE_MS after a transient problem. */
@@ -1839,7 +1915,10 @@ export class GlassesHud implements GlassesSurface {
     this.schedule();
     // Connect / disconnect: swap to the page with (or without) the opaque SPLASH container.
     // Ambient display: swap between the blank page and the HUD page (wake, idle, session start / end).
-    const swap = now >= this.timeoutUntil && ((this.imagesOn && this.splashActive() !== this.pageSplash) || (this.pageSwapDue() && now >= this.blockedUntil));
+    // A rejected swap is retried after the write back-off, never at once. While the ambient page is held
+    // back, the text of the page that is up goes out first (send() comes back here when it is done).
+    const swap = now >= this.timeoutUntil && now >= this.blockedUntil && (this.splashSwapDue() || this.pageSwapDue())
+      && !(this.ambientHeld && this.dirty().length);
     if (this.initialized && this.page === "hud" && !this.rebuilding && swap) void this.rebuild("hud", false);
     this.updateImages();
     this.publishMirror();
@@ -2299,7 +2378,8 @@ export class GlassesHud implements GlassesSurface {
    * Text `key` should show for `frame` (the frame last composed). The ambient container shows the pop-up
    * block; while a wake swap is still due it carries the view text, so the text menu stays usable when the
    * glasses reject the HUD page. On the HUD page a full-canvas pop-up is not drawn in the smaller BODY box:
-   * the box stays blank until the ambient page is up.
+   * the box stays blank for the moment the swap takes. When the swap is held back (ambientHeld) the frame is
+   * composed for the BODY box instead and is drawn there.
    */
   private wanted(key: ContainerKey, frame: HudFrame = this.frameValue): string {
     if (key === "ambient") return frame.body;
@@ -2369,7 +2449,9 @@ export class GlassesHud implements GlassesSurface {
       const splash = target === "hud" && this.splashActive();
       const ambient = target === "hud" && this.ambientActive();
       if (!force && target === this.page && (target === "menu" || (splash === this.pageSplash && ambient === this.pageAmbient))) return true;
-      this.frameValue = this.compose();
+      // The ambient page is composed for its own container, also while pop-ups are held in the BODY box.
+      this.buildingAmbient = ambient;
+      try { this.frameValue = this.compose(); } finally { this.buildingAmbient = false; }
       const frame = this.frameValue;
       let ok = false;
       const startedAt = this.now();
@@ -2447,6 +2529,8 @@ export class GlassesHud implements GlassesSurface {
     const operation = this.writePanels(this.generation, force).finally(() => {
       if (this.inFlight === operation) this.inFlight = undefined;
       this.schedule();
+      // The held-back ambient page waited for this text: try the swap again now.
+      if (this.ambientHeld && !this.disposed && !this.dirty().length) { try { this.refresh(); } catch (error) { this.reportRenderError(error); } }
       if (!this.inFlight && !this.disposed) this.pumpImages();
     });
     this.inFlight = operation;
