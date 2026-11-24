@@ -133,8 +133,9 @@ describe("suggestion lifecycle", () => {
     expect(h.last().find(item => item.question === askQ.question)?.askedAt).toBeDefined();
     await settle();
   });
-  it("other modes carry no kind and leave why untouched; an unattributed speaker can ask either kind", async () => {
-    const h = harness([{ suggestedQuestions: [{ ...LEAD, kind: "they-ask" }] }]);
+  it("other question modes carry no kind and leave why untouched; an unattributed speaker can ask either kind", async () => {
+    // v0.16: Meeting (the default) stamps kind "say" (v16-prompts.test.ts); Technical is a question mode.
+    const h = harness([{ suggestedQuestions: [{ ...LEAD, kind: "they-ask" }] }], { mode: "technical" });
     h.copilot.submit("t1", "Jetson boards are hard to order right now.");
     await settle();
     expect(h.last()[0]).not.toHaveProperty("kind");

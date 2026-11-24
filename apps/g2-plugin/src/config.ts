@@ -164,6 +164,33 @@ export const DEFAULT_CONFIG: PluginConfig = Object.freeze({
 
 /** Contract shape consumed by the SDK copilot lane. */
 /**
+ * v0.16 speech language. `PluginConfig.locale` is the speech language: a tag such as "en" or "zh-CN" pins
+ * speech recognition to that language (the default, "en"), and SPEECH_LANGUAGE_AUTO ("auto") is the "mixed
+ * languages" setting: recognition is not pinned and follows what is spoken. Answers and lines follow the
+ * spoken language in both cases.
+ */
+export const SPEECH_LANGUAGE_AUTO = "auto";
+/** True when the config (or a locale string) is set to mixed languages. */
+export function isMixedSpeechLanguage(value: Pick<PluginConfig, "locale"> | string | undefined): boolean {
+  const locale = typeof value === "string" ? value : value?.locale;
+  return locale?.trim().toLowerCase() === SPEECH_LANGUAGE_AUTO;
+}
+/**
+ * The `locale` to store for a "mixed languages" switch: on gives "auto"; off gives `pinned` (the language
+ * the user typed), or the default language when that is blank or itself "auto".
+ */
+export function speechLocale(mixed: boolean, pinned?: string): string {
+  if (mixed) return SPEECH_LANGUAGE_AUTO;
+  const locale = pinned?.trim().slice(0, 32) ?? "";
+  return locale && !isMixedSpeechLanguage(locale) ? locale : DEFAULT_CONFIG.locale;
+}
+/** Language tag for services that need one language (e.g. an export): undefined when mixed languages is on. */
+export function pinnedSpeechLanguage(config: Pick<PluginConfig, "locale">): string | undefined {
+  const locale = config.locale.trim();
+  return locale && !isMixedSpeechLanguage(locale) ? locale : undefined;
+}
+
+/**
  * v0.10: a mode switch applies the mode's presets (copilot toggles, auto-answer, strategy) on top
  * of the current config; everything else (models, keys, memory, fact-check) is kept.
  */
@@ -289,7 +316,9 @@ export function normalizePluginConfig(value: unknown): PluginConfig {
     promptId: cleanString(candidate.promptId, DEFAULT_CONFIG.promptId, 100),
     promptVersion: cleanString(candidate.promptVersion, DEFAULT_CONFIG.promptVersion, 32),
     instructions: cleanString(candidate.instructions, DEFAULT_CONFIG.instructions, 8_000),
-    locale: cleanString(candidate.locale, DEFAULT_CONFIG.locale, 32),
+    // "Auto" / "AUTO" are the mixed-languages setting, stored in one spelling.
+    locale: isMixedSpeechLanguage(typeof candidate.locale === "string" ? candidate.locale : undefined)
+      ? SPEECH_LANGUAGE_AUTO : cleanString(candidate.locale, DEFAULT_CONFIG.locale, 32),
     maxResponseSentences: cleanSentenceLimit(candidate.maxResponseSentences),
     // "office-discussion" was the old name of Meeting (v0.10).
     conversationMode: cleanChoice(

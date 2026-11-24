@@ -58,7 +58,13 @@ const CHINESE_QUESTION = /^(?:你能|你可以|您能|您可以|能否|可否|�
 const ARABIC_QUESTION = /^(?:هل|ما|ماذا|من|متى|أين|لماذا|كيف|أي|أيمكن|يمكن\s+أن)(?:\s|$)/u;
 const SPANISH_QUESTION = /^¿?\s*(?:puedes|podrías|podria|podriais|qué|que\s+|cómo|como\s+|por\s+qué|cuando|cuándo|donde|dónde|quién|quien|cuál|cual|cuánto|cuanto|es\s+|son\s+)/iu;
 const JAPANESE_QUESTION = /^(?:なぜ|どう|何|いつ|どこ|誰|どれ|どの|できますか)|(?:ですか|ますか|でしょうか|できますか|なのか|だろうか)[。！!\s]*$/u;
-const LEADING_FILLER = /^(?:(?:okay|ok|well|so|please|hey|um|uh|also|then)\b[,:]?\s*)+/i;
+/**
+ * v0.16 Korean without a question mark: an interrogative opening, or an ending that is only a question
+ * (-습니까, -인가요, -을까요). Endings that are as often a statement (-나요 in 만나요, -가요 in 집에 가요) are left out.
+ */
+const KOREAN_QUESTION = /^(?:왜|어떻게|어째서|무엇|무슨|뭘|누가|누구|언제|어디|어느|얼마|몇\s)|(?:[습입합됩십]니까|인가요|건가요|는가요|은가요|던가요|[을일할될]까요|[을일할될]까)[.。！!\s]*$/u;
+const SPACELESS_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const LEADING_FILLER =/^(?:(?:okay|ok|well|so|please|hey|um|uh|also|then)\b[,:]?\s*)+/i;
 const QUESTION_MARKS = new Set(["?", "？", "؟"]);
 const CLOSING_PUNCTUATION = new Set([
   '"', "'", "”", "’", "»", "›", ")", "]", "}", "）", "］", "｝", "】", "」", "』",
@@ -179,8 +185,47 @@ export class RecentQuestions {
  * Forms that are as often a real question to the listener ("What's the term for that?", "What else?",
  * "Who knows?", "Really?") are deliberately not here.
  */
-const RHETORICAL = /^(?:(?:well|so|um+|uh+|hmm+|oh|okay|ok|gosh|wow|honestly|i mean)[,.\s]+)*(?:where (?:do|would|should|can) i (?:even |really )?(?:start|begin)|how (?:do|should|would|shall|can) i (?:even |best )?(?:put|say|phrase|describe|explain) (?:it|this|that)|what was i (?:saying|going to say)|where was i|how (?:do|should) i say (?:this|that|it)|what can i say|you know(?: what i mean)?|right|okay|ok|yeah|no|make sense|does that make sense|is that fair|you see what i mean|what do you call it|let me think|how to put (?:it|this))[\s?!.…]*$/iu;
+const RHETORICAL_LEAD = String.raw`(?:(?:well|so|and|but|now|then|um+|uh+|hmm+|oh|okay|ok|gosh|wow|honestly|i mean)[,.\s]+)*`;
+const RHETORICAL_END = String.raw`[\s?!.…？！。]*$`;
+const RHETORICAL = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
+  String.raw`where (?:do|would|should|can) i (?:even |really )?(?:start|begin)`,
+  String.raw`how (?:do|should|would|shall|can) i (?:even |best )?(?:put|say|phrase|describe|explain) (?:it|this|that)`,
+  String.raw`what was i (?:saying|going to say)|where was i|how (?:do|should) i say (?:this|that|it)|what can i say`,
+  String.raw`you know(?: what i mean)?|right|okay|ok|yeah|no|make sense|does that make sense|is that fair|you see what i mean`,
+  String.raw`what do you call it|let me think|how to put (?:it|this)`,
+  // v0.16 talk and podcast forms: the speaker voices a question for the audience and goes on to answer it.
+  String.raw`(?:you|some of you|people|one) (?:might|may|could|often|probably)(?: (?:well|now|often|then))? (?:ask|wonder|be asking|be wondering|be thinking)\b.*`,
+  String.raw`you(?:['’]re| are) probably (?:asking|wondering|thinking)\b.*`,
+  String.raw`have you ever (?:wondered|asked yourself|stopped to think)\b.*`,
+  String.raw`what if i told you\b.*`,
+  String.raw`(?:you )?know what|guess what|am i right|isn['’]t (?:it|that)(?: right| so)?|don['’]t you think(?: so)?`,
+  String.raw`(?:do )?you (?:see|get|know) what i(?:['’]m| am) (?:saying|getting at)|see what i mean`,
+  String.raw`what do i mean(?: by (?:that|this))?|what am i (?:saying|getting at|talking about)`,
+  String.raw`why (?:am i|do i) (?:telling you|saying|bringing (?:this|that) up|mention(?:ing)? (?:this|that))\b.*`,
+  String.raw`what(?:['’]s| is) (?:the|my) point(?: here)?`,
+  // Korean tags and thinking aloud ("right?", "you know", "how shall I put it").
+  String.raw`그렇죠|그쵸|그렇지(?:요)?|그렇잖아요|맞죠|맞지요|알겠죠|아시겠죠|있잖아요|뭐랄까(?:요)?|뭐라고\s*(?:해야\s*)?할까(?:요)?|어떻게\s*말해야\s*할까(?:요)?|무슨\s*말이냐면`,
+  // Chinese tags and thinking aloud.
+  String.raw`对吧|是吧|对不对|是不是|你知道吗|怎么说呢`,
+].join("|") + `)${RHETORICAL_END}`, "iu");
+/**
+ * v0.16 questions a speaker asks and then answers ("So what does that mean? It means…"). They are skipped
+ * only when the same speaker goes on with a statement in the same line; said on their own they may be a
+ * real question to the wearer ("What does that mean?"), so they stay questions.
+ */
+const SELF_ANSWERED = new RegExp(`^${RHETORICAL_LEAD}(?:` + [
+  String.raw`what does (?:that|this|it|all of (?:that|this)) (?:even |really |actually )?mean(?: for (?:us|you|me))?`,
+  String.raw`why is (?:that|this)(?: so| the case| important)?|why does (?:that|this|it) (?:matter|happen|work)|why(?: not)?`,
+  String.raw`how does (?:that|this|it) (?:work|happen|help)|how (?:do|can) we (?:actually |really )?do (?:that|this|it)`,
+  String.raw`is there anything (?:we|you|i) can do(?: about (?:it|that|this))?`,
+  String.raw`what (?:can|should|do) (?:we|you|i) do(?: about (?:it|that|this))?`,
+  String.raw`where does (?:that|this) leave us|what happens (?:next|then)|what(?:['’]s| is) the (?:answer|solution|alternative|lesson|takeaway)`,
+  String.raw`왜\s*그럴까(?:요)?|왜일까(?:요)?|(?:이게\s*|그게\s*)?무슨\s*(?:뜻|의미)일까(?:요)?|어떻게\s*(?:하면|해야)\s*(?:될|할)까(?:요)?|우리가\s*할\s*수\s*있는\s*(?:게|것이)\s*(?:있을까|뭘까)(?:요)?`,
+  String.raw`(?:这|那)(?:是|意味着)什么(?:意思)?呢?|为什么呢|为什么会这样呢?|我们(?:能|可以|该)(?:做(?:些)?什么|怎么办)呢?`,
+].join("|") + `)${RHETORICAL_END}`, "iu");
 export function isRhetoricalQuestion(text: string): boolean { return RHETORICAL.test(text.trim()); }
+/** True for a question that is rhetorical when its speaker continues with a statement (see extractQuestions). */
+export function isSelfAnsweredQuestion(text: string): boolean { return SELF_ANSWERED.test(text.trim()); }
 
 function looksLikeUnpunctuatedQuestion(text: string): boolean {
   const cleaned = text
@@ -198,6 +243,7 @@ function looksLikeUnpunctuatedQuestion(text: string): boolean {
     || CURIOUS_QUESTION_START.test(cleaned)
   ) return true;
   return CHINESE_QUESTION.test(cleaned)
+    || KOREAN_QUESTION.test(cleaned)
     || ARABIC_QUESTION.test(cleaned)
     || SPANISH_QUESTION.test(cleaned)
     || JAPANESE_QUESTION.test(cleaned);
@@ -260,10 +306,20 @@ export function extractQuestions(input: string, limit = 3): DetectedQuestion[] {
 
   const questions: DetectedQuestion[] = [];
   const seen = new Set<string>();
-  for (const clause of sentenceClauses(normalizedInput)) {
+  const clauses = sentenceClauses(normalizedInput);
+  const isQuestion = (clause: Clause) => clause.explicitQuestion || looksLikeUnpunctuatedQuestion(clause.text.replace(LEADING_FILLER, "").trim());
+  /** The speaker goes on with a statement of some substance (not a tag, not another question). */
+  const answeredBySpeaker = (index: number): boolean => {
+    const next = clauses[index + 1];
+    if (!next || isQuestion(next)) return false;
+    const text = next.text.trim();
+    return SPACELESS_SCRIPT.test(text) ? [...text.replace(/[\p{P}\s]+/gu, "")].length >= 4 : (text.match(/[\p{L}\p{N}'’-]+/gu) ?? []).length >= 3;
+  };
+  for (const [index, clause] of clauses.entries()) {
     const cleaned = clause.text.replace(LEADING_FILLER, "").trim();
     if (!clause.explicitQuestion && !looksLikeUnpunctuatedQuestion(cleaned)) continue;
     if (isRhetoricalQuestion(cleaned)) continue;
+    if (isSelfAnsweredQuestion(cleaned) && answeredBySpeaker(index)) continue;
     // "X is hard to order and have a long lead time." is a statement: a bare
     // auxiliary after a conjunction continues the predicate, it is not a new question.
     if (!clause.explicitQuestion && clause.continuation && AUXILIARY_QUESTION_START.test(cleaned)

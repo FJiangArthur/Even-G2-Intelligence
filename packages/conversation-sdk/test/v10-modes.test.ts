@@ -59,14 +59,15 @@ describe("v0.10 mode profiles", () => {
   });
   it("copilot instructions follow the mode: default meeting text, interviewer probes, partner check-ins", () => {
     const meeting = copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS });
-    expect(meeting).toContain("useful questions the WEARER could ask the other party next");
+    // v0.16: Meeting, Learning, Social and Partner suggest lines to say.
+    expect(meeting).toContain("at most 3 lines the WEARER can say next");
     expect(meeting).not.toContain("Conversation mode:");
     const interviewer = copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS, mode: "interviewer" });
     expect(interviewer).toContain("follow-up probes the INTERVIEWER");
     expect(interviewer).toContain("candidate evidence");
     expect(interviewer).toMatch(/Never infer or mention protected characteristics/u);
     const partner = copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS, mode: "partner" });
-    expect(partner).toContain("gentle things the WEARER could say next");
+    expect(partner).toContain("the lines are warm, plain and honest");
     expect(partner).toContain("never suggest manipulative or dishonest lines");
     expect(copilotInstructions({ ...DEFAULT_COPILOT_SETTINGS, mode: "learning" })).toContain("At most 5; an empty list is fine");
   });
