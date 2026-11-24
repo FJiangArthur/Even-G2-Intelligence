@@ -2,6 +2,40 @@
 
 Newest first. Entries are engineering notes written at release time; measurements name the harness they came from.
 
+## v0.16.0 — lines to say, centred full-canvas pop-ups, history clean-up, imports
+
+Prompted by a real session (a podcast about being present) that produced "Could you clarify…", an interviewer answer key, repeated "asked Helix…" lines, and pop-ups in the top-left corner.
+
+**Glasses, display hidden**
+- The hidden-display page is one text container over the canvas (560×272, 10 lines). Pop-ups are centred with leading spaces and blank lines; the SDK has no alignment. A streaming answer stays top-left and is centred when its page is complete.
+- Content only: no "Q:", "Why:", "ASK THEM", "CONCEPT" headings. A concept is "Term — explanation"; verdicts read "Correction: / True: / Unsure: / Not checked: …"; a Candidate "they may ask" item keeps the prefix "They may ask:".
+- The question is no longer repeated above an answer on the hidden display. The awake HUD and the phone are unchanged.
+- "Mode: <name>" shows for 4 s at session start, so a mode left on from last time is visible.
+- If the glasses reject the hidden-display page, pop-ups fall back to the old body box.
+
+**Prompts**
+- Meeting, Learning, Social and Partner modes now propose up to 3 lines to say (`CopilotSuggestion.kind: "say"`): written to be read aloud word for word, in the language being spoken. Interviewer, Candidate, Negotiation and Technical keep question suggestions.
+- A tap on a line marks it said (phone and glasses) instead of asking Helix about it.
+- Speech-recognition rule in the answer and copilot prompts: infer the likely meaning silently; never mention the transcript or ask the wearer to clarify. Prompt version 2.
+- Manual tap ("last few sentences" / "whole conversation") returns the one best thing to say next, plus "Correction: …" when something just said was wrong. The answer key is only for the wearer's own spoken question in Interviewer mode.
+- Fewer answers to rhetorical questions: wider rhetorical and self-answered filters, Korean patterns, and a monologue guard (the other side has held the floor 60 s; short backchannels such as "Yeah" do not reset it). The guard needs speaker tags and is off in Interviewer and Candidate modes.
+- Setup: "Mixed languages (do not assume English)" stops pinning recognition to one language.
+
+**History**
+- "Clean up" proposes near-empty Helix sessions, answer-only sessions and duplicate imports, with a preview and confirm; merges are offered unticked. "Remove all" by source.
+- Repeated "asked Helix…" lines are collapsed into a "you asked" mark on the answer. Cut-off answers are marked.
+
+**Imports**
+- Imports (Omi, Obsidian) have their own 5 MiB budget, so a full import can no longer stop a live conversation from saving. Errors and counts show on the import card.
+- Re-import replaces a session instead of leaving stale lines; on-phone summaries are kept. Summaries, key facts and concepts of imports are searchable at answer time.
+- Omi: the wearer is "You", "SPEAKER_00" is "Speaker 1", lenient timestamps, conversations sent from Helix are skipped, local-time date filters, "Summaries only" option.
+- Obsidian: same-named notes no longer overwrite each other; files are read one at a time with progress; undated notes use the file date.
+
+**Not verified**
+- Nothing here ran on the phone, the glasses or a live provider. Fake providers show the plumbing, not the quality of a real model's lines.
+- Device-only: centring with the real glasses font and whether all 10 lines show; whether the bridge holds more than 5 MiB in total; Omi from the Even WebView; mixed-language recognition; whether a real session tags a podcast speaker reliably (untagged or mis-tagged, the monologue guard does not apply).
+- Left out: zipped-vault import; the awake HUD still titles the suggestions view "ASK THEM"; `docs/MODES*.md` and `docs/MEMORY_GUIDE.md` still quote the old prompt wording and the single 5 MiB limit.
+
 ## v0.15.1 — Even Hub SDK 0.0.16 (timer fix reported by Even Realities as the cause of the iPhone freeze)
 
 An Even Realities engineer reported the cause of the iPhone freeze and the white page after unlock: a defect in the timer implementation inside `@evenrealities/even_hub_sdk` 0.0.14. They repacked this plugin with SDK 0.0.16 and ran it in the background for 10 minutes with no freeze and no white page. The SDK 0.0.16 changelog reads "Fixed repeated execution of `setTimeout` / `setInterval` callbacks".

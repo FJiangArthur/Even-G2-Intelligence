@@ -65,6 +65,7 @@ import {
   applyModePreset,
   CONVERSATION_MODES,
   type ConversationMode,
+  pinnedSpeechLanguage,
 } from "./config";
 import { modeProfile, summarizeSession } from "@helix/conversation-sdk";
 import { SessionNotebook, applyTodoOp, type SessionNotebookData, type TodoOp } from "@helix/conversation-sdk";
@@ -740,6 +741,11 @@ export class G2ConversationController {
   // ---- end knowledge base ----
 
   public dismissCue(): void { this.presentation.dismissCue(); }
+  /** v0.16: the wearer marked a line to say as said (phone tap or glasses tap): phone, glasses and copilot all drop it. */
+  public markLineSaid(id: string): void {
+    this.presentation.markSuggestionSaid(id);
+    (this.transport as (ConversationTransport & { markSuggestionSaid?: (id: string) => boolean }) | undefined)?.markSuggestionSaid?.(id);
+  }
   public dismissInsight(id: string): void { this.presentation.dismissInsight(id); }
   public async explainTerm(): Promise<void> {
     await this.ask("Using the whole captured conversation, directly explain one recent technical term in the speech language. Preserve ambiguity. If there is no clear technical term, say so briefly.");
@@ -1678,7 +1684,7 @@ export class G2ConversationController {
     const results: OmiExportResult[] = [];
     for (const [index, { session, entries }] of batch.entries()) {
       this.setHistoryStatus(`Sending to Omi… ${index + 1}/${batch.length}`);
-      const result = await exportToOmi({ key: omiKey, session, entries, ...(signal ? { signal } : {}), ...(this.config.locale ? { language: this.config.locale } : {}) });
+      const result = await exportToOmi({ key: omiKey, session, entries, ...(signal ? { signal } : {}), ...(pinnedSpeechLanguage(this.config) ? { language: pinnedSpeechLanguage(this.config)! } : {}) });
       results.push(result);
       if (result.status === "failed" && ["invalid-key", "auth", "rate-limited"].includes(result.code)) break;
     }

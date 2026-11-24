@@ -280,3 +280,15 @@ describe("a line the wearer taps as said", () => {
     await client.dispose();
   });
 });
+
+import { isBackchannel } from "../src/direct-transport.js";
+describe("v0.16 monologue guard: backchannels", () => {
+  it("treats a short turn as a backchannel and a real turn as taking the floor", () => {
+    expect(isBackchannel("Yeah")).toBe(true);
+    expect(isBackchannel("Right, okay")).toBe(true);
+    expect(isBackchannel("")).toBe(true);
+    expect(isBackchannel("I think that is a different point")).toBe(false);
+    expect(isBackchannel("我觉得这个说法不太对")).toBe(false);
+    expect(isBackchannel("嗯")).toBe(true);
+  });
+});

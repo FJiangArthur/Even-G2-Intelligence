@@ -63,6 +63,14 @@ export const MONOLOGUE_AFTER_MS = 60_000, MONOLOGUE_GAP_MS = 30_000;
  */
 export const OMITTED_SPEECH_NOTE = "If the answer depends on something not shown above, say you do not have that detail.";
 /** Modes where the other side's questions are always for the wearer. */
+/** A turn too short to take the floor: under four words, or under eight characters of unspaced script. */
+export const isBackchannel = (text: string): boolean => {
+  const clean = text.trim();
+  if (!clean) return true;
+  const words = clean.split(/\s+/u).filter(Boolean).length;
+  const dense = (clean.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu) ?? []).length;
+  return dense >= 8 ? false : words < 4;
+};
 const MONOLOGUE_EXEMPT: readonly ConversationMode[] = ["interviewer", "interviewee"];
 /** GLOBAL BACKGROUND sent with an automatic answer: the newest whole sentences within this many characters. */
 const AUTO_BACKGROUND_CHARS = 20_000;
@@ -416,7 +424,7 @@ export class DirectConversationTransport implements ConversationTransport, Copil
     const unknownAsker = keyMode && speaker.role === "unknown";
     const answerable = questionKindFor(speaker.role) === "answer" || answerKey;
     // v0.16: questions put to an audience in a monologue are shown on the phone but not answered.
-    const monologue = this.monologue(runtime, speaker, timing, mode);
+    const monologue = this.monologue(runtime, speaker, timing, mode, transcript);
     const answering = answerable && !monologue && automation.answerQuestions !== false && shouldAnswerDetectedQuestions(strategy);
     for (const question of questions) {
       const now = Date.now();
@@ -445,8 +453,12 @@ export class DirectConversationTransport implements ConversationTransport, Copil
    * session is as likely the wearer's short reply as the other side. A turn of unknown role is never
    * suppressed, and Interviewer and Candidate modes are exempt. A manual ask does not come through here.
    */
-  private monologue(runtime: Runtime, speaker: Speaker, timing: TurnTiming, mode: ConversationMode): boolean {
-    if (speaker.role !== "other") { runtime.otherFloor = undefined; return false; }
+  private monologue(runtime: Runtime, speaker: Speaker, timing: TurnTiming, mode: ConversationMode, text = ""): boolean {
+    if (speaker.role !== "other") {
+      // A backchannel ("Yeah", "And", "Right, okay") is not the wearer taking the floor: the talk goes on.
+      if (!isBackchannel(text)) runtime.otherFloor = undefined;
+      return false;
+    }
     const end = timing.triggerAt, start = end - Math.max(0, timing.speechMs);
     const gap = this.options.monologue?.gapMs ?? MONOLOGUE_GAP_MS;
     const floor = runtime.otherFloor && start - runtime.otherFloor.lastEnd <= gap ? runtime.otherFloor : { since: start, lastEnd: end };
