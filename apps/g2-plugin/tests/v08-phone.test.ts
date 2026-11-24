@@ -147,14 +147,16 @@ describe("v0.8 History cleanup", () => {
     expect(lines.map(line => [line.kind, line.speaker, line.text])).toEqual([
       ["speech", "Them", "We're moving to CDTF for the mapping head. See for details."],
       ["speech", "You", "What's the lead time on Thor?"],
-      ["request", "You", "asked Helix about the whole conversation"],
+      // v0.16: the tap is no line of its own; the answer carries the "you asked" mark (asserted below).
       ["helix", "Helix", "Dev kits ship in 6–10 weeks"],
       ["check", "Check", "Thor ships in 8 weeks (supported): Distributors list 6–10 weeks."],
       ["request", "You", "Typed question to Helix"],
     ]);
     const text = transcriptText(lines);
     expect(text).not.toMatch(/https?:|www\.|api\.openai|gpt-6|latency|provider|endpoint|[{}]|\[1\]/iu);
-    expect(text.split("\n")[3]).toBe("    Helix: Dev kits ship in 6–10 weeks");
+    expect(lines[2]!.asked).toBe("whole");
+    expect(text.split("\n")[2]).toBe("    Helix (you asked · whole conversation): Dev kits ship in 6–10 weeks");
+    expect(text).not.toMatch(/asked Helix about/u);
     expect(lines[0]!.entryIds).toEqual(["session_a:e0", "session_a:e1", "session_a:e2"]);
   });
 

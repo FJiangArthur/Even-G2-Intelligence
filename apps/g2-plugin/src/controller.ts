@@ -39,6 +39,7 @@ import {
 } from "@helix/conversation-sdk";
 import { markdownSession, omiExportSummary, sessionMarkdown as toSessionMarkdown, vaultFiles as toVaultFiles, type MarkdownFile } from "./knowledge-panel"; // phone agent
 import { joinConcept } from "./history-panel";
+import { historyScopeIds, proposeHistoryCleanup, type HistoryCleanupProposal, type HistoryRemoveScope } from "@helix/conversation-sdk"; // v0.16 history clean-up
 import { firstAccessibleModel } from "@helix/conversation-sdk";
 import { DEFAULT_COPILOT_MODEL, answerProviderInfo, directEndpoint, providerModel, testProviderKey, type ProviderKeyTestResult } from "@helix/conversation-sdk";
 import { RehearsalPlayer, rehearsalScript, type RehearsalResult } from "./rehearsal";
@@ -141,6 +142,9 @@ export interface LifecycleFlag {
 export const RESUME_SAME_SESSION_MS = 30 * 60 * 1000;
 /** What History removal reports back to the panel. */
 export interface HistoryRemoval { readonly removed: number; readonly failed: number; readonly pendingInOpenAI: number; readonly message: string }
+/** v0.16: what the wearer ticked in History -> Clean up. A merge moves `fromId` (the later session) into `intoId`. */
+export interface HistoryCleanupPlan { readonly remove: readonly string[]; readonly merge: readonly { readonly fromId: string; readonly intoId: string }[] }
+export interface HistoryCleanupResult extends HistoryRemoval { readonly merged: number }
 /** One model call over a saved transcript (the transport's own fetch, or the Setup key path). */
 type DigestRunner = (session: { title: string; lines: readonly { speaker: string; text: string }[] }) => Promise<SessionDigest>;
 export const RESUME_PROMPT = "Session paused while Helix was in the background · tap to resume";
@@ -316,6 +320,54 @@ export class G2ConversationController {
     return left;
   }
   // ---- end v0.13 history ----
+  // ---- v0.16 history: clean-up and remove all ----
+  /** Sessions a bulk action leaves alone: the live one, ones being removed or summarised, and ones whose saved lines cannot be read. */
+  private historyBulkSkip(): Set<string> {
+    return new Set([...(this.session ? [this.session.id] : []), ...this.historyDeletions.keys(), ...this.recapJobs.keys(), ...this.history.corruptSessionIds()]);
+  }
+  /** What History -> Clean up would do (see proposeHistoryCleanup). Nothing changes until applyHistoryCleanup. */
+  public historyCleanupProposal(): HistoryCleanupProposal {
+    return proposeHistoryCleanup(this.savedSessions().map(session => ({ session, entries: this.history.getEntries(session.id) })), { skip: this.historyBulkSkip() });
+  }
+  /**
+   * Carries out the ticked part of a clean-up: merges first (oldest first, so a chain A + B + C ends
+   * up in A), then removals through removeHistorySessions. Only what is in `plan` is touched.
+   * Caller shows the preview and confirms before calling this API.
+   */
+  public async applyHistoryCleanup(plan: HistoryCleanupPlan, key = ""): Promise<HistoryCleanupResult> {
+    const skip = this.historyBulkSkip(), moved = new Map<string, string>(), gone: string[] = [];
+    let mergeFailed = 0;
+    const startOf = (id: string) => Date.parse(this.history.getSession(id)?.startedAt ?? "");
+    const pairs = [...plan.merge].sort((a, b) => startOf(a.fromId) - startOf(b.fromId));
+    for (const pair of pairs) {
+      const into = moved.get(pair.intoId) ?? pair.intoId, from = this.history.getSession(pair.fromId), target = this.history.getSession(into);
+      if (!from || !target || from.id === target.id || from.source !== "helix" || target.source !== "helix" || skip.has(from.id) || skip.has(target.id)) { mergeFailed++; continue; }
+      try {
+        await this.history.mergeSession(from.id, into);
+        moved.set(from.id, into); gone.push(from.id); this.mergedInto.set(from.id, into); this.titles.delete(from.id); this.titles.delete(into);
+      } catch { mergeFailed++; }
+    }
+    if (gone.length) { try { await this.history.flush(); } catch { /* reported by the next save */ } }
+    // A merged-away session's file in the OpenAI knowledge base goes too; the surviving session is re-sent by the next Sync.
+    const mergedPending = gone.length ? await this.forgetOpenAIKnowledge(gone, key) : 0;
+    const remove = [...new Set(plan.remove)].filter(id => !moved.has(id) && !skip.has(id));
+    const removal: HistoryRemoval = remove.length ? await this.removeHistorySessions(remove, key) : { removed: 0, failed: 0, pendingInOpenAI: 0, message: "" };
+    const merged = gone.length, pendingInOpenAI = removal.pendingInOpenAI + mergedPending;
+    const message = [merged ? `${merged === 1 ? "1 session" : `${merged} sessions`} merged into the one before.` : "", mergeFailed ? `${mergeFailed} could not be merged.` : "",
+      removal.message || (merged || mergeFailed ? "" : "Nothing was changed."),
+      mergedPending && !removal.pendingInOpenAI ? "The OpenAI knowledge base catches up at the next Sync (Knowledge tab)." : ""].filter(Boolean).join(" ");
+    this.setHistoryStatus(message);
+    return { removed: removal.removed, failed: removal.failed + mergeFailed, pendingInOpenAI, merged, message };
+  }
+  /** Sessions History -> Remove all would remove for a scope ("all" includes PDF documents). The live session always stays. */
+  public historyScopeIds(scope: HistoryRemoveScope): string[] { return historyScopeIds(this.savedSessions(), scope, this.session ? [this.session.id] : []); }
+  /** Removes every saved session of a scope, through removeHistorySessions. Caller confirms with the count first. */
+  public removeAllHistory(scope: HistoryRemoveScope, key = ""): Promise<HistoryRemoval> {
+    const ids = this.historyScopeIds(scope);
+    if (!ids.length) return Promise.resolve({ removed: 0, failed: 0, pendingInOpenAI: 0, message: "Nothing to remove." });
+    return this.removeHistorySessions(ids, key);
+  }
+  // ---- end v0.16 history ----
   /** Caller confirms user-triggered deletion before calling this API. */
   public async deleteHistorySession(id: string): Promise<void> {
     const pending = this.historyDeletions.get(id);

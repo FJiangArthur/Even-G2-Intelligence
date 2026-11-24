@@ -126,7 +126,7 @@ const TOO_LARGE = "Local history exceeds the 5 MiB storage limit.";
 const TOO_LARGE_SAVE = `${TOO_LARGE} Export or delete sessions before retrying.`;
 interface Snapshot { version: 1; sessions: HistorySession[]; entries: HistoryEntry[] }
 // Only provenance belongs here. Arbitrary provider payloads, headers and credential fields do not.
-const METADATA_KEYS = new Set(["model", "provider", "endpoint", "promptVersion", "prompt_version", "latencyMs", "latency_ms", "noteId", "origin", "omiConversationId", "omiSegmentId", "speakerId", "startSeconds", "endSeconds", "language", "status", "checkedAt", "section"]);
+const METADATA_KEYS = new Set(["model", "provider", "endpoint", "promptVersion", "prompt_version", "latencyMs", "latency_ms", "noteId", "origin", "omiConversationId", "omiSegmentId", "speakerId", "startSeconds", "endSeconds", "language", "status", "checkedAt", "section", "partial"]);
 export const KNOWLEDGE_SOURCES: readonly KnowledgeSource[] = Object.freeze(["helix", "omi", "obsidian"]);
 const KNOWLEDGE_KEYS = ["summary", "keyFacts", "people", "concepts", "tags"] as const;
 const MAX_KNOWLEDGE_ITEMS = 20, MAX_KNOWLEDGE_CHARS = 500;

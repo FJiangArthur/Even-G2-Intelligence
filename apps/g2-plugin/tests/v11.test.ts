@@ -88,7 +88,7 @@ describe("v0.11 history: AI cues, mindmap, generated summary", () => {
   it("pairs answers with their question and builds a two-level mindmap", () => {
     expect(sessionCues(entries)).toEqual([
       { kind: "answer", text: "Usually yes.", question: "Is 16 GB enough?" },
-      { kind: "answer", text: "Recap: x86 now.", question: "You asked about the whole conversation" },
+      { kind: "answer", text: "Recap: x86 now.", asked: "whole" }, // v0.16: a tap is a small mark, not a question line
       { kind: "check", text: "Lead time is 2 weeks: Distributors list 12." }]);
     const map = sessionMindmap(session, entries);
     expect(map.label).toBe("Compute planning");

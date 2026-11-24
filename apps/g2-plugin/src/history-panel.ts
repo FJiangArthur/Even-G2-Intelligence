@@ -1,4 +1,4 @@
-import { sessionRecap, type HistoryEntry, type HistorySession, type RetrievedMemory } from "@helix/conversation-sdk";
+import { contextAskScope, sessionRecap, type CleanupReason, type HistoryCleanupProposal, type HistoryEntry, type HistoryRemoveScope, type HistorySession, type RetrievedMemory } from "@helix/conversation-sdk";
 import type { G2ConversationController, HistoryState } from "./controller";
 import { icon, type IconName } from "./pixel-art";
 import { browserTransferEnv, exportFile } from "./file-transfer";
@@ -113,7 +113,15 @@ export interface TranscriptLine {
   readonly text: string;
   readonly kind: TranscriptLineKind;
   readonly entryIds: readonly string[];
+  /** A Helix answer the wearer asked for with a tap: about the last few sentences, or the whole conversation. */
+  readonly asked?: AskedScope;
+  /** A Helix answer the provider cut short. */
+  readonly cutOff?: true;
 }
+export type AskedScope = "recent" | "whole";
+/** The small mark on an answer the wearer asked for with a tap. */
+export const ASKED_MARK: Readonly<Record<AskedScope, string>> = { recent: "you asked", whole: "you asked · whole conversation" };
+export const CUT_OFF_LABEL = "(cut off)";
 
 const GENERIC = new Set(["", "speaker", "unknown", "g2 conversation", "conversation", "user"]);
 /** History speaker labels -> "You" / "Them" / "Speaker" / a real name (Omi speaker names stay). */
@@ -151,12 +159,16 @@ const norm = (text: string) => text.normalize("NFKC").toLowerCase().replace(/[^\
 /**
  * History transcript as "Speaker: text" lines. Consecutive lines from one speaker merge into one
  * paragraph; re-sent partials (a line that is a prefix of the next) are dropped; detected questions
- * that repeat speech are dropped; Helix answers become indented "Helix:" lines; context requests and
- * imported summaries never show their prompt text.
+ * that repeat speech are dropped; Helix answers become indented "Helix:" lines; imported summaries
+ * never show their prompt text. v0.16: a tap ("answer the last few sentences" / "the whole
+ * conversation") is no line of its own: the answer it got carries `asked`, and taps that got no
+ * answer show nothing. The saved question entries are untouched. A cut-off answer carries `cutOff`.
  */
 export function cleanTranscript(entries: readonly HistoryEntry[]): TranscriptLine[] {
   const speech = entries.filter(entry => entry.kind === "transcript").map(entry => norm(entry.text)).filter(Boolean);
-  const lines: { speaker: string; text: string; kind: TranscriptLineKind; entryIds: string[] }[] = [];
+  const lines: { speaker: string; text: string; kind: TranscriptLineKind; entryIds: string[]; asked?: AskedScope; cutOff?: true }[] = [];
+  /** The latest tap that has not been answered yet. */
+  let ask: { scope: AskedScope; id: string } | undefined;
   for (const entry of entries) {
     if (entry.metadata?.origin === "omi-summary" || /^omi summary$/iu.test(entry.speaker ?? "")) continue;
     const raw = entry.text ?? "";
@@ -172,18 +184,19 @@ export function cleanTranscript(entries: readonly HistoryEntry[]): TranscriptLin
         last.entryIds.push(entry.id);
       } else lines.push({ speaker, text, kind: "speech", entryIds: [entry.id] });
     } else if (entry.kind === "question") {
-      const label = (entry.speaker ?? "").trim();
-      if (/^local context$/iu.test(label) || /^whole conversation$/iu.test(label)) {
-        lines.push({ speaker: "You", text: /^local/iu.test(label) ? "asked Helix about the last few sentences" : "asked Helix about the whole conversation", kind: "request", entryIds: [entry.id] });
-        continue;
-      }
+      const scope = contextAskScope(entry);
+      if (scope) { ask = { scope, id: entry.id }; continue; }
+      ask = undefined; // a spoken or typed question follows: the next answer is not the tap's
       const text = cleanLineText(raw);
       const key = norm(text);
       if (!text || speech.some(said => said.includes(key))) continue; // detected from speech: already in the transcript
       lines.push({ speaker: historySpeaker(entry.speaker), text, kind: "request", entryIds: [entry.id] });
     } else if (entry.kind === "answer") {
       const text = cleanLineText(raw);
-      if (text) lines.push({ speaker: "Helix", text, kind: "helix", entryIds: [entry.id] });
+      if (text) {
+        lines.push({ speaker: "Helix", text, kind: "helix", entryIds: ask ? [ask.id, entry.id] : [entry.id], ...(ask ? { asked: ask.scope } : {}), ...(entry.metadata?.partial === "true" ? { cutOff: true as const } : {}) });
+        ask = undefined;
+      }
     } else if (entry.kind === "fact-check") {
       const [claim = "", ...rest] = raw.split("\n");
       const status = entry.metadata?.status;
@@ -196,7 +209,7 @@ export function cleanTranscript(entries: readonly HistoryEntry[]): TranscriptLin
 
 /** Plain text export of the clean transcript: "Speaker: text", Helix lines indented. */
 export function transcriptText(lines: readonly TranscriptLine[]): string {
-  return lines.map(line => `${line.kind === "helix" || line.kind === "check" ? "    " : ""}${line.speaker}: ${line.text}`).join("\n");
+  return lines.map(line => `${line.kind === "helix" || line.kind === "check" ? "    " : ""}${line.speaker}${line.asked ? ` (${ASKED_MARK[line.asked]})` : ""}: ${line.text}${line.cutOff ? ` ${CUT_OFF_LABEL}` : ""}`).join("\n");
 }
 
 /* --------------------------------------------------------------------- formatting */
@@ -325,18 +338,25 @@ export function historyKnowledgeNote(on: boolean, openai: boolean): string {
 }
 
 /** v0.11 AI cues: what Helix said in a session, each answer with the question that triggered it. */
-export interface SessionCue { readonly kind: "answer" | "check"; readonly text: string; readonly question?: string }
+export interface SessionCue {
+  readonly kind: "answer" | "check"; readonly text: string;
+  /** The spoken or typed question that triggered the answer. */
+  readonly question?: string;
+  /** v0.16: the answer was asked for with a tap (no question text of its own). */
+  readonly asked?: AskedScope;
+  readonly cutOff?: true;
+}
 export function sessionCues(entries: readonly HistoryEntry[]): SessionCue[] {
   const cues: SessionCue[] = [];
-  let question: string | undefined;
+  let question: string | undefined, asked: AskedScope | undefined;
   for (const entry of entries) {
     if (entry.kind === "question") {
-      const label = (entry.speaker ?? "").trim();
-      question = /^local context$/iu.test(label) ? "You asked about the last few sentences" : /^whole conversation$/iu.test(label) ? "You asked about the whole conversation" : cleanLineText(entry.text ?? "") || undefined;
+      asked = contextAskScope(entry);
+      question = asked ? undefined : cleanLineText(entry.text ?? "") || undefined;
     } else if (entry.kind === "answer") {
       const text = cleanLineText(entry.text ?? "");
-      if (text) cues.push({ kind: "answer", text, ...(question ? { question } : {}) });
-      question = undefined;
+      if (text) cues.push({ kind: "answer", text, ...(question ? { question } : {}), ...(asked ? { asked } : {}), ...(entry.metadata?.partial === "true" ? { cutOff: true as const } : {}) });
+      question = undefined; asked = undefined;
     } else if (entry.kind === "fact-check") {
       const [claim = "", ...rest] = (entry.text ?? "").split("\n");
       const status = entry.metadata?.status;
@@ -364,6 +384,41 @@ export function sessionMindmap(session: HistorySession, entries: readonly Histor
   ];
   return { label: sessionTitle(session, entries), children: branches.filter(branch => branch.children.length) };
 }
+
+/* ------------------------------------------------------- v0.16 clean-up and remove all */
+
+export type CleanupGroupId = CleanupReason | "merge";
+export interface CleanupRow {
+  /** "remove:<session id>" or "merge:<id of the later session>". */
+  readonly key: string; readonly label: string; readonly detail: string;
+}
+export interface CleanupGroup { readonly id: CleanupGroupId; readonly heading: string; readonly note: string; readonly tickedByDefault: boolean; readonly rows: CleanupRow[] }
+const CLEANUP_GROUPS: readonly (readonly [CleanupGroupId, string, string])[] = [
+  ["little-speech", "Almost nothing said", "Helix sessions with a stray word or a mic test, and no summary."],
+  ["answers-only", "Only tapped answers", "Helix sessions with answers you tapped for and no transcript."],
+  ["duplicate-import", "Duplicate imports", "The same Omi conversation or note saved twice. One copy stays."],
+  ["merge", "Merge sessions minutes apart", "Off by default. A merge cannot be undone."],
+];
+/** The clean-up preview: what is proposed, grouped by reason, removals ticked and merges unticked (pure). */
+export function cleanupPreview(proposal: HistoryCleanupProposal): CleanupGroup[] {
+  const when = (iso: string) => formatSessionDate(iso) || "Undated";
+  return CLEANUP_GROUPS.map(([id, heading, note]) => ({
+    id, heading, note, tickedByDefault: id !== "merge",
+    rows: id === "merge"
+      ? proposal.merges.map(merge => ({ key: `merge:${merge.fromId}`, label: `Merge ${cleanLineText(merge.intoTitle) || "Untitled session"} + ${cleanLineText(merge.fromTitle) || "Untitled session"}`,
+        detail: `${when(merge.intoStartedAt)} and ${when(merge.fromStartedAt)} · ${Math.max(0, Math.round(merge.gapMs / 60_000))} min apart` }))
+      : proposal.removals.filter(item => item.reason === id).map(item => ({ key: `remove:${item.id}`, label: cleanLineText(item.title) || "Untitled session",
+        detail: `${SOURCE_LABEL[item.source]} · ${when(item.startedAt)}` })),
+  })).filter(group => group.rows.length);
+}
+/** Row keys ticked when the preview opens: every removal, no merge. */
+export function cleanupDefaultTicks(proposal: HistoryCleanupProposal): Set<string> { return new Set(proposal.removals.map(item => `remove:${item.id}`)); }
+/** What will be done: only the ticked rows of the proposal (pure). */
+export function cleanupPlan(proposal: HistoryCleanupProposal, ticked: ReadonlySet<string>): { remove: string[]; merge: { fromId: string; intoId: string }[] } {
+  return { remove: proposal.removals.filter(item => ticked.has(`remove:${item.id}`)).map(item => item.id),
+    merge: proposal.merges.filter(merge => ticked.has(`merge:${merge.fromId}`)).map(merge => ({ fromId: merge.fromId, intoId: merge.intoId })) };
+}
+export const REMOVE_ALL_SCOPES: readonly (readonly [HistoryRemoveScope, string])[] = [["helix", "Helix conversations"], ["omi", "Omi imports"], ["obsidian", "Obsidian notes"], ["all", "Everything, with PDFs"]];
 
 /* ------------------------------------------------------------------------- panel */
 
@@ -459,17 +514,108 @@ export class HistoryPanel {
     const tools = element("div", undefined, "history-tools");
     this.selectButton.id = "history-select"; this.selectButton.setAttribute("aria-pressed", "false");
     this.selectButton.addEventListener("click", () => this.setSelecting(!this.picked));
-    tools.append(this.search, this.selectButton);
+    this.cleanButton.id = "history-clean-up"; this.cleanButton.addEventListener("click", () => this.showCleanup());
+    this.removeAllButton.id = "history-remove-all"; this.removeAllButton.addEventListener("click", () => this.showRemoveAll());
+    tools.append(this.search, this.selectButton, this.cleanButton, this.removeAllButton);
     this.selectBar.hidden = true;
     this.list.className = "card-list session-list"; this.detail.className = "history-detail"; this.detail.hidden = true;
     this.listView.className = "history-list-view";
-    this.listView.append(privacy, knowledge, searchLabel, tools, this.selectBar, this.confirmSlot, this.status, this.list);
+    this.listView.append(privacy, knowledge, searchLabel, tools, this.selectBar, this.bulkSlot, this.confirmSlot, this.status, this.list);
     this.panel.append(this.listView, this.detail);
     root.append(this.panel);
     this.unsubscribe = controller.subscribeHistory(state => this.render(state));
   }
+  // ---- v0.16: Clean up (preview, then confirm) and Remove all (scope, then confirm) ----
+  private readonly cleanButton = button("Clean up", "button button-quiet button-small history-clean-up");
+  private readonly removeAllButton = button("Remove all", "button button-quiet button-small history-remove-all");
+  /** Holds the clean-up preview or the remove-all scope choice; the confirm bar goes in confirmSlot. */
+  private readonly bulkSlot = element("div", undefined, "history-bulk-slot");
+  private closeBulk(): void { this.bulkSlot.replaceChildren(); this.confirmSlot.replaceChildren(); }
+  private bulkCard(title: string, note: string): { card: HTMLElement; actions: HTMLElement } {
+    const card = element("section", undefined, "history-bulk"); card.setAttribute("aria-label", title);
+    card.append(element("h3", title, "section-label"), element("p", note, "field-note"));
+    const actions = element("div", undefined, "confirm-actions");
+    const cancel = button("Cancel", "button button-secondary button-small history-bulk-cancel");
+    cancel.addEventListener("click", () => this.closeBulk());
+    actions.append(cancel);
+    return { card, actions };
+  }
+  /** Clean up: nothing is removed or merged before the preview is shown and the confirm bar is accepted. */
+  private showCleanup(): void {
+    if (this.picked) this.setSelecting(false);
+    this.closeBulk();
+    const proposal = this.controller.historyCleanupProposal(), groups = cleanupPreview(proposal);
+    if (!groups.length) { this.setNotice("Nothing to clean up."); return; }
+    const ticked = cleanupDefaultTicks(proposal);
+    const { card, actions } = this.bulkCard("Clean up", "Untick anything you want to keep. Nothing changes until you confirm.");
+    const go = button("Clean up", "button button-small history-bulk-go");
+    const count = () => {
+      const plan = cleanupPlan(proposal, ticked), total = plan.remove.length + plan.merge.length;
+      go.disabled = !total;
+      go.querySelector(".button-label")!.textContent = total ? `Clean up ${total}` : "Clean up";
+      return plan;
+    };
+    for (const group of groups) {
+      const section = element("fieldset", undefined, `history-bulk-group bulk-${group.id}`);
+      section.append(element("legend", `${group.heading} (${group.rows.length})`, "history-bulk-heading"), element("p", group.note, "field-note"));
+      for (const row of group.rows) {
+        const label = element("label", undefined, "history-bulk-row"), box = element("input"); box.type = "checkbox"; box.checked = ticked.has(row.key); box.dataset.cleanupKey = row.key;
+        box.addEventListener("change", () => { if (box.checked) ticked.add(row.key); else ticked.delete(row.key); this.confirmSlot.replaceChildren(); count(); });
+        const text = element("span", undefined, "history-bulk-text"); text.append(element("strong", row.label), element("small", row.detail));
+        label.append(box, text); section.append(label);
+      }
+      card.append(section);
+    }
+    go.addEventListener("click", () => {
+      const plan = count(), parts = [plan.remove.length ? `remove ${plural(plan.remove.length, "session")}` : "", plan.merge.length ? `merge ${plural(plan.merge.length, "pair")} of sessions` : ""].filter(Boolean).join(" and ");
+      this.confirmSlot.replaceChildren(confirmBar(`Clean up: ${parts}? ${plan.remove.length ? "Removed sessions are deleted from this phone. " : ""}${plan.merge.length ? "A merge cannot be undone. " : ""}This cannot be restored.`,
+        "Clean up", () => {
+          this.closeBulk(); this.setNotice("Cleaning up…");
+          void this.controller.applyHistoryCleanup(plan, this.options.openaiKey?.() ?? "")
+            .then(result => { this.listSignature = undefined; this.renderList(); this.setNotice(result.message); }, error => this.setNotice(error instanceof Error ? error.message : String(error)));
+        }, () => this.confirmSlot.replaceChildren()));
+    });
+    actions.append(go); card.append(actions); count();
+    this.bulkSlot.replaceChildren(card);
+    card.scrollIntoView?.({ block: "nearest" });
+  }
+  /** Remove all: pick what (Helix / Omi / Obsidian / everything), then confirm with the count. */
+  private showRemoveAll(): void {
+    if (this.picked) this.setSelecting(false);
+    this.closeBulk();
+    const counts = new Map(REMOVE_ALL_SCOPES.map(([scope]) => [scope, this.controller.historyScopeIds(scope).length]));
+    if (!counts.get("all")) { this.setNotice("Nothing to remove."); return; }
+    const { card, actions } = this.bulkCard("Remove all", "Choose what to remove from this phone. A live session stays.");
+    let chosen: HistoryRemoveScope | undefined;
+    const go = button("Remove", "button button-small history-bulk-go", "cross"); go.disabled = true;
+    const choices = element("fieldset", undefined, "history-bulk-group");
+    choices.append(element("legend", "Remove", "sr-only"));
+    for (const [scope, text] of REMOVE_ALL_SCOPES) {
+      const total = counts.get(scope) ?? 0;
+      const label = element("label", undefined, "history-bulk-row"), radio = element("input"); radio.type = "radio"; radio.name = "history-remove-scope"; radio.value = scope; radio.disabled = !total;
+      radio.addEventListener("change", () => { if (!radio.checked) return; chosen = scope; go.disabled = false; this.confirmSlot.replaceChildren(); });
+      const line = element("span", undefined, "history-bulk-text"); line.append(element("strong", text), element("small", plural(total, "session")));
+      label.append(radio, line); choices.append(label);
+    }
+    go.addEventListener("click", () => {
+      if (!chosen) return;
+      const scope = chosen, total = this.controller.historyScopeIds(scope).length, what = REMOVE_ALL_SCOPES.find(item => item[0] === scope)![1];
+      if (!total) { this.setNotice("Nothing to remove."); return; }
+      this.confirmSlot.replaceChildren(confirmBar(`Remove ${plural(total, "session")} (${what}) from this phone? Transcripts, answers, summaries, to-dos and notes are deleted and cannot be restored.`,
+        `Remove ${total}`, () => {
+          this.closeBulk(); this.setNotice(`Removing ${plural(total, "session")}…`);
+          void this.controller.removeAllHistory(scope, this.options.openaiKey?.() ?? "")
+            .then(result => { this.listSignature = undefined; this.renderList(); this.setNotice(result.message); }, error => this.setNotice(error instanceof Error ? error.message : String(error)));
+        }, () => this.confirmSlot.replaceChildren()));
+    });
+    actions.append(go); card.append(choices, actions);
+    this.bulkSlot.replaceChildren(card);
+    card.scrollIntoView?.({ block: "nearest" });
+  }
+  // ---- end v0.16 ----
   private setSelecting(on: boolean): void {
     this.picked = on ? new Set() : undefined;
+    this.bulkSlot.replaceChildren();
     this.confirmSlot.replaceChildren();
     this.selectButton.setAttribute("aria-pressed", String(on));
     this.selectButton.querySelector(".button-label")!.textContent = on ? "Done" : "Select";
@@ -753,8 +899,11 @@ export class HistoryPanel {
         for (const cue of cues) {
           const row = element("li", undefined, `cue cue-${cue.kind}`);
           row.append(element("span", cue.kind === "answer" ? "Answer" : "Check", "cue-kind"));
+          if (cue.asked) row.append(element("span", ASKED_MARK[cue.asked], "asked-mark"));
           if (cue.question) row.append(element("p", cue.question, "cue-question"));
-          row.append(element("p", cue.text, "cue-text"));
+          const answer = element("p", cue.text, "cue-text");
+          if (cue.cutOff) answer.append(" ", element("span", CUT_OFF_LABEL, "cut-off-mark"));
+          row.append(answer);
           list.append(row);
         }
         section("Answers and checks", "gem").append(list);
@@ -773,7 +922,10 @@ export class HistoryPanel {
         const row = element("li", undefined, `line line-${line.kind}`);
         row.dataset.entryIds = line.entryIds.join(" ");
         if (this.selectedEntry && line.entryIds.includes(this.selectedEntry)) row.classList.add("is-selected");
-        row.append(element("strong", `${line.speaker}:`, "line-speaker"), " ", element("span", line.text, "line-text"));
+        row.append(element("strong", `${line.speaker}:`, "line-speaker"), " ");
+        if (line.asked) row.append(element("span", ASKED_MARK[line.asked], "asked-mark"), " ");
+        row.append(element("span", line.text, "line-text"));
+        if (line.cutOff) row.append(" ", element("span", CUT_OFF_LABEL, "cut-off-mark"));
         list.append(row);
       }
       transcript.append(list);
