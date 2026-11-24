@@ -41,7 +41,8 @@ import { analyzeConversation, createFakeOpenAI, synthSpeechPcm, type FakeOpenAI 
 
 // The two interview-harness scripts hold lines that must NOT all be answered (fragments, rhetorical questions,
 // two questions in one line); tests/interview-scenario.test.ts runs them against their per-line outcomes.
-const REHEARSAL_SCRIPTS = ALL_REHEARSAL_SCRIPTS.filter(script => !script.id.startsWith("interview-"));
+// The talk script (v0.16) is a monologue whose questions must NOT be answered; tests/v16-talk-scenario.test.ts runs it.
+const REHEARSAL_SCRIPTS = ALL_REHEARSAL_SCRIPTS.filter(script => !script.id.startsWith("interview-") && !script.id.startsWith("talk-"));
 
 const FAKE_KEY = "sk-fake-rehearsal";
 const MODEL = "gpt-4.1-mini"; // priced in model-catalog and within the SDK's known context budgets
